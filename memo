@@ -19,5 +19,6 @@ for f in *.anchors; do      base=$f;     python ../synLTR2/anchor_builder.py "$b
 # 'anchor_coord_consolidator.py' consolidates adjacent anchors if theyre too small. Im thinking smaller than 15kb. 
 # It also now trys to stitch sections that are not covered by anchors. 
 # With rice, it appeared 99% of the genome was covered in anchors, leaving 4.4Mb unaccounded for. Adding the stitching fuction was consertvative and dropped it to 3.8 Mb. 
-# I think its mainly just chromosome ends that are uncovered now. Im working on 'anchor_coord_consolidator.py' to take fai files and stitch chrom ends. I see a bug... "9311v2_chr1:15925965..45172197	Nipponb_sca1:605995..633585	+". dont stitch terminal end between scaffolds and chromosomes. 
+# I think its mainly just chromosome ends that are uncovered now. I should leave them though, since scaffolded sequences add some confusion for filling terminal gaps.
+# I made 'anchor_coord_consolidator2.py', which might have better handling of filling gaps in minus strand.
 

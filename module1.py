@@ -12,7 +12,7 @@ Steps automated:
     (b)  gene_coords_extractor_all4.py -mcscan
     (c)  anchor_coord_subtracter.py
     (d)  anchor_coord_subtracter.py (second pass)
-    (e)  anchor_coord_consolidator3.py -t MIN_BLOCK_SIZE --stitch-gaps
+    (e)  anchor_coord_consolidator.py -t MIN_BLOCK_SIZE --stitch-gaps
 (6) Cleanup intermediate per-pair files:
        *.anchors.clean
        *.anchors.coords
@@ -219,14 +219,14 @@ def step5_process_pair(work_dir: Path, script_dir: Path, g1: str, g2: str, min_b
     echo(f"[5/6] (d) anchor_coord_subtracter (2nd) -> {d_out.name}", verbose)
     run_cmd(cmd_d, cwd=work_dir, verbose=verbose)
 
-    # (e) anchor_coord_consolidator3 -t MIN_BLOCK_SIZE --stitch-gaps
+    # (e) anchor_coord_consolidator -t MIN_BLOCK_SIZE --stitch-gaps
     cmd_e = [
-        sys.executable, str(script_dir / "anchor_coord_consolidator3.py"),
+        sys.executable, str(script_dir / "anchor_coord_consolidator.py"),
         "-t", str(min_block_size),
         str(d_out),
         "--stitch-gaps",
     ]
-    echo(f"[5/6] (e) anchor_coord_consolidator3 -> {out_e.name}", verbose)
+    echo(f"[5/6] (e) anchor_coord_consolidator -> {out_e.name}", verbose)
     with open(out_e, "w") as fout:
         if verbose:
             subprocess.run(cmd_e, cwd=work_dir, check=True, stdout=fout)

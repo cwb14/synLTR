@@ -1,9 +1,17 @@
 #!/usr/bin/env python3
 """
 Script to polish TSV alignments by removing total overlaps and trimming partial overlaps.
+
 Usage:
-    python polish_alignments.py input.tsv output.tsv
+    python polish_alignments.py input.tsv output.tsv [--verbose]
+
+Behavior:
+- Groups alignments by (ref_acc, qry_acc, strand).
+- Removes any alignment fully contained by another in the same group.
+- Trims later-starting alignments when there is a partial overlap.
+- If --verbose is provided, prints detailed DEBUG messages about removals/trims.
 """
+
 import argparse
 from collections import defaultdict
 
@@ -20,7 +28,10 @@ def main():
     parser = argparse.ArgumentParser(description="Polish TSV alignments")
     parser.add_argument('input', help='Input TSV file')
     parser.add_argument('output', help='Output TSV file')
+    parser.add_argument('--verbose', action='store_true',
+                        help='Print detailed debug statements about overlaps and trims')
     args = parser.parse_args()
+    verbose = args.verbose
 
     # Read alignments
     alignments = []
@@ -62,7 +73,11 @@ def main():
                 # Both share exact key, so just check containment
                 if (ai['ref_start'] <= aj['ref_start'] <= aj['ref_end'] <= ai['ref_end'] and
                     ai['qry_start'] <= aj['qry_start'] <= aj['qry_end'] <= ai['qry_end']):
-                    print(f"TOTAL OVERLAP: {ai['line']} totally encompasses {aj['line']}. {aj['line']} removed.")
+                    if verbose:
+                        print(
+                            f"TOTAL OVERLAP: {ai['line']} totally encompasses {aj['line']}. "
+                            f"{aj['line']} removed."
+                        )
                     removed_indices.add(j)
 
         # Build reduced group after removals
@@ -86,7 +101,11 @@ def main():
                     new_ref_str = format_alignment(aj['ref_acc'], new_ref_start, aj['ref_end'])
                     new_qry_str = format_alignment(aj['qry_acc'], new_qry_start, aj['qry_end'])
                     new_line = f"{new_ref_str}\t{new_qry_str}\t{aj['strand']}"
-                    print(f"PARTIAL OVERLAP: {ai['line']} partially overlaps with {old_line}. {old_line} trimmed to {new_line}")
+                    if verbose:
+                        print(
+                            f"PARTIAL OVERLAP: {ai['line']} partially overlaps with {old_line}. "
+                            f"{old_line} trimmed to {new_line}"
+                        )
                     # Update aj in reduced
                     aj['ref_str']    = new_ref_str
                     aj['qry_str']    = new_qry_str

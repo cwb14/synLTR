@@ -149,7 +149,7 @@ def step4_jcvi(work_dir: Path, script_dir: Path, genome_stems, threads: int, csc
         sys.executable, str(script_dir / "jcvi_diploid.py"),
         "-p", str(p),
         "--cpus", str(cpus),
-        "--keep", "anchors",
+        "--keep", "pdf", "anchors",
         "--prot",
         "--cscore", str(cscore),
     ]
@@ -161,6 +161,21 @@ def step4_jcvi(work_dir: Path, script_dir: Path, genome_stems, threads: int, csc
     expected_any = work_dir / f"{pairs[0][0]}.{pairs[0][1]}.anchors"
     if not expected_any.exists():
         raise RuntimeError("jcvi_diploid.py finished but no anchors files were found.")
+
+    # Collect JCVI dotplot PDFs into a dedicated folder
+    dotplot_dir = work_dir / "dotplots"
+    ensure_dir(dotplot_dir)
+    for pdf in work_dir.glob("*.pdf"):
+        dest = dotplot_dir / pdf.name
+        try:
+            if dest.exists():
+                # Overwrite to reflect latest run (consistent with --overwrite semantics elsewhere)
+                dest.unlink()
+            shutil.move(str(pdf), str(dest))
+            if verbose:
+                echo(f"    moved {pdf.name} -> dotplots/", verbose)
+        except Exception as e:
+            echo(f"    warning: could not move {pdf.name} to dotplots/: {e}", verbose=True)
     done.touch()
 
 def anchors_pairs(genome_stems):
@@ -370,3 +385,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

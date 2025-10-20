@@ -8,16 +8,59 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 
 
 def rename_header(header, file_prefix):
-    # chrom labels: chr/Chrom/Chromosome/CHR/etc with optional separators and optional colon+space
+    """
+    Detect chromosome-like labels and normalize to >{prefix}_chr{N}
+    - Handles: chr/Chrom/Chromosome/CHR/etc with optional separators and optional colon+space
+    - Removes leading zeros from numeric chromosomes.
+    - Returns (base_header_with_gt, base_header_without_gt) or (None, None) if no chr match.
+    """
     chrom_regex = re.compile(r'(Chr|chr|Chro|chro|Chrom|chrom|Chromosome|chromosome|CHROMOSOME|CHR|CHRO|CHROM)[ _-]*:? ?(\d+|[XYZW])')
     match = chrom_regex.search(header)
     if match:
-        # Convert chromosome number to integer to remove leading zeros
         chrom_number = match.group(2)
         if chrom_number.isdigit():
             chrom_number = str(int(chrom_number))  # Remove leading zeros
-        return f'>{file_prefix}_chr{chrom_number}', f'{file_prefix}_chr{chrom_number}'
+        base = f'>{file_prefix}_chr{chrom_number}'
+        return base, base[1:]
     return None, None
+
+
+def index_to_letters(n):
+    """
+    Convert 1 -> 'A', 2 -> 'B', ... 26 -> 'Z', 27 -> 'AA', etc. (Excel-style)
+    Assumes n >= 1.
+    """
+    letters = []
+    while n > 0:
+        n, r = divmod(n - 1, 26)
+        letters.append(chr(65 + r))
+    return ''.join(reversed(letters))
+
+
+def unique_chr_header(base_header_with_gt, used_headers, counts):
+    """
+    Generate a unique chr header by appending a letter suffix when needed.
+    - First occurrence of a given base gets no suffix.
+    - Second occurrence gets 'A', then 'B', ... (and continues AA, AB, ...)
+    Returns (unique_with_gt, unique_without_gt).
+    """
+    count = counts.get(base_header_with_gt, 0) + 1
+    counts[base_header_with_gt] = count
+
+    if count == 1:
+        candidate = base_header_with_gt
+    else:
+        suffix = index_to_letters(count - 1)  # 1->A for the second occurrence
+        candidate = f'{base_header_with_gt}{suffix}'
+
+    # Extra safety in case of unforeseen collisions
+    while candidate in used_headers:
+        count += 1
+        counts[base_header_with_gt] = count
+        suffix = index_to_letters(count - 1)
+        candidate = f'{base_header_with_gt}{suffix}'
+
+    return candidate, candidate[1:]
 
 
 def process_file(file_path, pass_files, out_dir, out_suffix):
@@ -44,7 +87,7 @@ def process_file(file_path, pass_files, out_dir, out_suffix):
     chr_sequences = {header: seqs for header, seqs in sequences.items() if rename_header(header, file_prefix)[0]}
     sca_sequences = {header: seqs for header, seqs in sequences.items() if not rename_header(header, file_prefix)[0]}
 
-    # Sort sca sequences by size
+    # Sort sca sequences by size (desc)
     sorted_sca_sequences = sorted(sca_sequences.items(), key=lambda item: -sequence_lengths[item[0]])
 
     new_lines = []
@@ -52,29 +95,37 @@ def process_file(file_path, pass_files, out_dir, out_suffix):
     fallback_counter = 1
     header_mapping = []
 
-    # Process chr sequences without sorting
+    # Track duplicates per base chr header
+    base_counts = {}
+
+    # Process chr sequences; ensure unique headers by appending suffix if needed
     for header, seqs in chr_sequences.items():
-        new_header, new_header_full = rename_header(header, file_prefix)
-        old_header = header.strip()[1:]
-        if new_header and new_header not in used_headers:
-            used_headers.add(new_header)
-            new_lines.append(f'{new_header}\n')
-            header_mapping.append(f'{old_header}\t{new_header.strip(">")}\n')
+        base_with_gt, _ = rename_header(header, file_prefix)
+        if not base_with_gt:
+            continue
+        unique_with_gt, unique_no_gt = unique_chr_header(base_with_gt, used_headers, base_counts)
+
+        old_header_no_gt = header.strip()[1:]
+        new_lines.append(f'{unique_with_gt}\n')
+        used_headers.add(unique_with_gt)
+        header_mapping.append(f'{old_header_no_gt}\t{unique_no_gt}\n')
         new_lines.append(''.join(seqs) + '\n')
 
     # Process sorted sca sequences with length check
     for header, seqs in sorted_sca_sequences:
+        # ensure unique sca header
         while f'>{file_prefix}_sca{fallback_counter}' in used_headers:
             fallback_counter += 1
         new_header_full = f'>{file_prefix}_sca{fallback_counter}'
+        # Exclude overly long 'sca' headers (historical constraint); chr headers are exempt
         if len(new_header_full) > 14:
             print(f"Excluding sequence with header {new_header_full} due to length > 13 characters.")
             break
-        old_header = header.strip()[1:]
+        old_header_no_gt = header.strip()[1:]
         new_lines.append(f'{new_header_full}\n')
         used_headers.add(new_header_full)
         fallback_counter += 1
-        header_mapping.append(f'{old_header}\t{new_header_full.strip(">")}\n')
+        header_mapping.append(f'{old_header_no_gt}\t{new_header_full[1:]}\n')
         new_lines.append(''.join(seqs) + '\n')
 
     # Feed the new_lines output directly to bioawk via stdin

@@ -5,27 +5,21 @@ import subprocess
 from argparse import ArgumentParser
 from itertools import combinations
 from concurrent.futures import ProcessPoolExecutor, as_completed
+from collections import defaultdict, Counter
 
 
-def rename_header(header, file_prefix):
-    """
-    Detect chromosome-like labels and normalize to >{prefix}_chr{N}
-    - Handles: chr/Chrom/Chromosome/CHR/etc with optional separators and optional colon+space
-    - Removes leading zeros from numeric chromosomes.
-    - Returns (base_header_with_gt, base_header_without_gt) or (None, None) if no chr match.
-    """
-    chrom_regex = re.compile(r'(Chr|chr|Chro|chro|Chrom|chrom|Chromosome|chromosome|CHROMOSOME|CHR|CHRO|CHROM)[ _-]*:? ?(\d+|[XYZW])')
-    match = chrom_regex.search(header)
-    if match:
-        chrom_number = match.group(2)
-        if chrom_number.isdigit():
-            chrom_number = str(int(chrom_number))  # Remove leading zeros
-        base = f'>{file_prefix}_chr{chrom_number}'
-        return base, base[1:]
-    return None, None
+# -----------------------------
+# Helpers for chr parsing/naming
+# -----------------------------
 
+CHR_PREFIX_RE = re.compile(
+    r'(Chr|chr|Chro|chro|Chrom|chrom|Chromosome|chromosome|CHROMOSOME|CHR|CHRO|CHROM)'
+    r'[ _-]*:? ?'                       # optional separators/colon
+    r'(\d+|[XYZW])'                     # number or X/Y/Z/W
+    r'([A-Za-z]+)?'                     # optional existing letter(s), e.g. A, B, AA
+)
 
-def index_to_letters(n):
+def index_to_letters(n: int) -> str:
     """
     Convert 1 -> 'A', 2 -> 'B', ... 26 -> 'Z', 27 -> 'AA', etc. (Excel-style)
     Assumes n >= 1.
@@ -37,31 +31,35 @@ def index_to_letters(n):
     return ''.join(reversed(letters))
 
 
-def unique_chr_header(base_header_with_gt, used_headers, counts):
+def parse_chr_from_header(header: str):
     """
-    Generate a unique chr header by appending a letter suffix when needed.
-    - First occurrence of a given base gets no suffix.
-    - Second occurrence gets 'A', then 'B', ... (and continues AA, AB, ...)
-    Returns (unique_with_gt, unique_without_gt).
+    Parse 'chr-like' label from a FASTA header line (including '>').
+    Returns (chrom_number_str, letter_or_None) or (None, None) if no chr match.
+    - Removes leading zeros from numeric chromosomes.
+    - Normalizes letter suffix to uppercase (if present).
     """
-    count = counts.get(base_header_with_gt, 0) + 1
-    counts[base_header_with_gt] = count
+    m = CHR_PREFIX_RE.search(header)
+    if not m:
+        return None, None
+    chrom = m.group(2)
+    if chrom.isdigit():
+        chrom = str(int(chrom))  # normalize leading zeros
+    letter = m.group(3).upper() if m.group(3) else None
+    return chrom, letter
 
-    if count == 1:
-        candidate = base_header_with_gt
-    else:
-        suffix = index_to_letters(count - 1)  # 1->A for the second occurrence
-        candidate = f'{base_header_with_gt}{suffix}'
 
-    # Extra safety in case of unforeseen collisions
-    while candidate in used_headers:
-        count += 1
-        counts[base_header_with_gt] = count
-        suffix = index_to_letters(count - 1)
-        candidate = f'{base_header_with_gt}{suffix}'
+def make_chr_header(prefix: str, chrom: str, letter: str | None) -> str:
+    """
+    Construct the new header (with '>') using prefix, chrom number, and optional letter.
+    """
+    if letter:
+        return f'>{prefix}_chr{chrom}{letter}'
+    return f'>{prefix}_chr{chrom}'
 
-    return candidate, candidate[1:]
 
+# -----------------------------
+# Core processing
+# -----------------------------
 
 def process_file(file_path, pass_files, out_dir, out_suffix):
     file_prefix = os.path.splitext(os.path.basename(file_path))[0]
@@ -72,6 +70,7 @@ def process_file(file_path, pass_files, out_dir, out_suffix):
     with open(file_path, 'r') as fasta_file:
         lines = fasta_file.readlines()
 
+    # Parse FASTA
     sequences = {}
     current_header = None
     for line in lines:
@@ -83,41 +82,134 @@ def process_file(file_path, pass_files, out_dir, out_suffix):
 
     sequence_lengths = {header: sum(len(seq) for seq in seqs) for header, seqs in sequences.items()}
 
-    # Separate sequences into those with chr designations and those without
-    chr_sequences = {header: seqs for header, seqs in sequences.items() if rename_header(header, file_prefix)[0]}
-    sca_sequences = {header: seqs for header, seqs in sequences.items() if not rename_header(header, file_prefix)[0]}
+    # Partition into chr-like and non-chr (sca) sequences using the new parser
+    chr_sequences = {}
+    sca_sequences = {}
+    for header, seqs in sequences.items():
+        chrom, letter = parse_chr_from_header(header)
+        if chrom is not None:
+            chr_sequences[header] = (seqs, chrom, letter)
+        else:
+            sca_sequences[header] = seqs
 
-    # Sort sca sequences by size (desc)
+    # Sort sca sequences by size (desc) for stable fallback numbering
     sorted_sca_sequences = sorted(sca_sequences.items(), key=lambda item: -sequence_lengths[item[0]])
 
     new_lines = []
     used_headers = set()
-    fallback_counter = 1
     header_mapping = []
 
-    # Track duplicates per base chr header
-    base_counts = {}
+    # -----------------------------
+    # Handle chr-groups (by chrom number)
+    #   - Preserve existing letters where present.
+    #   - If duplicates exist (group size > 1 OR collisions), assign letters
+    #     starting from 'A' to unlettered entries and to any colliding extras.
+    #   - If a chrom number is unique and has no letter, keep it unlettered.
+    # -----------------------------
+    # Group entries: chrom_number -> list of items
+    # item: (old_header, seqs, chrom, letter)
+    groups = defaultdict(list)
+    for old_header, (seqs, chrom, letter) in chr_sequences.items():
+        groups[chrom].append((old_header, seqs, chrom, letter))
 
-    # Process chr sequences; ensure unique headers by appending suffix if needed
-    for header, seqs in chr_sequences.items():
-        base_with_gt, _ = rename_header(header, file_prefix)
-        if not base_with_gt:
-            continue
-        unique_with_gt, unique_no_gt = unique_chr_header(base_with_gt, used_headers, base_counts)
+    for chrom, items in groups.items():
+        # Track letters present; handle collisions where the same letter appears multiple times
+        # Preserve the first occurrence of an existing letter; extras will be reassigned.
+        letter_counts = Counter([it[3] for it in items if it[3] is not None])
+        kept_letters = set()
+        collisions = []   # items that need new letter due to collision
+        unlettered = []   # items with no letter originally
 
-        old_header_no_gt = header.strip()[1:]
-        new_lines.append(f'{unique_with_gt}\n')
-        used_headers.add(unique_with_gt)
-        header_mapping.append(f'{old_header_no_gt}\t{unique_no_gt}\n')
-        new_lines.append(''.join(seqs) + '\n')
+        # Assign buckets while preserving order of appearance
+        prepared = []  # (old_header, seqs, chrom, letter_or_None or 'COLLISION')
+        seen_for_letter = Counter()
+        for old_header, seqs, chromN, letter in items:
+            if letter is None:
+                unlettered.append((old_header, seqs, chromN))
+                prepared.append((old_header, seqs, chromN, None))
+            else:
+                seen_for_letter[letter] += 1
+                if seen_for_letter[letter] == 1:
+                    kept_letters.add(letter)
+                    prepared.append((old_header, seqs, chromN, letter))
+                else:
+                    # collision on same letter; will need reassignment
+                    collisions.append((old_header, seqs, chromN))
+                    prepared.append((old_header, seqs, chromN, 'COLLISION'))
 
-    # Process sorted sca sequences with length check
+        # Determine if we need to assign letters in this group
+        need_letters = (
+            len(items) > 1  # multiple entries for this chrom number
+            or any(p[3] == 'COLLISION' for p in prepared)
+        )
+
+        # Build an iterator of next available letters starting at 'A', skipping kept ones
+        def next_letter_generator():
+            idx = 1  # A
+            while True:
+                cand = index_to_letters(idx)
+                if cand not in kept_letters:
+                    yield cand
+                idx += 1
+
+        letter_iter = next_letter_generator()
+
+        # Assign letters to unlettered (only if needed) and to collisions
+        assigned_letters = {}
+        if need_letters:
+            # First handle collisions so their letters change away from duplicates
+            for old_header, seqs, chromN in collisions:
+                ltr = next(letter_iter)
+                kept_letters.add(ltr)
+                assigned_letters[old_header] = ltr
+            # Then handle truly unlettered ones
+            for old_header, seqs, chromN in unlettered:
+                ltr = next(letter_iter)
+                kept_letters.add(ltr)
+                assigned_letters[old_header] = ltr
+
+        # Emit sequences in original group order with their final headers
+        for old_header, seqs, chromN, letter in prepared:
+            if letter == 'COLLISION':
+                new_letter = assigned_letters[old_header]
+            elif letter is None:
+                # If not needed, leave unlettered (unique number case).
+                # If needed, retrieve assigned letter.
+                if need_letters:
+                    new_letter = assigned_letters[old_header]
+                else:
+                    new_letter = None
+            else:
+                new_letter = letter  # preserved
+
+            new_header_with_gt = make_chr_header(file_prefix, chromN, new_letter)
+            # Safety: ensure global uniqueness (extremely unlikely after our logic, but guard anyway)
+            base = new_header_with_gt
+            if base in used_headers:
+                # rare: global collision across chroms; bump letters
+                bump_iter = next_letter_generator()
+                while base in used_headers:
+                    bump = next(bump_iter)
+                    base = make_chr_header(file_prefix, chromN, bump)
+                new_header_with_gt = base
+
+            new_lines.append(f'{new_header_with_gt}\n')
+            used_headers.add(new_header_with_gt)
+            old_header_no_gt = old_header[1:]
+            new_header_no_gt = new_header_with_gt[1:]
+            header_mapping.append(f'{old_header_no_gt}\t{new_header_no_gt}\n')
+            new_lines.append(''.join(seqs) + '\n')
+
+    # -----------------------------
+    # Handle non-chr (sca) sequences
+    # -----------------------------
+    fallback_counter = 1
     for header, seqs in sorted_sca_sequences:
         # ensure unique sca header
         while f'>{file_prefix}_sca{fallback_counter}' in used_headers:
             fallback_counter += 1
         new_header_full = f'>{file_prefix}_sca{fallback_counter}'
-        # Exclude overly long 'sca' headers (historical constraint); chr headers are exempt
+        # Historical constraint: exclude overly long 'sca' headers; chr headers are exempt
         if len(new_header_full) > 14:
             print(f"Excluding sequence with header {new_header_full} due to length > 13 characters.")
             break
@@ -128,10 +220,18 @@ def process_file(file_path, pass_files, out_dir, out_suffix):
         header_mapping.append(f'{old_header_no_gt}\t{new_header_full[1:]}\n')
         new_lines.append(''.join(seqs) + '\n')
 
-    # Feed the new_lines output directly to bioawk via stdin
+    # -----------------------------
+    # Pipe through bioawk for clean FASTA formatting
+    # -----------------------------
     bioawk_command = ["bioawk", "-c", "fastx", '{print ">"$name; print $seq}']
     try:
-        process = subprocess.Popen(bioawk_command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=False)
+        process = subprocess.Popen(
+            bioawk_command,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=False
+        )
     except FileNotFoundError:
         raise RuntimeError("bioawk not found on PATH. Please install bioawk and ensure it is accessible.")
 
@@ -141,26 +241,25 @@ def process_file(file_path, pass_files, out_dir, out_suffix):
         err_text = bioawk_err.decode('utf-8', errors='replace') if bioawk_err else ''
         raise RuntimeError(f"bioawk failed for {file_path} with exit code {process.returncode}.\n{err_text}")
 
-    # Prepare output paths
-    # - fasta and pass list honor out_suffix (or disabled when allowed)
-    # - mapping file keeps *_chrIDs.txt (no suffix), but goes to out_dir if provided
+    # -----------------------------
+    # Write outputs
+    # -----------------------------
     suffix = "" if out_suffix == "disable" else out_suffix
     fasta_filename = f"{file_prefix}{suffix}.fa"
     output_file_path = os.path.join(out_dir if out_dir else ".", fasta_filename)
 
-    # Write the bioawk processed output directly to the final file
     with open(output_file_path, 'wb') as output_file:
         output_file.write(bioawk_output)
     print(f"Processed {file_path}, output written to {output_file_path}")
 
-    # Writing the header mapping file (always named *_chrIDs.txt)
+    # Header mapping (always *_chrIDs.txt)
     mapping_filename = f"{file_prefix}_chrIDs.txt"
     mapping_file_path = os.path.join(out_dir if out_dir else ".", mapping_filename)
     with open(mapping_file_path, 'w') as mapping_file:
         mapping_file.writelines(header_mapping)
     print(f"Header mapping for {file_path} written to {mapping_file_path}")
 
-    # Check if a pass file exists for this file prefix and process it if so
+    # Pass file update if present
     pass_file = f'{file_prefix}.pass.list'
     if pass_file in pass_files:
         process_pass_file(pass_file, mapping_file_path, out_dir, out_suffix)
@@ -197,7 +296,6 @@ def process_pass_file(pass_file, mapping_file_path, out_dir, out_suffix):
             columns[0] = columns[0].replace(old_id_part, mappings[old_id_part], 1)
         new_pass_lines.append('\t'.join(columns) + '\n')
 
-    # Prepare output path for pass list (respects out_suffix setting)
     suffix = "" if out_suffix == "disable" else out_suffix
     prefix = os.path.splitext(os.path.splitext(os.path.basename(pass_file))[0])[0]
     output_pass_filename = f"{prefix}{suffix}.pass.list"
@@ -232,14 +330,12 @@ def main(genomes, pass_files, processes, out_dir, out_suffix):
             "Otherwise output could overwrite input."
         )
 
-    # Create out_dir if provided and doesn't exist
     if out_dir:
         os.makedirs(out_dir, exist_ok=True)
 
     genome_prefixes = [os.path.splitext(os.path.basename(genome))[0] for genome in genomes]
     pass_prefixes = [os.path.splitext(os.path.splitext(os.path.basename(pass_file))[0])[0] for pass_file in pass_files]
 
-    # Parallel processing of genome files with up to `processes` concurrent workers
     errors = []
     if processes < 1:
         processes = 1
@@ -257,7 +353,6 @@ def main(genomes, pass_files, processes, out_dir, out_suffix):
                 errors.append((genome_file, str(e)))
                 print(f"[ERROR] Failed processing {genome_file}: {e}")
 
-    # Generate lists after all processing completes (these live in out_dir if provided)
     generate_jcvi_list(genome_prefixes, out_dir)
     write_prefix_list('genome_list.txt', genome_prefixes, out_dir)
     write_prefix_list('pass_list.txt', pass_prefixes, out_dir)
@@ -278,8 +373,6 @@ if __name__ == "__main__":
     parser.add_argument("-genomes", nargs='+', help="FASTA files to process.", required=True)
     parser.add_argument("-pass_files", nargs='*', help="Pass files to update based on header mappings.", default=[])
     parser.add_argument("-processes", type=int, default=1, help="Max number of genomes to process concurrently (default: 1).")
-
-    # New options
     parser.add_argument(
         "-out_dir",
         type=str,

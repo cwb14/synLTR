@@ -9,37 +9,74 @@ from Bio.Seq import Seq
 
 # A companion script to 'liftover.py'.
 # Takes miniprot CDS and proteins and removes 1-2bp nt insertions that cause frameshift.
+# Adds a cautious fallback for 3–4 bp insertions that also keeps the *next* AA in-frame.
 # Outputs a modified version of the CDS that directly translates to the protein.
 # Useful for KaKs.
+
+def _aa_of(codon: str, table: int) -> Optional[str]:
+    """Translate a 3bp codon->AA (single letter). Returns None if codon is incomplete."""
+    if len(codon) != 3:
+        return None
+    return str(Seq(codon).translate(table=table))
+
+def _next_aa_matches(cds_seq: str, i_after: int, aa_next: Optional[str], table: int) -> bool:
+    """
+    Check whether the next amino acid (aa_next) matches the next codon starting at i_after.
+    If aa_next is None (we're at the last AA), consider it a match (nothing to check).
+    """
+    if aa_next is None:
+        return True
+    if i_after + 3 > len(cds_seq):
+        return False
+    aa = _aa_of(str(cds_seq[i_after:i_after+3]), table)
+    return aa == aa_next or (aa_next == 'X')  # allow X in target as wildcard for the *next* AA too
 
 def correct_cds(cds_seq, pep_seq, table=1):
     """
     Walk through cds_seq vs. pep_seq; remove any 1–2 bp insertions
-    in cds_seq that rescue the translation frame.
+    in cds_seq that rescue the translation frame. If that fails,
+    cautiously try a 3–4 bp removal but only accept it if it also keeps the
+    *following* amino acid in-frame (mitigates false positives).
+
+    'X' in the protein is treated as a wildcard AA *only if* the following AA
+    also remains in-frame (so we don't drift).
+
     Returns (fixed_seq:str, modifications:list of (pos, removed_seq)).
     """
-    i = 0  # position in cds_seq
-    j = 0  # position in pep_seq
+    i = 0  # position in cds_seq (nt)
+    j = 0  # position in pep_seq (aa)
     fixed_codons = []
     mods = []
     Lc, Lp = len(cds_seq), len(pep_seq)
+
     while j < Lp:
         aa_target = pep_seq[j]
-        # try current frame
+        aa_next = pep_seq[j+1] if (j + 1) < Lp else None
+
+        # 0-skip (current frame) acceptance rule:
+        # - exact AA match; or
+        # - if target is 'X', only accept if the *next* AA will match from i+3
         if i + 3 <= Lc:
             codon = str(cds_seq[i:i+3])
-            if str(Seq(codon).translate(table=table)) == aa_target:
+            aa0 = _aa_of(codon, table)
+            if aa0 == aa_target or (
+                aa_target == 'X' and _next_aa_matches(cds_seq, i + 3, aa_next, table)
+            ):
                 fixed_codons.append(codon)
                 i += 3
                 j += 1
                 continue
-        # else try skipping 1 or 2 bp
+
+        # Try skipping 1 or 2 bp (original behavior), with support for 'X' as wildcard
         rescued = False
         for skip in (1, 2):
             if i + skip + 3 <= Lc:
-                codon2 = str(cds_seq[i+skip:i+skip+3])
-                if str(Seq(codon2).translate(table=table)) == aa_target:
-                    removed = str(cds_seq[i:i+skip])
+                codon2 = str(cds_seq[i + skip:i + skip + 3])
+                aa2 = _aa_of(codon2, table)
+                if (aa2 == aa_target) or (
+                    aa_target == 'X' and _next_aa_matches(cds_seq, i + skip + 3, aa_next, table)
+                ):
+                    removed = str(cds_seq[i:i + skip])
                     mods.append((i, removed))
                     i += skip
                     fixed_codons.append(codon2)
@@ -47,12 +84,43 @@ def correct_cds(cds_seq, pep_seq, table=1):
                     j += 1
                     rescued = True
                     break
-        if not rescued:
-            # neither skip rescued the frame
-            raise ValueError(
-                f"Cannot align aa #{j+1} ({aa_target}) "
-                f"at cds position {i+1} (next codon != target)"
-            )
+        if rescued:
+            continue
+
+        # Fallback: try skipping 3 or 4 bp.
+        # Preference: smaller skip; also *require* that the next AA matches after the skip,
+        # to avoid false positives that push us out of frame.
+        candidates: List[Tuple[int, str]] = []  # (skip, codon_after_skip)
+        for skip in (3, 4):
+            if i + skip + 3 <= Lc:
+                codon_f = str(cds_seq[i + skip:i + skip + 3])
+                aa_f = _aa_of(codon_f, table)
+                # Accept if exact match, or 'X' with next AA remaining in-frame.
+                if (aa_f == aa_target) or (
+                    aa_target == 'X' and _next_aa_matches(cds_seq, i + skip + 3, aa_next, table)
+                ):
+                    # Require next AA to match (if exists). This is the mitigation step.
+                    if _next_aa_matches(cds_seq, i + skip + 3, aa_next, table):
+                        candidates.append((skip, codon_f))
+
+        if candidates:
+            # Choose the smallest skip that also keeps next AA in-frame (already enforced)
+            candidates.sort(key=lambda x: x[0])
+            skip, codon_f = candidates[0]
+            removed = str(cds_seq[i:i + skip])
+            mods.append((i, removed))
+            i += skip
+            fixed_codons.append(codon_f)
+            i += 3
+            j += 1
+            continue
+
+        # Nothing worked; raise a clear error as before
+        raise ValueError(
+            f"Cannot align aa #{j+1} ({aa_target}) "
+            f"at cds position {i+1} (next codon != target)"
+        )
+
     return "".join(fixed_codons), mods
 
 def setup_logging(verbose: bool):
@@ -82,7 +150,11 @@ def _worker(task) -> Tuple[str, Optional[str], List[Tuple[int, str]], Optional[s
 
 def main():
     p = argparse.ArgumentParser(
-        description="Remove 1–2 bp insertions in CDS so that it translates exactly to the given protein. Supports parallel processing."
+        description=(
+            "Remove 1–2 bp insertions in CDS so that it translates exactly to the given protein; "
+            "if needed, cautiously try 3–4 bp removals that also keep the following AA in-frame. "
+            "Supports parallel processing."
+        )
     )
     p.add_argument("-c", "--cds", required=True,
                    help="FASTA of coding sequences")

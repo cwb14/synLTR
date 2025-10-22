@@ -239,7 +239,7 @@ def step5_process_pair(work_dir: Path, script_dir: Path, g1: str, g2: str, min_b
         sys.executable, str(script_dir / "anchor_coord_consolidator.py"),
         "-t", str(min_block_size),
         str(d_out),
-        "--stitch-gaps",
+  #      "--stitch-gaps", # This function almost works, but its bugged. It should only stitch gaps if sorting by pair1_start and pair2_start support the stitch. 
     ]
     echo(f"[5/6] (e) anchor_coord_consolidator -> {out_e.name}", verbose)
     with open(out_e, "w") as fout:

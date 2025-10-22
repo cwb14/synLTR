@@ -54,32 +54,55 @@ def run_miniprot(genome, prot, threads, outn, outs, outc, write_gff_path):
 
 def parse_gff(gff_file):
     """
-    Parse the miniprot GFF to extract:
-      • peptide translations   → pep_data
-      • mRNA coords            → mrna_bed
-      • CDS coords             → cds_bed
-      • wobble-frame CDS sequences → wobbleframe_data
-    """
-    pep_data     = []
-    mrna_bed     = []
-    cds_bed      = []
-    wobbleframe_data = []
+    Parse the miniprot GFF and return:
+      • peptide translations           → pep_data
+      • mRNA coords (BED6)             → mrna_bed
+      • CDS coords (BED6)              → cds_bed
+      • wobble-frame CDS sequences     → wobbleframe_data
 
-    sequence     = ""  # for ##STA
-    atn_sequence = ""  # for ##ATN
+    New behavior:
+      - If multiple mRNAs share the same Target, they are renamed to share the
+        first-seen mRNA ID as a common prefix with numbered suffixes:
+        <first_tid>_1, <first_tid>_2, ...
+      - Singletons keep their original ID.
+      - All outputs (pep, mRNA bed/seq, cds bed) use the renamed IDs.
+    """
+    import re
+    # First pass: collect mRNA entries and CDS entries
+    # We need the sequences that precede each mRNA (##STA / ##ATN).
+    current_sta = ""
+    current_atn = ""
+
+    # mRNAs: tid -> dict with target, coords, strand, sequences
+    mrnas = {}
+    # Target -> list of tids in encounter order
+    target_to_tids = defaultdict(list)
+    # Keep encounter order of tids globally (if needed)
+    tid_order = []
+
+    # Collect CDS entries as (chrom, start0, end0, strand, parent_tid)
+    cds_entries = []
+
+    target_pat = re.compile(r"Target=([^;\s]+)")
+    id_pat = re.compile(r"ID=([^;\s]+)")
+    parent_pat = re.compile(r"Parent=([^;\s]+)")
 
     with open(gff_file) as fh:
-        for line in fh:
-            line = line.rstrip()
+        for raw in fh:
+            line = raw.rstrip()
+
             if line.startswith("#"):
                 if line.startswith("##STA"):
-                    sequence = line.split("\t", 1)[1]
+                    # Amino-acid translation (for >pep)
+                    # After tab, everything is the sequence
+                    current_sta = line.split("\t", 1)[1]
                 elif line.startswith("##ATN"):
-                    raw = line.split("\t", 1)[1]
-                    clean = re.sub(r"~\d+~", "", raw)
+                    # Nucleotide CDS with codon frames encoded; clean as in your code
+                    raw_atn = line.split("\t", 1)[1]
+                    clean = re.sub(r"~\d+~", "", raw_atn)
                     clean = clean.replace("-", "")
                     clean = re.sub(r"[a-z]", "", clean)
-                    atn_sequence = clean
+                    current_atn = clean
                 continue
 
             cols = line.split("\t")
@@ -90,18 +113,80 @@ def parse_gff(gff_file):
             attrs = cols[8]
 
             if feat == "mRNA":
-                tid = attrs.split("ID=")[1].split(";")[0]
-                pep_data.append(f">{tid}\n{sequence}")
-                wobbleframe_data.append(f">{tid}\n{atn_sequence}")
+                m = id_pat.search(attrs)
+                if not m:
+                    continue
+                tid = m.group(1)
+
+                tmatch = target_pat.search(attrs)
+                target_id = tmatch.group(1) if tmatch else "__NO_TARGET__"
+
                 s0 = int(start) - 1
                 e0 = int(end)
-                mrna_bed.append(f"{chrom}\t{s0}\t{e0}\t{tid}\t0\t{strand}")
+
+                # Store info for this mRNA (sequence state at this time)
+                mrnas[tid] = {
+                    "target": target_id,
+                    "chrom": chrom,
+                    "start0": s0,
+                    "end0": e0,
+                    "strand": strand,
+                    "sta": current_sta,
+                    "atn": current_atn,
+                }
+                target_to_tids[target_id].append(tid)
+                tid_order.append(tid)
 
             elif feat == "CDS":
-                pid = attrs.split("Parent=")[1].split(";")[0]
+                pm = parent_pat.search(attrs)
+                if not pm:
+                    continue
+                parent_tid = pm.group(1)
                 s0 = int(start) - 1
                 e0 = int(end)
-                cds_bed.append(f"{chrom}\t{s0}\t{e0}\t{pid}\t0\t{strand}")
+                cds_entries.append((chrom, s0, e0, strand, parent_tid))
+
+    # Build rename map:
+    # - singleton target -> original id
+    # - multi-target -> first seen tid as prefix, numbered by encounter order
+    rename_map = {}
+    for target, tids in target_to_tids.items():
+        if len(tids) == 1:
+            rename_map[tids[0]] = tids[0]
+        else:
+            base = tids[0]  # first-seen for this Target
+            for i, old_tid in enumerate(tids, start=1):
+                rename_map[old_tid] = f"{base}_{i}"
+
+    # Construct outputs using renamed IDs
+    pep_data = []
+    mrna_bed = []
+    cds_bed = []
+    wobbleframe_data = []
+
+    for tid in tid_order:
+        if tid not in mrnas:
+            continue
+        rec = mrnas[tid]
+        new_id = rename_map.get(tid, tid)
+
+        # Peptide FASTA from ##STA
+        if rec["sta"]:
+            pep_data.append(f">{new_id}\n{rec['sta']}")
+
+        # Wobble-frame (ATN) CDS sequence
+        if rec["atn"]:
+            wobbleframe_data.append(f">{new_id}\n{rec['atn']}")
+
+        # mRNA BED
+        mrna_bed.append(
+            f"{rec['chrom']}\t{rec['start0']}\t{rec['end0']}\t{new_id}\t0\t{rec['strand']}"
+        )
+
+    # CDS BED with Parent renamed
+    for chrom, s0, e0, strand, parent_tid in cds_entries:
+        new_parent = rename_map.get(parent_tid, parent_tid)
+        cds_bed.append(f"{chrom}\t{s0}\t{e0}\t{new_parent}\t0\t{strand}")
 
     return pep_data, mrna_bed, cds_bed, wobbleframe_data
 

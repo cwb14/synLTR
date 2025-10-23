@@ -102,8 +102,9 @@ def process_file(infile: str, threshold: int, stitch_gaps: bool):
 
     # ---------- optional stitching ----------
     if stitch_gaps:
-        # Index all records per (pair1_id, pair2_id) across BOTH strands
         from collections import defaultdict
+
+        # Index all records per (pair1_id, pair2_id) across BOTH strands (for opposite-strand guard)
         pair_index = defaultdict(list)
         for _bin_key, _lines in final_bins.items():
             for rec in _lines:
@@ -114,7 +115,7 @@ def process_file(infile: str, threshold: int, stitch_gaps: bool):
             gap1_start, gap1_end = prev[2], nxt[1]
             gap2_start, gap2_end = prev[5], nxt[4]
             if not (gap1_end > gap1_start and gap2_end > gap2_start):
-                return False  # no positive gap -> nothing to check
+                return False  # nothing to check
 
             for cand in pair_index[(prev[0], prev[3])]:
                 if cand is prev or cand is nxt:
@@ -123,41 +124,59 @@ def process_file(infile: str, threshold: int, stitch_gaps: bool):
                 if cand[6] == prev[6]:
                     continue
                 # if an opposite-strand block overlaps BOTH gap windows, it "occupies" the gap
-                if ranges_touch_or_overlap(gap1_start, gap1_end, cand[1], cand[2]) and \
-                   ranges_touch_or_overlap(gap2_start, gap2_end, cand[4], cand[5]):
+                if (cand[1] <= gap1_end and cand[2] >= gap1_start) and \
+                   (cand[4] <= gap2_end and cand[5] >= gap2_start):
                     return True
             return False
 
         for bin_key, lines in final_bins.items():
             if not lines:
                 continue
-            # Sort again to ensure chronological order for stitching
-            lines.sort(key=lambda x: (x[1], x[4]))
+
+            # Build dual orderings within THIS bin (same pair1_id, pair2_id, strand)
+            lines_by_p1 = sorted(lines, key=lambda x: (x[1], x[4]))  # pair1_start then pair2_start
+            lines_by_p2 = sorted(lines, key=lambda x: (x[4], x[1]))  # pair2_start then pair1_start
+
+            # Map "identity" of a record to its index in pair2-order for quick adjacency checks
+            pos_in_p2 = {id(rec): idx for idx, rec in enumerate(lines_by_p2)}
 
             stitched = []
-            for prev, nxt in zip(lines, lines[1:]):
+            for prev, nxt in zip(lines_by_p1, lines_by_p1[1:]):
                 stitched.append(prev)
 
-                # Compute gaps on both sequences (positive gap only)
+                # Positive gaps on both sequences?
                 gap1_start, gap1_end = prev[2], nxt[1]
                 gap2_start, gap2_end = prev[5], nxt[4]
+                if not (gap1_end > gap1_start and gap2_end > gap2_start):
+                    continue  # no stitch for touching/overlapping
 
-                if (gap1_end > gap1_start) and (gap2_end > gap2_start):
-                    # NEW GUARD: skip if opposite strand occupies the gap
-                    if not has_opposite_strand_between(prev, nxt):
-                        # Insert a synthetic line covering the gap on both sequences
-                        stitched.append([
-                            prev[0], gap1_start, gap1_end,
-                            prev[3], gap2_start, gap2_end,
-                            prev[6],
-                            gap1_end - gap1_start,
-                            gap2_end - gap2_start,
-                            bin_key,
-                            "stitched"  # internal marker; output format ignores this
-                        ])
-            # Append the last original record
-            stitched.append(lines[-1])
-            final_bins[bin_key] = stitched
+                # NEW GUARD #1: Opposite strand occupying the gap → skip
+                if has_opposite_strand_between(prev, nxt):
+                    continue
+
+                # NEW GUARD #2: Dual-order adjacency check
+                j = pos_in_p2[id(prev)]
+                k = pos_in_p2[id(nxt)]
+                if abs(j - k) != 1:
+                    # Not consecutive in pair2 order → bogus stitch, skip
+                    continue
+
+                # If both guards pass, insert the synthetic line
+                stitched.append([
+                    prev[0], gap1_start, gap1_end,
+                    prev[3], gap2_start, gap2_end,
+                    prev[6],
+                    gap1_end - gap1_start,
+                    gap2_end - gap2_start,
+                    bin_key,
+                    "stitched"  # internal marker; output format ignores this
+                ])
+
+            # append the last original record (in pair1 order)
+            stitched.append(lines_by_p1[-1])
+
+            # Keep stitched list sorted for deterministic output
+            final_bins[bin_key] = sorted(stitched, key=lambda x: (x[1], x[4]))
 
     # ---------- output ----------
     # Flatten bins in insertion order; within bin keep sorted order for determinism

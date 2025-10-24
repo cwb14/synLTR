@@ -36,8 +36,7 @@ External tools you should have on PATH (the pipeline will check and warn):
   - barrnap, sdust, trf, longdust (used inside LTR_HARVEST_parallel if enabled)
   - minimap2 (if you run the optional path)
   - Python 3
-
-Author: you + ChatGPT
+  
 """
 
 import argparse
@@ -165,7 +164,7 @@ def main():
         "-seq", str(GENOME),
         "--overlap", "30000",
         "-t", THREADS,
-        "--barrnap", "--sdust", "--trf", "--longdust"
+#       "--barrnap", "--sdust", "--trf", "--longdust" # Based on simulation, using all "--barrnap", "--sdust", "--trf", "--longdust", "--protein" leads to loss. I've not tested trying each independelntly...only all or nothing. 
     ]
     # conditionally gene-mask/protein args
     if PROTEIN:
@@ -299,7 +298,19 @@ def main():
     # Run WFA on merged SCN
     if not exists_and_handle(merged_scn_wfa, args.on_exist):
         cmd = dedent(f"""
-        {wfa_exec} <(grep -v '^#' {merged_scn} | sort | uniq) {GENOME} -x 6 -O 12 -E 4 -o 80 -e 2 -f 70 --vic-out 10 --vic-in 5 --match-thresh 14 --allowed-subs 2 --allowed-gaps 0 -A -w 200 --thresh-high 0.70 --thresh-low 0.5 > {merged_scn_wfa} 2> /dev/null
+        {wfa_exec} <(grep -v '^#' {merged_scn} | sort | uniq) {GENOME} --win-pairs 34 -x 5 -O 37 -E 7 -o 41 -e 3 -f 45 --vic-out 10 --vic-in 5 --match-thresh 18 --allowed-subs 3 --allowed-gaps 0 -A -w 200 --thresh-high 0.70 --thresh-low 0.5 > {merged_scn_wfa} 2> /dev/null
+
+        # Based on grid searching for best parameters, I think:
+        # 'match_thresh 10' to 'match_thresh 18'. Pick 14 or 18. 
+        # "allowed_gaps 0" to "allowed_gaps 1". Not sure our simulation is great for gaps, so I should maybe consider raising to 1. 
+        # "allowed_subs 1" to "allowed_subs 5".
+        # "win_pairs 30" to "win_pairs 34".
+        # "thresh_high 0.7" to "thresh_high 0.75".
+        # "thresh_low 0.5" to "thresh_low 0.6"
+        # "f 40" to "f 45".
+        # "x 3" to "x 7".
+        # "O 20" to "O 50" & "o 20" to "o 50".
+        # "E 3" to "E 9" & "e 1" to "e 5".
 
         """).strip()
         # Need bash for process substitution

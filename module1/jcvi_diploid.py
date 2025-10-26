@@ -5,7 +5,8 @@ from concurrent.futures import ThreadPoolExecutor
 import os
 import glob
 import itertools
-from typing import List, Set
+import time
+from typing import List, Set, Tuple, Dict
 
 # -------------------------
 # Helpers
@@ -16,6 +17,9 @@ LAST_DB_SUFFIXES  = [".des", ".sds", ".tis", ".ssp", ".bck", ".suf", ".prj"]
 PROT_DB_SUFFIXES  = [".pep.dmnd"]
 
 OUTPUT_CHOICES = ["pdf", "lifted", "anchors", "filtered", "last", "jcvi_list", "db", "all", "none"]
+PAIR_OUTPUT_KEYS = ("pdf", "lifted", "anchors", "filtered", "last")
+MAX_RETRIES = 2  # dumb retry count
+RETRY_SLEEP_SEC = 2  # small backoff between retries
 
 def ensure_list_file(list_file_path: str) -> None:
     """Create jcvi_list.txt if missing using *.bed or *.pep prefixes."""
@@ -45,10 +49,10 @@ def ensure_list_file(list_file_path: str) -> None:
 
     print(f"Generated '{list_file_path}' with {len(accessions)} accessions ({count_pairs} pairs).")
 
-def read_pairs(list_path: str) -> List[tuple]:
+def read_pairs(list_path: str) -> List[Tuple[str, str]]:
     with open(list_path, 'r') as infile:
         lines = [ln.strip() for ln in infile if ln.strip()]
-    pairs = []
+    pairs: List[Tuple[str, str]] = []
     for ln in lines:
         parts = ln.split()
         if len(parts) != 2:
@@ -56,7 +60,7 @@ def read_pairs(list_path: str) -> List[tuple]:
         pairs.append((parts[0], parts[1]))
     return pairs
 
-def build_expected_outputs_for_pair(col1: str, col2: str) -> dict:
+def build_expected_outputs_for_pair(col1: str, col2: str) -> Dict[str, str]:
     """Return mapping for the 5 common outputs tied to a pair (no dbs here)."""
     return {
         "pdf":      f"{col1}.{col2}.pdf",
@@ -86,6 +90,40 @@ def safe_unlink(path: str, dry_run: bool = False) -> None:
         print(f"deleted: {path}")
     except Exception as e:
         print(f"warning: failed to delete {path}: {e}")
+
+def file_nonempty(path: str) -> bool:
+    return os.path.isfile(path) and os.path.getsize(path) > 0
+
+def choose_check_keys(args_keep: List[str] or None) -> Set[str]:
+    """
+    Decide which per-pair outputs we should verify to judge success.
+    Logic:
+      - if --keep is None: check ALL standard per-pair outputs
+      - if --keep includes 'all': check ALL standard per-pair outputs
+      - otherwise: check those per-pair outputs named in --keep
+      - if that set is empty (e.g. user only kept 'db' or 'jcvi_list' or 'none'),
+        fall back to checking 'anchors' as a reasonable core artifact.
+    """
+    if args_keep is None:
+        keys = set(PAIR_OUTPUT_KEYS)
+    elif "all" in args_keep:
+        keys = set(PAIR_OUTPUT_KEYS)
+    else:
+        keys = {k for k in args_keep if k in PAIR_OUTPUT_KEYS}
+        if not keys:
+            # fallback so the retry heuristic still does something useful
+            keys = {"anchors"}
+    return keys
+
+def outputs_ok_for_pair(col1: str, col2: str, check_keys: Set[str]) -> bool:
+    expected = build_expected_outputs_for_pair(col1, col2)
+    for key in check_keys:
+        path = expected.get(key)
+        if not path:
+            continue
+        if not file_nonempty(path):
+            return False
+    return True
 
 # -------------------------
 # Main
@@ -138,24 +176,71 @@ def main():
     # Read pairs
     pairs = read_pairs(file_to_use)
 
-    # Function to run a command for a given line
-    def run_command(pair):
+    # Decide which outputs we will verify for success
+    check_keys = choose_check_keys(args.keep)
+
+    # Function to run a command for a given line, with dumb retry on missing/empty outputs
+    def run_command(pair: Tuple[str, str]) -> None:
         col1, col2 = pair
-        command = [
-            'python', '-m', 'jcvi.compara.catalog', 'ortholog',
-            col1, col2, '--no_strip_names', f'--cpus={args.cpus}',
-            '--notex', f'--cscore={args.cscore}'
-        ]
-        if args.blast:
-            command.extend(['--align_soft', 'blast'])
-        elif args.prot:
-            command.extend(['--align_soft', 'diamond_blastp', '--dbtype', 'prot'])
-        # Run
-        subprocess.run(command, check=False)
+        expected_map = build_expected_outputs_for_pair(col1, col2)
+
+        def _invoke():
+            command = [
+                'python', '-m', 'jcvi.compara.catalog', 'ortholog',
+                col1, col2, '--no_strip_names', f'--cpus={args.cpus}',
+                '--notex', f'--cscore={args.cscore}'
+            ]
+            if args.blast:
+                command.extend(['--align_soft', 'blast'])
+            elif args.prot:
+                command.extend(['--align_soft', 'diamond_blastp', '--dbtype', 'prot'])
+            # Run
+            subprocess.run(command, check=False)
+
+        # Attempt run + verification, with retries
+        attempt = 0
+        while True:
+            attempt += 1
+            if attempt > 1:
+                # Small courtesy pause before retrying
+                time.sleep(RETRY_SLEEP_SEC)
+
+            _invoke()
+
+            if outputs_ok_for_pair(col1, col2, check_keys):
+                # Success
+                return
+
+            if attempt <= MAX_RETRIES:
+                # Best-effort cleanup of any zero-byte files among the check set before retry
+                for key in check_keys:
+                    path = expected_map.get(key)
+                    if path and os.path.isfile(path) and os.path.getsize(path) == 0:
+                        try:
+                            os.remove(path)
+                        except Exception:
+                            pass
+                print(f"[retry] Detected missing/empty outputs for {col1},{col2} "
+                      f"(checked: {', '.join(sorted(check_keys))}); retry {attempt}/{MAX_RETRIES}.")
+                continue
+            else:
+                # Give up after MAX_RETRIES
+                missing = []
+                for key in check_keys:
+                    path = expected_map.get(key)
+                    if not path:
+                        continue
+                    if not os.path.isfile(path):
+                        missing.append(f"{key} (missing)")
+                    elif os.path.getsize(path) == 0:
+                        missing.append(f"{key} (empty)")
+                status = "; ".join(missing) if missing else "unknown failure state"
+                print(f"[warn] Giving up on {col1},{col2} after {MAX_RETRIES} retries: {status}.")
+                return
 
     # Run in parallel
     with ThreadPoolExecutor(max_workers=args.p) as executor:
-        executor.map(run_command, pairs)
+        list(executor.map(run_command, pairs))
 
     # -------------------------
     # Cleanup phase (optional)

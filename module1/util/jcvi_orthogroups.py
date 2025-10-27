@@ -8,6 +8,8 @@ from collections import defaultdict, Counter
 gene_re = re.compile(r'^([A-Za-z]+)(\d+)(?:_(\d+))?$')
 # Parses "Bdact016340" or "Etef739571_2" -> ("Bdact","016340","2"/None)
 
+chrom_sp_re = re.compile(r'^([A-Za-z]+)_(chr|sca)')  # e.g., Bdact_chr2, Etef_sca12
+
 def parse_gene(tok):
     m = gene_re.match(tok)
     if not m:
@@ -83,9 +85,8 @@ def choose_reference_species(species, prefer=None):
 def find_orthogroups(species, edges, copies_seen, pair_fulls, ref_sp):
     """
     Finds fully reciprocal, across-all-species orthogroups at the *base-gene* level.
-    OUTPUT CHANGE (already present): the reference species now outputs FULL IDs (with suffixes)
-    for all reference duplicates that actually pair with at least one chosen
-    base in the other species. These reference copies are placed first on the line.
+    OUTPUT: the reference species outputs FULL IDs (with suffixes) for all reference duplicates
+            that pair with at least one chosen base in the other species. These ref copies are first.
     """
     others = [s for s in species if s != ref_sp]
 
@@ -204,29 +205,199 @@ def passes_filter(tokens, filt_counts):
     filt_counts: dict species -> exact count required
     Returns True if for each specified species, the number of tokens with that prefix equals the required count.
     """
-    # Count species occurrences in this orthogroup line
     sp_counts = Counter()
     for t in tokens:
         sp, _, _ = parse_gene(t)
         sp_counts[sp] += 1
-
-    # Check exact matches for only the specified species
     for sp, required in filt_counts.items():
         if sp_counts.get(sp, 0) != required:
+            return False
+    return True
+
+# ----------------------
+# Syntenic-block filter
+# ----------------------
+
+def _extract_species_from_chrom(chrom):
+    """
+    chrom examples: 'Bdact_chr2', 'Cdact_chr2A', 'Etef_sca12'
+    returns 'Bdact', 'Cdact', 'Etef' respectively (based on prefix before _chr/_sca)
+    """
+    m = chrom_sp_re.match(chrom)
+    if not m:
+        # fallback: take alpha prefix
+        return re.match(r'^([A-Za-z]+)', chrom).group(1)
+    return m.group(1)
+
+def load_beds(bed_patterns):
+    """
+    bed_patterns: list of patterns or file paths; we will glob-expand each
+    Returns: dict full_gene_id -> (species, chrom, start, end)
+    """
+    gene2pos = {}
+    files = []
+    for p in bed_patterns:
+        files.extend(glob.glob(p))
+    for fp in files:
+        with open(fp) as fh:
+            for line in fh:
+                if not line.strip() or line.startswith("#"):  # tolerant
+                    continue
+                cols = line.rstrip("\n").split("\t")
+                if len(cols) < 4:
+                    continue
+                chrom, s, e, name = cols[0], cols[1], cols[2], cols[3]
+                try:
+                    start = int(s)
+                    end = int(e)
+                except ValueError:
+                    continue
+                sp = _extract_species_from_chrom(chrom)
+                gene2pos[name] = (sp, chrom, start, end)
+    return gene2pos
+
+def parse_region(tok):
+    """
+    tok like 'Bdact_chr1:13911..75338' -> (species, chrom, 13911, 75338)
+    """
+    chrom, coords = tok.split(":")
+    s, e = coords.split("..")
+    start, end = int(s), int(e)
+    sp = _extract_species_from_chrom(chrom)
+    return sp, chrom, start, end
+
+def load_blocks(block_patterns):
+    """
+    block_patterns: list of patterns or file paths (glob-expanded)
+    Returns:
+      blocks[(spA, spB)] = list of (A_chrom, A_s, A_e, B_chrom, B_s, B_e)
+    We store both directions, so lookups are easy either way.
+    """
+    blocks = defaultdict(list)
+    files = []
+    for p in block_patterns:
+        files.extend(glob.glob(p))
+    for fp in files:
+        with open(fp) as fh:
+            for line in fh:
+                raw = line.strip()
+                if not raw or raw.startswith("#"):
+                    continue
+                parts = raw.split()
+                if len(parts) < 2:
+                    continue
+                # accept tab or space separation; first two fields are the regions
+                a_tok = parts[0]
+                b_tok = parts[1]
+                try:
+                    spA, A_chrom, A_s, A_e = parse_region(a_tok)
+                    spB, B_chrom, B_s, B_e = parse_region(b_tok)
+                except Exception:
+                    continue
+                # store both directions
+                blocks[(spA, spB)].append((A_chrom, A_s, A_e, B_chrom, B_s, B_e))
+                blocks[(spB, spA)].append((B_chrom, B_s, B_e, A_chrom, A_s, A_e))
+    return blocks
+
+def _gene_within(chrom, s, e, block_chrom, bs, be):
+    """Return True if chrom matches and [s,e] is fully inside [bs,be]."""
+    if chrom != block_chrom:
+        return False
+    return s >= bs and e <= be
+
+def _pair_supported_by_block(geneA_pos, geneB_pos, block_list):
+    """
+    geneA_pos: (chromA, sA, eA); geneB_pos: (chromB, sB, eB)
+    block_list: list of (A_chrom, A_s, A_e, B_chrom, B_s, B_e) for a specific (spA, spB)
+    Return True if any block contains BOTH geneA and geneB.
+    """
+    chromA, sA, eA = geneA_pos
+    chromB, sB, eB = geneB_pos
+    for A_chrom, A_s, A_e, B_chrom, B_s, B_e in block_list:
+        if _gene_within(chromA, sA, eA, A_chrom, A_s, A_e) and _gene_within(chromB, sB, eB, B_chrom, B_s, B_e):
+            return True
+    return False
+
+def passes_synteny(tokens, ref_sp, gene2pos, blocks):
+    """
+    tokens: list of full IDs for one orthogroup line
+    ref_sp: reference species (first in chain)
+    gene2pos: dict full_id -> (species, chrom, start, end)
+    blocks: blocks[(spA, spB)] -> list of block tuples
+    Strategy:
+      - Build species -> list of full IDs present in this orthogroup.
+      - Form a "chain" of species: [ref, *sorted(others)].
+      - For each adjacent pair in the chain (si, sj):
+            require that there exists at least one (gene_i, gene_j) pair
+            that is covered by a syntenic block in blocks[(si, sj)].
+        If no block data exists for (si, sj), treat this pair as "unknown" and pass it.
+      - If any required pair fails, the orthogroup fails.
+    """
+    # group genes by species
+    sp2genes = defaultdict(list)
+    for g in tokens:
+        sp, _, _ = parse_gene(g)
+        sp2genes[sp].append(g)
+
+    # ensure we have positions for every gene; if not, fail
+    for g in tokens:
+        if g not in gene2pos:
+            return False
+
+    species_in_group = list(sp2genes.keys())
+    others = sorted([s for s in species_in_group if s != ref_sp])
+    chain = [ref_sp] + others
+
+    for i in range(len(chain) - 1):
+        si, sj = chain[i], chain[i+1]
+        block_key = (si, sj)
+        if block_key not in blocks or len(blocks[block_key]) == 0:
+            # No info to verify this adjacency; allow it.
+            continue
+        ok = False
+        # try all combinations; success if any pair shares a block
+        for gi in sp2genes[si]:
+            _, chrom_i, s_i, e_i = gene2pos[gi]
+            for gj in sp2genes[sj]:
+                _, chrom_j, s_j, e_j = gene2pos[gj]
+                if _pair_supported_by_block(
+                    (chrom_i, s_i, e_i),
+                    (chrom_j, s_j, e_j),
+                    blocks[block_key]
+                ):
+                    ok = True
+                    break
+            if ok:
+                break
+        if not ok:
             return False
     return True
 
 def main():
     ap = argparse.ArgumentParser(
         description="Build fully reciprocal, across-all-species orthogroups from *.anchors files, "
-                    "optionally filtering by exact per-species copy counts."
+                    "optionally filtering by (A) exact per-species copy counts OR (B) syntenic block matching."
     )
     ap.add_argument("--ref", help="Reference species to key output lines by (default: lexicographically first species).")
     ap.add_argument("-o", "--out", help="Output TSV file (default: stdout).")
-    ap.add_argument("-f", "--filter", help="Two-column file: <Species> <Count>. Only keep orthogroups whose per-species "
-                                           "copy counts EXACTLY match the provided counts. Unspecified species are unconstrained.")
+
+    # Filter A: per-species exact copy counts
+    ap.add_argument("-f", "--filter", help="Two-column file: <Species> <Count>. "
+                                           "Only keep orthogroups whose per-species copy counts EXACTLY match the provided counts. "
+                                           "Unspecified species are unconstrained.")
+
+    # Filter B: syntenic block matching
+    ap.add_argument("--beds", nargs="+",
+                    help="BED files (glob ok). Each row: chrom  start  end  geneID  ... "
+                         "Chrom must be like '[species]_chr#' or '[species]_sca#'.")
+    ap.add_argument("--blocks", nargs="+",
+                    help="Syntenic block files (glob ok). Lines like: "
+                         "'Bdact_chr1:13911..75338\\tCdact_chr1A:411902..478939\\t+'. "
+                         "We only use the first two columns.")
+
     args = ap.parse_args()
 
+    # Read anchors & build orthogroups
     species, edges, copies_seen, pair_fulls = read_anchors()
     if not species:
         raise SystemExit("No *.anchors files found.")
@@ -234,10 +405,29 @@ def main():
     ref_sp = choose_reference_species(species, args.ref)
     lines = list(find_orthogroups(species, edges, copies_seen, pair_fulls, ref_sp))
 
-    # Optional filtering step
-    if args.filter:
+    # Decide which filter (if any) is active
+    use_count_filter = bool(args.filter)
+    use_block_filter = bool(args.beds and args.blocks)
+
+    if use_count_filter and use_block_filter:
+        raise SystemExit("Choose only one filtering mode: either '-f/--filter' OR '--beds' + '--blocks'.")
+
+    # Optional per-species copy-count filter
+    if use_count_filter:
         filt_counts = load_filter_counts(args.filter)
         lines = [toks for toks in lines if passes_filter(toks, filt_counts)]
+
+    # Optional syntenic-block filter
+    elif use_block_filter:
+        gene2pos = load_beds(args.beds)
+        blocks = load_blocks(args.blocks)
+        filtered = []
+        for toks in lines:
+            if passes_synteny(toks, ref_sp, gene2pos, blocks):
+                filtered.append(toks)
+        lines = filtered
+
+    # else: no filtering
 
     if args.out:
         with open(args.out, "w") as out:

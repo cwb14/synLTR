@@ -173,12 +173,22 @@ def find_orthogroups(species, edges, copies_seen, pair_fulls, ref_sp):
 
 def load_filter_counts(path):
     """
-    Reads a two-column file specifying exact copy counts per species.
-    Format: <Species><whitespace><Count>
+    Reads a two-column file specifying per-species copy-count constraints.
+    Format per line:
+      <Species><whitespace><CountSpec>
+    Where CountSpec can be:
+      N   (exactly N)
+      N-  (≤ N)
+      N+  (≥ N)
+
     Lines starting with '#' or blank lines are ignored.
     Unspecified species are unconstrained.
+
+    Returns:
+      dict: species -> (op, value) where op ∈ {'==', '<=', '>='}
     """
     filt = {}
+    pat = re.compile(r'^(\d+)([+-])?$')  # captures integer and optional +/- suffix
     with open(path) as fh:
         for line in fh:
             raw = line.strip()
@@ -188,13 +198,18 @@ def load_filter_counts(path):
             if len(parts) < 2:
                 raise SystemExit(f"Malformed filter line (need 2 columns): {line.rstrip()}")
             sp = parts[0].strip()
-            try:
-                cnt = int(parts[1])
-            except ValueError:
-                raise SystemExit(f"Non-integer count in filter for species '{sp}': {parts[1]}")
-            if cnt < 0:
-                raise SystemExit(f"Negative count in filter for species '{sp}': {cnt}")
-            filt[sp] = cnt
+            m = pat.match(parts[1])
+            if not m:
+                raise SystemExit(f"Invalid count spec for species '{sp}': {parts[1]} (use N, N+, or N-)")
+            val = int(m.group(1))
+            suf = m.group(2)
+            if suf == '+':
+                op = '>='
+            elif suf == '-':
+                op = '<='
+            else:
+                op = '=='
+            filt[sp] = (op, val)
     if not filt:
         raise SystemExit("Filter file parsed but contained no rules.")
     return filt
@@ -202,15 +217,21 @@ def load_filter_counts(path):
 def passes_filter(tokens, filt_counts):
     """
     tokens: list of full IDs (e.g., 'Bdact001522', 'Cdact003658_1', ...)
-    filt_counts: dict species -> exact count required
-    Returns True if for each specified species, the number of tokens with that prefix equals the required count.
+    filt_counts: dict species -> (op, value), where op ∈ {'==', '<=', '>='}
+    Returns True if each specified species satisfies its constraint.
     """
     sp_counts = Counter()
     for t in tokens:
         sp, _, _ = parse_gene(t)
         sp_counts[sp] += 1
-    for sp, required in filt_counts.items():
-        if sp_counts.get(sp, 0) != required:
+
+    for sp, (op, val) in filt_counts.items():
+        c = sp_counts.get(sp, 0)
+        if op == '==' and c != val:
+            return False
+        if op == '<=' and c > val:
+            return False
+        if op == '>=' and c < val:
             return False
     return True
 
@@ -382,9 +403,10 @@ def main():
     ap.add_argument("-o", "--out", help="Output TSV file (default: stdout).")
 
     # Filter A: per-species exact copy counts
-    ap.add_argument("-f", "--filter", help="Two-column file: <Species> <Count>. "
-                                           "Only keep orthogroups whose per-species copy counts EXACTLY match the provided counts. "
-                                           "Unspecified species are unconstrained.")
+    ap.add_argument("-f", "--filter",
+                    help="Two-column file: <Species> <CountSpec>. CountSpec: N (exact), N- (≤N), N+ (≥N). "
+                         "Only keep orthogroups whose per-species copy counts satisfy the provided constraints. "
+                         "Unspecified species are unconstrained.")
 
     # Filter B: syntenic block matching
     ap.add_argument("--beds", nargs="+",
@@ -405,17 +427,24 @@ def main():
     ref_sp = choose_reference_species(species, args.ref)
     lines = list(find_orthogroups(species, edges, copies_seen, pair_fulls, ref_sp))
 
-    # Decide which filter (if any) is active
+    # Decide which filters (if any) are active
     use_count_filter = bool(args.filter)
     use_block_filter = bool(args.beds and args.blocks)
 
-    if use_count_filter and use_block_filter:
-        raise SystemExit("Choose only one filtering mode: either '-f/--filter' OR '--beds' + '--blocks'.")
-
-    # Optional per-species copy-count filter
+    # Apply per-species copy-count filter first (if requested)
     if use_count_filter:
         filt_counts = load_filter_counts(args.filter)
         lines = [toks for toks in lines if passes_filter(toks, filt_counts)]
+
+    # Then apply syntenic-block filter (if requested)
+    if use_block_filter:
+        gene2pos = load_beds(args.beds)
+        blocks = load_blocks(args.blocks)
+        filtered = []
+        for toks in lines:
+            if passes_synteny(toks, ref_sp, gene2pos, blocks):
+                filtered.append(toks)
+        lines = filtered
 
     # Optional syntenic-block filter
     elif use_block_filter:

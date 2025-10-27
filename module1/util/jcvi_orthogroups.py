@@ -3,7 +3,7 @@ import argparse
 import glob
 import os
 import re
-from collections import defaultdict
+from collections import defaultdict, Counter
 
 gene_re = re.compile(r'^([A-Za-z]+)(\d+)(?:_(\d+))?$')
 # Parses "Bdact016340" or "Etef739571_2" -> ("Bdact","016340","2"/None)
@@ -83,7 +83,7 @@ def choose_reference_species(species, prefer=None):
 def find_orthogroups(species, edges, copies_seen, pair_fulls, ref_sp):
     """
     Finds fully reciprocal, across-all-species orthogroups at the *base-gene* level.
-    OUTPUT CHANGE: the reference species now outputs FULL IDs (with suffixes)
+    OUTPUT CHANGE (already present): the reference species now outputs FULL IDs (with suffixes)
     for all reference duplicates that actually pair with at least one chosen
     base in the other species. These reference copies are placed first on the line.
     """
@@ -146,9 +146,7 @@ def find_orthogroups(species, edges, copies_seen, pair_fulls, ref_sp):
 
             out_tokens = []
 
-            # NEW: collect all reference FULL copies that actually pair with the chosen bases
-            # across the selected solution. Use union across species; if none found, fall back
-            # to all observed copies of this ref_base.
+            # Collect all reference FULL copies that actually pair with the chosen bases
             ref_fulls_union = set()
             for sp in sorted(others):
                 chosen_base = sol[sp]
@@ -172,10 +170,61 @@ def find_orthogroups(species, edges, copies_seen, pair_fulls, ref_sp):
 
             yield out_tokens
 
+def load_filter_counts(path):
+    """
+    Reads a two-column file specifying exact copy counts per species.
+    Format: <Species><whitespace><Count>
+    Lines starting with '#' or blank lines are ignored.
+    Unspecified species are unconstrained.
+    """
+    filt = {}
+    with open(path) as fh:
+        for line in fh:
+            raw = line.strip()
+            if not raw or raw.startswith("#"):
+                continue
+            parts = raw.split()
+            if len(parts) < 2:
+                raise SystemExit(f"Malformed filter line (need 2 columns): {line.rstrip()}")
+            sp = parts[0].strip()
+            try:
+                cnt = int(parts[1])
+            except ValueError:
+                raise SystemExit(f"Non-integer count in filter for species '{sp}': {parts[1]}")
+            if cnt < 0:
+                raise SystemExit(f"Negative count in filter for species '{sp}': {cnt}")
+            filt[sp] = cnt
+    if not filt:
+        raise SystemExit("Filter file parsed but contained no rules.")
+    return filt
+
+def passes_filter(tokens, filt_counts):
+    """
+    tokens: list of full IDs (e.g., 'Bdact001522', 'Cdact003658_1', ...)
+    filt_counts: dict species -> exact count required
+    Returns True if for each specified species, the number of tokens with that prefix equals the required count.
+    """
+    # Count species occurrences in this orthogroup line
+    sp_counts = Counter()
+    for t in tokens:
+        sp, _, _ = parse_gene(t)
+        sp_counts[sp] += 1
+
+    # Check exact matches for only the specified species
+    for sp, required in filt_counts.items():
+        if sp_counts.get(sp, 0) != required:
+            return False
+    return True
+
 def main():
-    ap = argparse.ArgumentParser(description="Build fully reciprocal, across-all-species orthogroups from *.anchors files.")
+    ap = argparse.ArgumentParser(
+        description="Build fully reciprocal, across-all-species orthogroups from *.anchors files, "
+                    "optionally filtering by exact per-species copy counts."
+    )
     ap.add_argument("--ref", help="Reference species to key output lines by (default: lexicographically first species).")
     ap.add_argument("-o", "--out", help="Output TSV file (default: stdout).")
+    ap.add_argument("-f", "--filter", help="Two-column file: <Species> <Count>. Only keep orthogroups whose per-species "
+                                           "copy counts EXACTLY match the provided counts. Unspecified species are unconstrained.")
     args = ap.parse_args()
 
     species, edges, copies_seen, pair_fulls = read_anchors()
@@ -184,6 +233,11 @@ def main():
 
     ref_sp = choose_reference_species(species, args.ref)
     lines = list(find_orthogroups(species, edges, copies_seen, pair_fulls, ref_sp))
+
+    # Optional filtering step
+    if args.filter:
+        filt_counts = load_filter_counts(args.filter)
+        lines = [toks for toks in lines if passes_filter(toks, filt_counts)]
 
     if args.out:
         with open(args.out, "w") as out:

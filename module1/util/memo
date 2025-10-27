@@ -1,0 +1,63 @@
+######## Notes on synteny-guided chromosome rename, reorientation, and chronogram construction. ########
+
+# Run first pass.
+python synLTR/module1.py --script_dir ./synLTR/module1/ --genomes ../Bdact.fa ../Cdact.fa ../Etef.fa ../Sbico.fa ../Osati.fa --threads 30 --dir_name test --protein_fa ../../Sbico.faa --miniprot_outn 10 --verbose
+
+# Get homolog summaries.
+cd test/
+for f in *.anchors.coords.polished2.consolidated; do python ../synLTR/module1/util/homolog_identifier.py --input "$f" > "${f}.pairs"; done
+
+# Identify best match.
+for f in *.anchors.coords.polished2.consolidated.pairs; do
+  if [[ "$f" == Bdact.* || "$f" == *.Bdact.* ]]; then
+    python ../synLTR/module1/util/best_homolog.py Bdact "$f" > "$f.best"
+  fi
+done
+# Merge.
+cat *anchors.coords.polished2.consolidated.pairs.best > all.anchors.coords.polished2.consolidated.pairs.best
+
+# Re-orient.
+python ../synLTR/module1/util/homolog_renamer.py --allow-sca all.anchors.coords.polished2.consolidated.pairs.best ./
+
+# Prep to redo. 
+mkdir reorient
+mv *mod.fa reorient/
+cd reorient/
+for f in *_mod.*; do mv "$f" "${f/_mod/}"; done
+
+# Redo.
+python ../../synLTR/module1.py --script_dir ../../synLTR/module1/ --genomes ./Bdact.fa ./Cdact.fa ./Etef.fa ./Sbico.fa ./Osati.fa --threads 150 --dir_name redo --protein_fa ../../../../Sbico.faa --miniprot_outn 10 --verbose
+
+## Create the orthogroups file. 
+
+# No filter. 
+python ../../../synLTR/module1/util/jcvi_orthogroups.py > orthogroups.tsv
+
+# Filter by count expectation. 
+# 'ploidy.tsv' is this:
+# Bdact	1
+# Osati	1
+# Sbico	1
+# Cdact 2-
+# Etef	2-
+# This says the diploids should have one copy. Tetraploids are allowed less than or equal to two. 
+python ../../../synLTR/module1/util/jcvi_orthogroups.py -f ploidy.tsv > orthogroups.tsv
+
+# Filter by overlapping syntenic block. This doesnt filter out too much.
+python ../../../synLTR/module1/util/jcvi_orthogroups.py --beds ./*bed --blocks "*anchors.coords.polished2.consolidated" > orthogroups.tsv
+
+# Filter by both.
+# This is the one Im using. 
+python ../../../synLTR/module1/util/jcvi_orthogroups.py -f ploidy.tsv --beds ./*bed --blocks "*anchors.coords.polished2.consolidated" > orthogroups.tsv 
+
+# Get the orthogroup sequences.
+python ../../../synLTR/module1/util/jcvi_OGseqs.py --cds *.cds.inframe --peps *.pep --seed 32 --orthogroups orthogroups.tsv
+# Backtrans.
+bash ../../../synLTR/module1/util/backtranslate.sh --threads 4 --processes 100 --trim-mode strict --pep-dir orthogroups/pep  --cds-dir orthogroups/cds --force
+
+# Create supermatrix.
+python ../../../synLTR/module1/util/build_smtx.py --input_glob "codon_align/*.codon.trim.fna" --out_prefix supermatrix 
+
+# Create species tree.
+iqtree3 -s supermatrix.fna -p supermatrix.partitions.genes.txt -m MFP+MERGE -B 1000 --boot-trees --sampling GENE -T AUTO --prefix iqtree_genepart_outgroup --symtest-remove-bad -o Osati
+

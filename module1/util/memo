@@ -16,6 +16,16 @@ done
 # Merge.
 cat *anchors.coords.polished2.consolidated.pairs.best > all.anchors.coords.polished2.consolidated.pairs.best
 
+    # Optionally, I can try to phase.
+    # Throw those that appear polyploid into a config. 
+    cat all.anchors.coords.polished2.consolidated.pairs.best |cut -f 2,4,6,8 | grep -v 'Aumbe\|Zmay\|Cnlem\|Bdist\|Ecurv\|Eindi\|NA\|Lperr\|Osati\|Ocape\|Othom\|Plati\|Sbico\|Tfili' > config
+    # Attempt phasing. 
+    for fa in *.fa; do
+        prefix=$(basename "$fa" .fa)
+        echo "Processing $prefix..."
+        subphaser -i "$fa" -c <(grep "$prefix" config) -disable_ltr -o "${prefix}_subphase"
+    done
+
 # Re-orient.
 python ../synLTR/module1/util/homolog_renamer.py --allow-sca all.anchors.coords.polished2.consolidated.pairs.best ./
 

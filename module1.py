@@ -25,7 +25,7 @@ Features:
 - Parallel per-pair anchors processing, capped by --threads.
 - Verbose mode to stream underlying tool output; quiet mode prints high-level progress.
 
-Author: Ou Lab automation helper
+Author: Chris Benson & ChatGPT
 """
 
 import argparse
@@ -110,7 +110,7 @@ def step3_liftover_per_genome(clean_genome_names, script_dir: Path, work_dir: Pa
         "--threads", str(threads),
         "--cdhit",
         "--outputs", "pep", "bed",
-        "--TEsorter",
+#        "--TEsorter",
     ]
     echo("[3/6] Running liftover.py", verbose)
     run_cmd(cmd, cwd=work_dir, verbose=verbose)
@@ -381,7 +381,7 @@ def main():
     # (6) Cleanup intermediates
     step6_cleanup(work_dir, genome_stems, args.verbose)
 
-    echo("✅ Pipeline complete.", verbose=True)
+    echo("Pipeline complete.", verbose=True)
 
 if __name__ == "__main__":
     main()

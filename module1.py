@@ -110,7 +110,7 @@ def step3_liftover_per_genome(clean_genome_names, script_dir: Path, work_dir: Pa
         "--threads", str(threads),
         "--cdhit",
         "--outputs", "pep", "bed",
-#        "--TEsorter",
+        "--TEsorter",
     ]
     echo("[3/6] Running liftover.py", verbose)
     run_cmd(cmd, cwd=work_dir, verbose=verbose)

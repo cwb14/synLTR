@@ -153,9 +153,11 @@ def main():
 
     ltrharvest_args = (
         '-similar 70 -minlenltr 100 -maxlenltr 7000 -mintsd 4 -maxtsd 8 -seqids yes -overlaps all -seed 10'
+#       '-similar 70 -minlenltr 100 -maxlenltr 7000 -mintsd 4 -maxtsd 8 -seqids yes -overlaps best -seed 20 -xdrop 5'
     )
     ltrfinder_args = (
         '-w 2 -D 15000 -d 500 -L 7000 -l 100 -S 4 -p 10 -g 150'
+#       '-w 2 -D 15000 -d 500 -L 7000 -l 100 -S 6 -p 15 -g 50'
     )
     sweep_file = repo_ltrharv / "sweep.tsv"
 
@@ -164,6 +166,7 @@ def main():
         "-seq", str(GENOME),
         "--overlap", "30000",
         "-t", THREADS,
+#       "--barrnap"      
 #       "--barrnap", "--sdust", "--trf", "--longdust" # Based on simulation, using all "--barrnap", "--sdust", "--trf", "--longdust", "--protein" leads to loss. I've not tested trying each independelntly...only all or nothing. 
     ]
     # conditionally gene-mask/protein args
@@ -171,9 +174,9 @@ def main():
         base_cmd += ["--gene-mask", "--mp-outn", "1000", "--mp-outs", "0.99", "--mp-outc", "0.1", "--protein", str(PROTEIN)]
     base_cmd += [
         "--ltrharvest-args", f"{ltrharvest_args}",
-        "--run-ltrfinder",
-        "--ltrfinder-args", f"{ltrfinder_args}",
-        "--sweep-file", str(sweep_file)
+        "--run-ltrfinder", # Tab it out for just harvest.
+        "--ltrfinder-args", f"{ltrfinder_args}", # Tab it out for just harvest.
+        "--sweep-file", str(sweep_file) # Tab it out to skip sweep.
     ]
 
     # Skip if main outputs exist and on-exist=skip
@@ -213,7 +216,8 @@ def main():
         mm_cmd = [
             sys.executable, str(minimap2_LTR_py), str(GENOME),
             "-t", "1", "-p", THREADS,
-            "--mp-outn", "1000", "--mp-outs", "0.99", "--mp-outc", "0.1",
+#            "--mp-outn", "1000", "--mp-outs", "0.99", "--mp-outc", "0.1",
+            "--mp-outn", "1000", "--mp-outs", "0.98", "--mp-outc", "0.1",
             "--out-prefix", mm_prefix,
             "--min-internal", "100", "--max-internal", "30000",
             "--min-ltr", "100", "--max-ltr", "15000",

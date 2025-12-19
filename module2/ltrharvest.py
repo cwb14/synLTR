@@ -22,13 +22,17 @@ Default parameters are benchmarked with PrinTE:
 
 - python ltrharvest.py --genome burnin.fasta --proteins PrinTE/data/TAIR10.pep.fa.gz --te-library lib_clean.fa --out-prefix myrun --threads 100
 
+# ltrharvest.
 - python ./PrinTE/util/bedtools.py -pass_scn myrun.ltrharvest.stitched.scn -bed <(cat burnin.bed | grep -v FRAG | grep -v gene | grep LTR) -r 0.90 -print unique-bed
   Overlapping entries: 1800 (1793 unique)
   Entries unique to SCN/PASS file: 8
   Entries unique to BED file: 6
 
-
-
+# ltrharvest + TEsorter.
+- python ./PrinTE/util/bedtools2.py -pass_scn <(cat myrun.ltrharvest.stitched.fa.rexdb-plant.cls.lib.fa | grep '>' | sed 's/^>//; s/#.*//') -bed <(cat burnin.bed | grep -v FRAG | grep -v gene | grep LTR) -r 0.90
+  Overlapping entries: 1658 (1651 unique)
+  Entries unique to SCN/PASS file: 4
+  Entries unique to BED file: 148
 """
 
 import argparse

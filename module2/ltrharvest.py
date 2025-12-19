@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
 LTRharvest pipeline (SCN fixed + minor edits)
+LTRharvest parameters are aggressive. Masking genes and non-LTR-RT TEs helps, but still, many false positives with real data. TEsorter is used to clean them up.  
 
 Key fix:
 - DO NOT use `-out` for SCN. `-out` produces FASTA sequences.
@@ -25,6 +26,9 @@ Default parameters are benchmarked with PrinTE:
   Overlapping entries: 1800 (1793 unique)
   Entries unique to SCN/PASS file: 8
   Entries unique to BED file: 6
+
+
+
 """
 
 import argparse

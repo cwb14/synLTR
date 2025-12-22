@@ -1,0 +1,24 @@
+# Divk looks off, so looks like it will need to be corrected. These scripts hopefully will help train a gradient boosted or other model that could then be used to correct divK. 
+
+# Remove non-ATCG characters. 
+python convert_nonbases.py athrep.updated.fasta_062024.ltr.full athrep.updated.fasta_062024.ltr.bases.full 
+# Note, i did this for all libs, but only showing arabidopsis above. 
+
+# Create a big lib of LTR-RTs.
+cat ltr-db.bases.fa maize*bases* athrep.updated.fasta_062024.ltr.bases.full rice7.0.0.liban.ltr.bases.full > ltr-db.full.fa
+
+# Run it for burn-in
+bash ../PrinTE/PrinTE.sh -P 20 -itp 70 -ftp 0 -sz 300Mb -i ltr-db.full.fa -F 3.0e-11,5e-11 -m 3e-8 --TE_ratio ../PrinTE/ratios_ltr_only.tsv -k 0 --TsTv 2.0 --ex_LTR --threads 200 --step 50000 --generation_end 3000000 --burnin_only --TE_mut_Mmax 15 --TE_mut_k 15
+
+# Add shared. 
+awk -F'\t' '{
+  if ($4 !~ /^gene/) $4 = "shared_" $4;
+  print $0
+}' OFS='\t' burnin.bed > burnin2.bed && mv burnin2.bed burnin.bed
+
+# Run on a single lineage. 
+mkdir lineage1 && cd lineage1
+cp ../burnin* ./
+
+# Smaller step, higher insertion rate, lower deletion rate. 
+nohup /usr/bin/time -v bash ../../PrinTE/PrinTE.sh -i ../ltr-db.full.fa -F 9.0e-11,1e-11 --TE_ratio ../../PrinTE/ratios_ltr_only.tsv -k 0 --TsTv 2.0 --ex_LTR --threads 200 --step 10000 --generation_end 5000000 --fasta burnin.fasta --bed burnin.bed --mutation_rate 3e-8 --seed 20 &

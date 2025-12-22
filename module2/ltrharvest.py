@@ -1,17 +1,12 @@
 #!/usr/bin/env python3
 """
-LTRharvest pipeline (SCN fixed + minor edits)
-LTRharvest parameters are aggressive. Masking genes and non-LTR-RT TEs helps, but still, many false positives with real data. TEsorter is used to clean them up.  
+(1) Masks genes and non-LTR TEs
+(2) Runs ltrharvest and ltr_finder and merges results.
+(3) Feeds LTR-RT internal sequence to TEsorter to filter out false positives (plus some true positives).
+(4) Runs kmer2ltr on remaining pool.
+(5) Purges duplicate LTR-RTs based on kmer2ltr LTR divergence.
+NOTE: "--tesorter-tree" currently broken. To fix, we'd simply re-run TEsorter on the remaining deduped full length LTR-RTs.
 
-Key fix:
-- DO NOT use `-out` for SCN. `-out` produces FASTA sequences.
-- For SCN/tabular output (LTR_retriever-style), capture stdout with `-tabout yes`.
-- GFF3 is written to a file via `-gff3 <filename>`.
-
-Outputs (outside of {prefix}.work):
-- {prefix}.ltrharvest.stitched.gff3  (lifted to genome coords; seqid=chrom)
-- {prefix}.ltrharvest.stitched.scn   (lifted to genome coords; appended chrom as last field)
-- {prefix}.ltrharvest.stitched.fa    (FASTA extracted from stitched SCN using s(ret)/e(ret))
 
 Tools:
 - Uses ./tools/minimap2/minimap2 and ./tools/miniprot/miniprot by default.
@@ -40,6 +35,8 @@ import os
 import re
 import shutil
 import subprocess
+import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Tuple, Iterable, Optional
@@ -69,6 +66,17 @@ def mkdirp(p: Path):
     p.mkdir(parents=True, exist_ok=True)
     return p
 
+def _format_hms(seconds: float) -> str:
+    if not seconds or seconds == float("inf"):
+        return "unknown"
+    seconds = int(seconds)
+    h = seconds // 3600
+    m = (seconds % 3600) // 60
+    s = seconds % 60
+    if h > 0:
+        return f"{h:d}:{m:02d}:{s:02d}"
+    else:
+        return f"{m:d}:{s:02d}"
 
 # -----------------------------
 # FASTA helpers
@@ -105,6 +113,10 @@ def load_fasta_as_dict(path: str) -> Dict[str, str]:
     for name, seq in iter_fasta(path):
         d[name] = seq
     return d
+
+def revcomp(seq: str) -> str:
+    comp = str.maketrans("ACGTacgtNn", "TGCAtgcaNn")
+    return seq.translate(comp)[::-1]
 
 
 # -----------------------------
@@ -316,32 +328,220 @@ def build_suffixerator_index(gt_path: str, chunk_fa: str, indexname: str):
     if r.returncode != 0:
         raise RuntimeError(f"gt suffixerator failed for {chunk_fa}:\n{(r.stderr or '').strip()}")
 
-def run_ltrharvest_scn_and_gff3(gt_path: str, indexname: str, scn_path: str, gff3_path: str, ltrharvest_args: List[str]):
+def run_ltrharvest_scn_and_gff3(
+    gt_path: str,
+    indexname: str,
+    scn_path: str,
+    gff3_path: str,
+    ltrharvest_args: List[str],
+    timeout_s: int = 0
+):
     """
     - SCN/tabular output is stdout (with -tabout yes)
     - GFF3 output goes to gff3_path (with -gff3 <file>)
+    - If timeout occurs, salvage partial stdout to scn_path and keep any partial gff3 file.
     """
     cmd = [gt_path, "ltrharvest", "-index", indexname] + ltrharvest_args + ["-tabout", "yes", "-gff3", gff3_path]
-    r = run(cmd, capture=True)
-    if r.returncode != 0:
-        raise RuntimeError(f"gt ltrharvest failed for index {indexname}:\n{(r.stderr or '').strip()}")
 
-    Path(scn_path).write_text(r.stdout or "")
+    try:
+        r = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=(timeout_s if timeout_s and timeout_s > 0 else None),
+        )
+        if r.returncode != 0:
+            raise RuntimeError(f"gt ltrharvest failed for index {indexname}:\n{(r.stderr or '').strip()}")
+        Path(scn_path).write_text(r.stdout or "")
 
-def process_one_chunk(gt_path: str, chunk: ChunkInfo, work_dir: str, ltrharvest_args: List[str]) -> Tuple[ChunkInfo, str, str]:
+    except subprocess.TimeoutExpired as te:
+        # Salvage partial stdout (SCN/tabout-like)
+        partial = te.stdout or ""
+        Path(scn_path).write_text(partial)
+
+        # Keep partial gff3 file if it exists; if not, touch it so stitch step doesn't error
+        gp = Path(gff3_path)
+        if not gp.exists():
+            gp.touch()
+
+        # Do NOT raise — allow pipeline to continue and stitch/merge what we got
+        print(f"[WARN] ltrharvest timeout for index {indexname} after {timeout_s}s; salvaged partial SCN/GFF3.", file=sys.stderr)
+
+def process_one_chunk(
+    gt_path: str,
+    ltrfinder_path: str,
+    chunk: ChunkInfo,
+    work_dir: str,
+    ltrharvest_args: List[str],
+    ltrfinder_args: List[str],
+    ltr_tools: str,
+    ltr_timeout_s: int = 0,   # <-- ADD
+) -> Tuple[ChunkInfo, Optional[str], Optional[str], Optional[str]]:
+
+    """
+    Returns:
+      (chunk,
+       ltrharvest_scn_path or None,
+       ltrharvest_gff3_path or None,
+       ltrfinder_scn_path (converted) or None)
+    """
     wdir = mkdirp(Path(work_dir) / chunk.chunk_id)
     local_fa = str(wdir / Path(chunk.fasta_path).name)
     shutil.copyfile(chunk.fasta_path, local_fa)
 
-    indexname = str(wdir / "idx")
-    build_suffixerator_index(gt_path, local_fa, indexname)
+    harvest_scn_path = None
+    harvest_gff3_path = None
+    finder_scn_path = None
 
-    scn_path = str(wdir / f"{chunk.chunk_id}.ltrharvest.scn")
-    gff3_path = str(wdir / f"{chunk.chunk_id}.ltrharvest.gff3")
+    if ltr_tools in ("both", "ltrharvest"):
+        indexname = str(wdir / "idx")
+        build_suffixerator_index(gt_path, local_fa, indexname)
 
-    run_ltrharvest_scn_and_gff3(gt_path, indexname, scn_path, gff3_path, ltrharvest_args)
-    return chunk, scn_path, gff3_path
+        harvest_scn_path = str(wdir / f"{chunk.chunk_id}.ltrharvest.scn")
+        harvest_gff3_path = str(wdir / f"{chunk.chunk_id}.ltrharvest.gff3")
+        run_ltrharvest_scn_and_gff3(
+            gt_path, indexname, harvest_scn_path, harvest_gff3_path, ltrharvest_args,
+            timeout_s=ltr_timeout_s
+        )
 
+
+    if ltr_tools in ("both", "ltr_finder"):
+        raw_path = str(wdir / f"{chunk.chunk_id}.ltr_finder.raw.scn")
+        conv_path = str(wdir / f"{chunk.chunk_id}.ltr_finder.ltrharvest_like.scn")
+
+        run_ltrfinder_raw(ltrfinder_path, local_fa, raw_path, ltrfinder_args, timeout_s=ltr_timeout_s)
+        raw_text = Path(raw_path).read_text() if Path(raw_path).exists() else ""
+        ltrfinder_w2_to_ltrharvest_scn(raw_text, conv_path)
+
+        finder_scn_path = conv_path
+
+    return chunk, harvest_scn_path, harvest_gff3_path, finder_scn_path
+
+# -----------------------------
+# Step 5b: ltr_finder per chunk + convert to ltrharvest-style SCN
+# -----------------------------
+
+def run_ltrfinder_raw(ltrfinder_path: str, chunk_fa: str, raw_out_path: str, ltrfinder_args: List[str], timeout_s: int = 0):
+    """
+    Runs ltr_finder on chunk_fa. Captures stdout to raw_out_path.
+    If timeout occurs, salvages partial stdout to raw_out_path.
+    NOTE: -w 2 is required (user stated); enforced elsewhere.
+    """
+    cmd = [ltrfinder_path] + ltrfinder_args + [chunk_fa]
+
+    try:
+        r = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=(timeout_s if timeout_s and timeout_s > 0 else None),
+        )
+        if r.returncode != 0:
+            raise RuntimeError(f"ltr_finder failed:\n{(r.stderr or '').strip()}")
+        Path(raw_out_path).write_text(r.stdout or "")
+
+    except subprocess.TimeoutExpired as te:
+        partial = te.stdout or ""
+        Path(raw_out_path).write_text(partial)
+        print(f"[WARN] ltr_finder timeout after {timeout_s}s on {chunk_fa}; salvaged partial stdout.", file=sys.stderr)
+
+def ltrfinder_w2_to_ltrharvest_scn(raw_text: str, out_scn_path: str):
+    """
+    Convert LTR_FINDER -w 2 output to LTRharvest tabout-like SCN.
+
+    Output columns (space-separated):
+      s(ret) e(ret) l(ret) s(lLTR) e(lLTR) l(lLTR) s(rLTR) e(rLTR) l(rLTR) sim(LTRs) seq-nr chr
+
+    We mimic the provided Perl logic, but in Python.
+    """
+    seq_id = -1
+    n_written = 0
+
+    with open(out_scn_path, "w") as out:
+        # Header lines start with ## so your stitch_scn() will skip them (it skips '#')
+        out.write("## LTR_FINDER\n")
+        out.write("## Converted to LTRharvest-like SCN/tabout\n")
+        out.write("## s(ret) e(ret) l(ret) s(lLTR) e(lLTR) l(lLTR) s(rLTR) e(rLTR) l(rLTR) sim(LTRs) seq-nr chr\n")
+
+        for line in raw_text.splitlines():
+            if not line:
+                continue
+            if line.startswith(">"):
+                seq_id += 1
+                continue
+            if not line.startswith("["):
+                continue
+
+            # Perl: s/\[\s+/\[/g;
+            line2 = re.sub(r"^\[\s+", "[", line.strip())
+
+            toks = line2.split()
+            # Need enough tokens to safely index [1,2,3,4,12,15]
+            if len(toks) <= 15:
+                continue
+
+            chr_ = toks[1]
+            loc = toks[2]
+            lens = toks[3]      # "lLTRlen,rLTRlen"
+            ltr_len = toks[4]   # full-length length
+            direction = toks[12]
+            similarity = toks[15]
+
+            mloc = re.match(r"^(\d+)\-(\d+)$", loc)
+            mlens = re.match(r"^(\d+),(\d+)$", lens)
+            if not mloc or not mlens:
+                continue
+
+            sret = int(mloc.group(1))
+            eret = int(mloc.group(2))
+            lltr_len = int(mlens.group(1))
+            rltr_len = int(mlens.group(2))
+
+            # Compute LTR coordinates
+            eltr = sret + lltr_len - 1
+            srtr = eret - rltr_len + 1
+
+            # Basic sanity
+            if sret <= 0 or eret <= 0 or eltr < sret or srtr > eret:
+                continue
+
+            # ltr_finder similarity can be e.g. "0.85" or "85.0%" depending on build/output.
+            # ltrharvest "sim(LTRs)" is typically percent-like. We'll normalize:
+            sim_val = None
+            try:
+                if similarity.endswith("%"):
+                    sim_val = float(similarity.rstrip("%"))
+                else:
+                    sim_val = float(similarity)
+                    # If it's 0..1, scale to percent
+                    if 0.0 <= sim_val <= 1.0:
+                        sim_val *= 100.0
+            except Exception:
+                continue
+
+            # l(ret) should match provided LTR_len token; fallback to eret-sret+1 if needed
+            try:
+                lret = int(float(ltr_len))
+            except Exception:
+                lret = eret - sret + 1
+
+            if seq_id < 0:
+                # If input had no '>' lines (unlikely), set to 0
+                seq_id = 0
+
+            # Direction is not represented in SCN columns; kept only for your debugging if needed.
+            out.write(
+                f"{sret} {eret} {lret} "
+                f"{sret} {eltr} {lltr_len} "
+                f"{srtr} {eret} {rltr_len} "
+                f"{sim_val:.2f} {seq_id} {chr_}\n"
+            )
+            n_written += 1
+
+    if n_written == 0:
+        Path(out_scn_path).touch()
 
 # -----------------------------
 # Step 6: stitch outputs (lift coords and normalize seqid)
@@ -438,17 +638,62 @@ def stitch_scn(chunk_triplets: List[Tuple[ChunkInfo, str, str]], stitched_out: s
     if n_written == 0:
         Path(stitched_out).touch()
 
+def stitch_scn_from_pairs(pairs: List[Tuple[ChunkInfo, str]], stitched_out: str):
+    triplets = [(c, scn, "") for (c, scn) in pairs]  # dummy gff slot
+    stitch_scn(triplets, stitched_out)
+
+def merge_stitched_scns(stitched_scns: List[str], merged_out: str):
+    """
+    Merge multiple stitched SCN files into one, removing duplicates.
+
+    Dedup key:
+      (chrom, s(ret), e(ret), s(lLTR), e(lLTR), s(rLTR), e(rLTR))
+    Chrom is last column in your stitched format.
+    """
+    seen = set()
+    n_written = 0
+
+    with open(merged_out, "w") as out:
+        for scn in stitched_scns:
+            p = Path(scn)
+            if not p.exists() or p.stat().st_size == 0:
+                continue
+            with p.open("r") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    parts = re.split(r"\s+", line)
+                    if len(parts) < 12:
+                        continue
+                    chrom = parts[-1]
+                    # indices per your SCN convention
+                    key = (
+                        chrom,
+                        parts[0], parts[1],  # sret, eret
+                        parts[3], parts[4],  # s(lLTR), e(lLTR)
+                        parts[6], parts[7],  # s(rLTR), e(rLTR)
+                    )
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    out.write("  ".join(parts) + "\n")
+                    n_written += 1
+
+    if n_written == 0:
+        Path(merged_out).touch()
+
 # -----------------------------
 # Step 7: build LTR FASTA from stitched SCN
 # -----------------------------
 
-def scn_to_ltr_fasta(stitched_scn: str, genome_fa: str, out_fa: str):
+def scn_to_internal_fasta(stitched_scn: str, genome_fa: str, out_fa: str):
     """
-    Uses s(ret) and e(ret) (1-based inclusive) plus chrom (last column) to extract sequences from genome_fa.
+    Uses e(lLTR) and s(rLTR) (1-based inclusive coords from ltrharvest tabout),
+    plus chrom (last column), to extract INTERNAL sequence only (LTRs excluded).
 
-    Output record format:
-      >chr1:10006055-10007712
-      ACTG...
+    Header stays full-length LTR-RT coords:
+      >chr1:s(ret)-e(ret)
     """
     genome = load_fasta_as_dict(genome_fa)
 
@@ -462,26 +707,46 @@ def scn_to_ltr_fasta(stitched_scn: str, genome_fa: str, out_fa: str):
             if len(parts) < 12:
                 continue
 
+            # Full-length coords (header)
             sret, eret = parts[0], parts[1]
+
+            # Internal coords: e(lLTR) to s(rLTR)
+            # Columns: s(lLTR)=3, e(lLTR)=4, s(rLTR)=6, e(rLTR)=7 (0-based indices)
+            el = parts[4]
+            sr = parts[6]
+
             chrom = parts[-1]
 
-            if not (sret.isdigit() and eret.isdigit()):
+            if not (sret.isdigit() and eret.isdigit() and el.isdigit() and sr.isdigit()):
                 continue
-            s1 = int(sret)
-            e1 = int(eret)
-            if e1 < s1:
-                s1, e1 = e1, s1
+
+            sret1 = int(sret)
+            eret1 = int(eret)
+            el1   = int(el)
+            sr1   = int(sr)
+
+            # normalize full-length header interval
+            if eret1 < sret1:
+                sret1, eret1 = eret1, sret1
+
+            # internal is between LTRs: (e(lLTR)+1) .. (s(rLTR)-1)
+            internal_start1 = el1 + 1
+            internal_end1   = sr1 - 1
+
+            if internal_end1 < internal_start1:
+                continue  # no internal region
 
             seq = genome.get(chrom)
             if seq is None:
                 continue
 
-            start0 = s1 - 1
-            end0 = e1  # inclusive -> exclusive
+            start0 = internal_start1 - 1
+            end0   = internal_end1  # inclusive -> exclusive
+
             if start0 < 0 or end0 > len(seq):
                 continue
 
-            header = f"{chrom}:{s1}-{e1}"
+            header = f"{chrom}:{sret1}-{eret1}"
             out.write(f">{header}\n")
             frag = seq[start0:end0]
             for i in range(0, len(frag), 60):
@@ -490,7 +755,6 @@ def scn_to_ltr_fasta(stitched_scn: str, genome_fa: str, out_fa: str):
 
     if n_written == 0:
         Path(out_fa).touch()
-
 
 # -----------------------------
 # Step 8: build kmer2ltr.domain from stitched SCN
@@ -534,6 +798,47 @@ def scn_to_kmer2ltr_domain(stitched_scn: str, out_domain: str):
 # -----------------------------
 # Tool setup (./tools/)
 # -----------------------------
+
+def tool_usable_kmer2ltr(k2l_dir: Path) -> bool:
+    """
+    Checks whether Kmer2LTR is runnable via:
+      python3 tools/Kmer2LTR/Kmer2LTR.py -h
+    We treat help text presence as usable even if returncode != 0.
+    """
+    script = (k2l_dir / "Kmer2LTR.py").resolve()
+    if not script.exists():
+        return False
+    try:
+        r = subprocess.run(
+            ["python3", str(script), "-h"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        txt = (r.stdout or "") + "\n" + (r.stderr or "")
+        return ("--max-win-overdisp" in txt) or ("Kmer2LTR" in txt) or (r.returncode == 0)
+    except Exception:
+        return False
+
+def ensure_kmer2ltr(tools_dir: Path) -> str:
+    """
+    Ensures ./tools/Kmer2LTR exists (git clone) and is usable.
+    Returns the Kmer2LTR script path: ./tools/Kmer2LTR/Kmer2LTR.py
+    """
+    tools_dir = mkdirp(tools_dir)
+    k2l_dir = tools_dir / "Kmer2LTR"
+
+    if not tool_usable_kmer2ltr(k2l_dir):
+        if not k2l_dir.exists():
+            run(["git", "clone", "https://github.com/cwb14/Kmer2LTR.git", str(k2l_dir)], check=True)
+        if not tool_usable_kmer2ltr(k2l_dir):
+            raise RuntimeError(
+                f"Kmer2LTR appears unusable in: {k2l_dir}\n"
+                f"Try: python3 {k2l_dir}/Kmer2LTR.py -h"
+            )
+
+    return str((k2l_dir / "Kmer2LTR.py").resolve())
+
 
 def tool_usable_generic(bin_path: Path, args: List[str]) -> bool:
     if not bin_path.exists() or not os.access(str(bin_path), os.X_OK):
@@ -637,7 +942,7 @@ def ensure_tesorter(tools_dir: Path) -> str:
     return str(te_dir)
 
 def run_tesorter(stitched_fa: str, tesorter_py_path: str, outdir: Path,
-                 db: str, cov: int, evalue: str, rule: str, threads: int) -> Tuple[str, str]:
+                 db: str, cov: int, evalue: str, rule: str, threads: int) -> Tuple[str, str, str]:
     """
     Runs TEsorter in outdir so outputs land in {prefix}.work/,
     but passes stitched_fa as an absolute path so it can be found.
@@ -663,10 +968,188 @@ def run_tesorter(stitched_fa: str, tesorter_py_path: str, outdir: Path,
     if r.returncode != 0:
         raise RuntimeError(f"TEsorter failed:\n{(r.stderr or '').strip()}")
 
-    base = Path(stitched_fa_abs).name  # <<< FIX: derive base from abs path
+    base = Path(stitched_fa_abs).name
     cls_lib = str(outdir / f"{base}.{db}.cls.lib")
     cls_pep = str(outdir / f"{base}.{db}.cls.pep")
-    return cls_lib, cls_pep
+    cls_tsv = str(outdir / f"{base}.{db}.cls.tsv")
+    return cls_lib, cls_pep, cls_tsv
+    
+def run_kmer2ltr(kmer2ltr_py: str, in_fa: str, out_prefix: str, outdir: Path,
+                threads: int, max_win_overdisp: float, min_retained_fraction: float) -> str:
+    """
+    Runs Kmer2LTR in outdir.
+    Returns the path to the main TSV output (the file named exactly out_prefix).
+    Produces (in outdir): kmer2ltr_density.pdf, {out_prefix}.summary, {out_prefix}, {out_prefix}.log (per README). :contentReference[oaicite:1]{index=1}
+    """
+    
+    mkdirp(outdir)
+    which_or_die("mafft")
+    which_or_die("trimal")
+
+    kmer2ltr_py_abs = str(Path(kmer2ltr_py).resolve())
+
+    cmd = [
+        "python3", kmer2ltr_py_abs,
+        "-i", str(Path(in_fa).resolve()),
+        "--max-win-overdisp", str(max_win_overdisp),
+        "--min-retained-fraction", str(min_retained_fraction),
+        "-p", str(threads),
+        "-o", out_prefix,
+    ]
+
+
+    r = subprocess.run(cmd, cwd=str(outdir), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    if r.returncode != 0:
+        raise RuntimeError(f"Kmer2LTR failed:\n{(r.stderr or '').strip()}")
+
+    main_out = outdir / out_prefix
+    if not main_out.exists():
+        raise RuntimeError(f"Kmer2LTR finished but did not create expected output: {main_out}")
+
+    return str(main_out)
+    
+def _parse_interval_from_kmer2ltr_col1(col1: str) -> Optional[Tuple[str, int, int]]:
+    # col1: Athal_chr1:4406006-4411120#LTR/Copia/Bianca
+    left = col1.split("#", 1)[0]
+    if ":" not in left:
+        return None
+    chrom, rest = left.split(":", 1)
+    if "-" not in rest:
+        return None
+    start_s, end_s = rest.split("-", 1)
+    try:
+        start = int(start_s)
+        end = int(end_s)
+    except ValueError:
+        return None
+    if end < start:
+        start, end = end, start
+    return chrom, start, end
+
+
+def _overlap_fraction_of_shorter(a: Tuple[int, int], b: Tuple[int, int]) -> float:
+    a0, a1 = a
+    b0, b1 = b
+    inter = min(a1, b1) - max(a0, b0) + 1
+    if inter <= 0:
+        return 0.0
+    lena = a1 - a0 + 1
+    lenb = b1 - b0 + 1
+    return inter / min(lena, lenb)
+
+
+def dedup_kmer2ltr_tsv(kmer2ltr_tsv: str, out_tsv: str, threshold: float) -> None:
+    """
+    Dedup a Kmer2LTR output TSV (main output file), keeping the lowest p-distance (col7).
+    Assumes p-distance is column 7 (1-based), per your wrapper standard.
+    """
+    in_path = Path(kmer2ltr_tsv)
+    if not in_path.exists() or in_path.stat().st_size == 0:
+        Path(out_tsv).touch()
+        return
+
+    tmp_sorted = in_path.parent / (in_path.name + ".sorted.tmp")
+
+    # External sort: chrom by ':' delimiter (k1), then numeric start (k2)
+    # We rely on sort being available (coreutils); if not, you can replace with a Python sort.
+    r = run(["sort", "-t:", "-k1,1V", "-k2,2n", str(in_path)], check=True, capture=True)
+    tmp_sorted.write_text(r.stdout or "")
+
+    cluster: List[Dict[str, object]] = []
+    cluster_chrom: Optional[str] = None
+
+    def flush_cluster(out_handle):
+        if not cluster:
+            return
+        best = min(cluster, key=lambda x: float(x["p"]))  # type: ignore
+        out_handle.write(best["line"])  # type: ignore
+
+    with open(tmp_sorted, "r") as fin, open(out_tsv, "w") as out:
+        for raw in fin:
+            if not raw.strip():
+                continue
+            parts = raw.rstrip("\n").split("\t")
+            if len(parts) < 7:
+                out.write(raw)
+                continue
+
+            parsed = _parse_interval_from_kmer2ltr_col1(parts[0])
+            if parsed is None:
+                out.write(raw)
+                continue
+            chrom, s, e = parsed
+
+            try:
+                p = float(parts[6])  # col7 (0-based 6)
+            except ValueError:
+                out.write(raw)
+                continue
+
+            rec = {"chrom": chrom, "s": s, "e": e, "p": p, "line": raw}
+
+            if not cluster:
+                cluster = [rec]
+                cluster_chrom = chrom
+                continue
+
+            if chrom != cluster_chrom:
+                flush_cluster(out)
+                cluster = [rec]
+                cluster_chrom = chrom
+                continue
+
+            belongs = False
+            for rrec in cluster:
+                frac = _overlap_fraction_of_shorter((s, e), (int(rrec["s"]), int(rrec["e"])))  # type: ignore
+                if frac >= threshold:
+                    belongs = True
+                    break
+
+            if belongs:
+                cluster.append(rec)
+            else:
+                flush_cluster(out)
+                cluster = [rec]
+                cluster_chrom = chrom
+
+        flush_cluster(out)
+
+    try:
+        tmp_sorted.unlink()
+    except Exception:
+        pass
+
+def subset_fasta_by_name_set(in_fa: str, out_fa: str, keep_names: set) -> None:
+    """
+    Keep FASTA records whose header token (up to whitespace, without '>') is in keep_names.
+    """
+    n_written = 0
+    with open(out_fa, "w") as out:
+        for name, seq in iter_fasta(in_fa):
+            if name in keep_names:
+                out.write(f">{name}\n")
+                for i in range(0, len(seq), 60):
+                    out.write(seq[i:i+60] + "\n")
+                n_written += 1
+    if n_written == 0:
+        Path(out_fa).touch()
+
+
+def names_from_kmer2ltr_dedup(dedup_tsv: str) -> set:
+    """
+    Kmer2LTR first column is the LTR-RT name; your tesorter full-length FASTA uses
+    >{TE}#LTR/{Superfamily}/{Clade} so it should match exactly.
+    """
+    keep = set()
+    with open(dedup_tsv, "r") as f:
+        for line in f:
+            if not line.strip():
+                continue
+            cols = line.rstrip("\n").split("\t")
+            if cols:
+                keep.add(cols[0])
+    return keep
+
 
 def build_ltr_rt_tree_from_tesorter(stitched_fa: str, tesorter_py_path: str, outdir: Path,
                                    db: str, iqtree3_path: str, ltr_tree_r: str):
@@ -711,30 +1194,84 @@ def build_ltr_rt_tree_from_tesorter(stitched_fa: str, tesorter_py_path: str, out
 
     run(["Rscript", ltr_tree_r, treefile_name, cls_tsv_name, out_pdf], cwd=str(outdir), check=True, capture=True)
     
-def subset_tesorter_cls_lib_to_fasta(cls_lib_path: str, out_fa: str):
+def build_tesorter_full_length_ltr_fasta_from_cls_tsv(cls_tsv_path: str, genome_fa: str, out_fa: str):
     """
-    Keep only sequences with 'LTR' in header line, and trim header after the first space.
-    Example:
-      >Athal_chr5:...#LTR/Copia/Ale Athal_chr5:...
-    becomes:
-      >Athal_chr5:...#LTR/Copia/Ale
+    Build full-length LTR-RT FASTA using genome + TEsorter cls.tsv.
+
+    cls.tsv columns (with header):
+      TE  Order  Superfamily  Clade  Complete  Strand  Domains
+
+    We keep only Order == 'LTR' (column2).
+    Header format:
+      >{TE}#LTR/{Superfamily}/{Clade}
+
+    If Strand == '-', output reverse-complement of the extracted genomic sequence.
+    TE format expected:
+      chrom:start-end
     """
+    genome = load_fasta_as_dict(genome_fa)
+
+    def parse_te_interval(te: str) -> Optional[Tuple[str, int, int]]:
+        # robust split on last ":" in case chrom names contain ":" (rare but safer)
+        if ":" not in te:
+            return None
+        chrom, rng = te.rsplit(":", 1)
+        m = re.match(r"^(\d+)-(\d+)$", rng)
+        if not m:
+            return None
+        s1 = int(m.group(1))
+        e1 = int(m.group(2))
+        if e1 < s1:
+            s1, e1 = e1, s1
+        return chrom, s1, e1
+
     n_written = 0
-    with open(cls_lib_path, "r") as fin, open(out_fa, "w") as out:
-        write_it = False
+    with open(cls_tsv_path, "r") as fin, open(out_fa, "w") as out:
+        header_seen = False
         for line in fin:
-            if line.startswith(">"):
-                hdr = line[1:].rstrip("\n")
-                if "LTR" in hdr:
-                    trimmed = hdr.split(" ", 1)[0]
-                    out.write(">" + trimmed + "\n")
-                    write_it = True
-                    n_written += 1
-                else:
-                    write_it = False
-            else:
-                if write_it:
-                    out.write(line)
+            line = line.rstrip("\n")
+            if not line:
+                continue
+
+            # Handle header row (starts with 'TE\tOrder...' in your example)
+            if not header_seen:
+                header_seen = True
+                if line.startswith("TE\t") or line.lower().startswith("te\t"):
+                    continue  # skip header
+                # if no header, fall through and parse as data
+
+            cols = line.split("\t")
+            if len(cols) < 7:
+                continue
+
+            te, order, superfam, clade, _complete, strand, _domains = cols[:7]
+            if order != "LTR":
+                continue
+
+            parsed = parse_te_interval(te)
+            if parsed is None:
+                continue
+            chrom, s1, e1 = parsed
+
+            seq = genome.get(chrom)
+            if seq is None:
+                continue
+
+            start0 = s1 - 1
+            end0 = e1
+            if start0 < 0 or end0 > len(seq):
+                continue
+
+            frag = seq[start0:end0]
+            if strand == "-":
+                frag = revcomp(frag)
+
+            hdr = f"{te}#LTR/{superfam}/{clade}"
+            out.write(f">{hdr}\n")
+            for i in range(0, len(frag), 60):
+                out.write(frag[i:i+60] + "\n")
+            n_written += 1
+
     if n_written == 0:
         Path(out_fa).touch()
 
@@ -781,6 +1318,14 @@ def main():
     ap.add_argument("--size", type=int, default=5_000_000, help="Chunk size (bp)")
     ap.add_argument("--overlap", type=int, default=30_000, help="Chunk overlap (bp)")
 
+    # Kmer2LTR + dedup controls
+    ap.add_argument("--kmer2ltr-max-win-overdisp", type=float, default=1000.0,
+                    help="Kmer2LTR --max-win-overdisp")
+    ap.add_argument("--kmer2ltr-min-retained-fraction", type=float, default=0.01,
+                    help="Kmer2LTR --min-retained-fraction")
+    ap.add_argument("--dedup-threshold", type=float, default=0.80,
+                    help="Overlap threshold (fraction of shorter interval) for dedup (default: 0.80)")
+
     # TEsorter (required)
     ap.add_argument("--tesorter-db", default="rexdb-plant",
                     help="TEsorter HMM database (-db)")
@@ -791,12 +1336,32 @@ def main():
     ap.add_argument("--tesorter-rule", default="70-30-80",
                     help="TEsorter pass2 rule (-rule)")
 
+
     # Optional phylogeny (slow!)
     ap.add_argument("--tesorter-tree", action="store_true",
                     help="Build LTR-RT phylogeny from TEsorter domains (VERY slow; adds iqtree3 + Rscript runtime)")
     ap.add_argument("--iqtree3", default="iqtree3", help="Path to iqtree3 (only used if --tesorter-tree)")
     ap.add_argument("--ltr-tree-r", default="./tools/TEsorter/scripts/LTR_tree.R",
                     help="Path to TEsorter LTR_tree.R (only used if --tesorter-tree)")
+
+    ap.add_argument("--ltr-tools", default="both", choices=["both", "ltrharvest", "ltr_finder"],
+                    help="Which LTR caller(s) to run per chunk")
+
+    ap.add_argument("--ltrfinder", default="ltr_finder",
+                    help="Path to ltr_finder v1.07 executable")
+
+    ap.add_argument(
+        "--ltr-timeout",
+        type=int,
+        default=0,
+        help="Max seconds allowed per chunk per LTR tool call (0 = no timeout). Timed-out chunks salvage partial outputs."
+    )
+
+    ap.add_argument(
+        "--ltrfinder-args",
+        default="-w 2 -C -D 15000 -d 100 -L 7000 -l 100 -p 15 -M 0.75 -S 5.0",
+        help="Quoted string of args appended to ltr_finder (NOTE: -w 2 is required)"
+    )
 
     # ltrharvest args string
     ap.add_argument(
@@ -816,9 +1381,24 @@ def main():
     tools_dir = Path("./tools")
     minimap2_path, miniprot_path = ensure_tools(tools_dir)
     tesorter_py_path = ensure_tesorter(tools_dir)
+    kmer2ltr_py = ensure_kmer2ltr(tools_dir)
 
     which_or_die("bedtools")
     which_or_die(args.gt)
+    if args.ltr_tools in ("both", "ltr_finder"):
+        which_or_die(args.ltrfinder)
+
+    # enforce -w 2 requirement
+    lf_args = args.ltrfinder_args.strip().split()
+    if args.ltr_tools in ("both", "ltr_finder"):
+        if "-w" not in lf_args:
+            raise RuntimeError("ltr_finder requires '-w 2' output format; please include '-w 2' in --ltrfinder-args")
+        # If user provided '-w' but not '2', catch that too
+        for i, tok in enumerate(lf_args):
+            if tok == "-w":
+                if i + 1 >= len(lf_args) or lf_args[i + 1] != "2":
+                    raise RuntimeError("ltr_finder output format must be '-w 2' for SCN conversion compatibility")
+
 
     # Step 2
     print("[Step2] miniprot gene masking...")
@@ -875,47 +1455,124 @@ def main():
         raise RuntimeError("No chunks produced (empty genome?)")
 
     # Step 5
-    print(f"[Step5] ltrharvest on {len(chunks)} chunks with {args.threads} workers...")
+    print(f"[Step5] LTR calling on {len(chunks)} chunks with {args.threads} workers...")
     ltr_args = args.ltrharvest_args.strip().split()
-    ltr_work = str(workdir / "ltrharvest_runs")
+    lf_args = args.ltrfinder_args.strip().split()
+
+    ltr_work = str(workdir / "ltr_runs")
     mkdirp(Path(ltr_work))
 
-    chunk_triplets: List[Tuple[ChunkInfo, str, str]] = []
+    harvest_pairs: List[Tuple[ChunkInfo, str]] = []
+    harvest_gffs: List[Tuple[ChunkInfo, str, str]] = []  # (chunk, scn, gff) for stitch_gff3
+    finder_pairs: List[Tuple[ChunkInfo, str]] = []
+
     failures = 0
+    total = len(chunks)
+    completed = 0
+
+    start = time.monotonic()
+    last_update = 0.0
+    update_interval = 1.0  # seconds
+
+    print("", file=sys.stderr)  # ensure stderr stream exists
+
     with ThreadPoolExecutor(max_workers=max(1, args.threads)) as ex:
-        futs = {ex.submit(process_one_chunk, args.gt, c, ltr_work, ltr_args): c for c in chunks}
+        futs = {
+            ex.submit(
+                process_one_chunk,
+                args.gt, args.ltrfinder, c,
+                ltr_work, ltr_args, lf_args, args.ltr_tools,
+                args.ltr_timeout
+            ): c
+            for c in chunks
+        }
+
         for fut in as_completed(futs):
             c = futs[fut]
+            completed += 1
+
             try:
-                chunk, scn_path, gff3_path = fut.result()
-                chunk_triplets.append((chunk, scn_path, gff3_path))
+                chunk, h_scn, h_gff, f_scn = fut.result()
+
+                if h_scn:
+                    harvest_pairs.append((chunk, h_scn))
+                if h_scn and h_gff:
+                    harvest_gffs.append((chunk, h_scn, h_gff))
+                if f_scn:
+                    finder_pairs.append((chunk, f_scn))
+
             except Exception as e:
                 failures += 1
-                print(f"[WARN] chunk failed: {c.chunk_id} :: {e}")
+                print(f"\n[WARN] chunk failed: {c.chunk_id} :: {e}", file=sys.stderr)
+
+            # ---- progress display ----
+            now = time.monotonic()
+            if (now - last_update) >= update_interval or completed == total:
+                elapsed = now - start
+                pct = (completed / total) * 100 if total else 100.0
+                rate = (completed / elapsed) if elapsed > 0 else 0.0
+                remaining = ((total - completed) / rate) if rate > 0 else float("inf")
+                eta = _format_hms(remaining)
+
+                msg = (
+                    f"\r[Step5] LTR calling: {completed}/{total} "
+                    f"({pct:.2f}%) | ETA {eta}"
+                )
+                print(msg, end="", file=sys.stderr, flush=True)
+                last_update = now
+
+    print("", file=sys.stderr)  # newline after progress bar
 
     if failures:
         print(f"[WARN] {failures} chunks failed; stitching continues using successes only.")
 
-    # Step 6 stitched outputs (outside workdir)
-    stitched_gff3 = f"{out_prefix}.ltrharvest.stitched.gff3"
-    stitched_scn  = f"{out_prefix}.ltrharvest.stitched.scn"
+    # Step 6 stitched outputs (NOW INSIDE workdir)
+    stitched_gff3 = str(workdir / f"{out_prefix}.ltrharvest.stitched.gff3")
+    stitched_harvest_scn = str(workdir / f"{out_prefix}.ltrharvest.stitched.scn")
+    stitched_finder_scn  = str(workdir / f"{out_prefix}.ltrfinder.stitched.scn")
 
-    print(f"[Step6] stitching GFF3 -> {stitched_gff3}")
-    stitch_gff3(chunk_triplets, stitched_gff3)
+    # Keep merged SCN as your "primary" output (unchanged location unless you also want it in workdir)
+    merged_scn = f"{out_prefix}.ltrtools.stitched.scn"
 
-    print(f"[Step6] stitching SCN  -> {stitched_scn}")
-    stitch_scn(chunk_triplets, stitched_scn)
+    if args.ltr_tools in ("both", "ltrharvest"):
+        print(f"[Step6] stitching GFF3 (ltrharvest) -> {stitched_gff3}")
+        stitch_gff3(harvest_gffs, stitched_gff3)
+
+        print(f"[Step6] stitching SCN  (ltrharvest) -> {stitched_harvest_scn}")
+        stitch_scn_from_pairs(harvest_pairs, stitched_harvest_scn)
+    else:
+        # If not running ltrharvest, make sure expected outputs exist (optional)
+        Path(stitched_gff3).write_text("##gff-version 3\n")
+        Path(stitched_harvest_scn).touch()
+
+    if args.ltr_tools in ("both", "ltr_finder"):
+        print(f"[Step6] stitching SCN  (ltr_finder) -> {stitched_finder_scn}")
+        stitch_scn_from_pairs(finder_pairs, stitched_finder_scn)
+    else:
+        Path(stitched_finder_scn).touch()
+
+    # Merge whichever stitched SCNs exist into primary merged_scn
+    to_merge = []
+    if args.ltr_tools in ("both", "ltrharvest"):
+        to_merge.append(stitched_harvest_scn)
+    if args.ltr_tools in ("both", "ltr_finder"):
+        to_merge.append(stitched_finder_scn)
+
+    print(f"[Step6] merging stitched SCN(s) -> {merged_scn}")
+    merge_stitched_scns(to_merge, merged_scn)
 
     # (2) build LTR FASTA from stitched SCN using s(ret)/e(ret)
-    stitched_fa = f"{out_prefix}.ltrharvest.stitched.fa"
-    print(f"[Step7] building FASTA from SCN -> {stitched_fa}")
-    scn_to_ltr_fasta(stitched_scn, args.genome, stitched_fa)
+    internals_fa = str(workdir / f"{out_prefix}.ltrtools.internals.fa")
+    print(f"[Step7] building INTERNALS FASTA from SCN -> {internals_fa}")
+    scn_to_internal_fasta(merged_scn, args.genome, internals_fa)
+
 
     # Step 9: TEsorter on stitched FASTA (required)
     tesorter_outdir = workdir  # store ALL TEsorter outputs in {prefix}.work/
     print(f"[Step9] running TEsorter on stitched FASTA (outputs -> {tesorter_outdir})")
-    cls_lib_path, cls_pep_path = run_tesorter(
-        stitched_fa=stitched_fa,
+
+    cls_lib_path, cls_pep_path, cls_tsv_path = run_tesorter(
+        stitched_fa=internals_fa,
         tesorter_py_path=tesorter_py_path,
         outdir=tesorter_outdir,
         db=args.tesorter_db,
@@ -925,10 +1582,36 @@ def main():
         threads=args.threads,
     )
 
-    # Subset cls.lib into a simple FASTA in ./ (outside workdir)
-    tesorter_lib_fa = f"{out_prefix}.ltrharvest.stitched.fa.{args.tesorter_db}.cls.lib.fa"
-    print(f"[Step9] subsetting cls.lib -> {tesorter_lib_fa}")
-    subset_tesorter_cls_lib_to_fasta(cls_lib_path, tesorter_lib_fa)
+    # Now build FULL-LENGTH LTR-RT FASTA from genome + cls.tsv (Order == LTR)
+    tesorter_lib_fa = str(workdir / f"{out_prefix}.ltrharvest.full_length.fa.{args.tesorter_db}.cls.lib.fa")
+    print(f"[Step9] building full-length LTR FASTA from cls.tsv -> {tesorter_lib_fa}")
+    build_tesorter_full_length_ltr_fasta_from_cls_tsv(cls_tsv_path, args.genome, tesorter_lib_fa)
+
+
+    # Step 9b: Kmer2LTR on full-length FASTA (for dedup)
+    print("[Step9b] running Kmer2LTR (dedup driver) on full-length LTR FASTA...")
+    k2l_prefix = f"{out_prefix}_kmer2ltr"  # basename, created in workdir
+    k2l_main = run_kmer2ltr(
+        kmer2ltr_py=kmer2ltr_py,
+        in_fa=tesorter_lib_fa,
+        out_prefix=k2l_prefix,
+        outdir=workdir,
+        threads=args.threads,
+        max_win_overdisp=args.kmer2ltr_max_win_overdisp,
+        min_retained_fraction=args.kmer2ltr_min_retained_fraction,
+    )
+
+    # Primary output #1 (in ./): dedup TSV
+    k2l_dedup_out = f"{out_prefix}_kmer2ltr_dedup"
+    print(f"[Step9b] deduping Kmer2LTR output -> {k2l_dedup_out}")
+    dedup_kmer2ltr_tsv(k2l_main, k2l_dedup_out, threshold=args.dedup_threshold)
+
+    # Primary output #2 (in ./): dedupbed full-length FASTA
+    tesorter_lib_fa_dedup = f"{out_prefix}.ltrharvest.full_length.dedup.fa.{args.tesorter_db}.cls.lib.fa"
+    print(f"[Step9b] subsetting full-length FASTA by dedup list -> {tesorter_lib_fa_dedup}")
+    keep_names = names_from_kmer2ltr_dedup(k2l_dedup_out)
+    subset_fasta_by_name_set(tesorter_lib_fa, tesorter_lib_fa_dedup, keep_names)
+
 
     # Optional: tree building (VERY slow)
     if args.tesorter_tree:
@@ -939,7 +1622,7 @@ def main():
             raise RuntimeError(f"LTR_tree.R not found at: {args.ltr_tree_r}")
 
         build_ltr_rt_tree_from_tesorter(
-            stitched_fa=stitched_fa,
+            stitched_fa=internals_fa,
             tesorter_py_path=tesorter_py_path,
             outdir=tesorter_outdir,
             db=args.tesorter_db,
@@ -949,21 +1632,23 @@ def main():
 
 
     # Step 8: kmer2ltr.domain from stitched SCN
-    kmer2ltr_domain = f"{out_prefix}.kmer2ltr.domain"
+    kmer2ltr_domain = str(workdir / f"{out_prefix}.kmer2ltr.domain")
+
     print(f"[Step8] building kmer2ltr domain -> {kmer2ltr_domain}")
-    scn_to_kmer2ltr_domain(stitched_scn, kmer2ltr_domain)
+    scn_to_kmer2ltr_domain(merged_scn, kmer2ltr_domain)
 
     print("\nDone.")
-    print("Key outputs:")
-    print(f"  Stitched GFF3:  {stitched_gff3}")
-    print(f"  Stitched SCN:   {stitched_scn}")
-    print(f"  Stitched FASTA: {stitched_fa}")
-    print(f"  kmer2ltr domain: {kmer2ltr_domain}")
-    print(f"  Tools dir:      ./tools/")
+    print("Primary outputs:")
+    print(f"  Kmer2LTR dedup TSV:          {out_prefix}_kmer2ltr_dedup")
+    print(f"  TEsorter full-length dedup FASTA: {out_prefix}.ltrharvest.full_length.dedup.fa.{args.tesorter_db}.cls.lib.fa")
+    print("")
+    print("Workdir outputs:")
+    print(f"  Full-length (pre-dedup) FASTA: {tesorter_lib_fa}")
+    print(f"  Kmer2LTR outputs prefix:       {workdir}/{out_prefix}_kmer2ltr*")
 
-    print(f"  TEsorter subset lib FASTA: {tesorter_lib_fa}")
     if args.tesorter_tree:
-        print(f"  TEsorter tree PDF (in workdir): {Path(stitched_fa).stem}.TEsorter_tree.pdf")
+        # NOTE: your current code also references stitched_fa here; fix that too (below)
+        print(f"  TEsorter tree PDF (in workdir): {Path(internals_fa).stem}.TEsorter_tree.pdf")
 
     # (1) cleaning: remove {prefix}.work entirely
     if args.clean:

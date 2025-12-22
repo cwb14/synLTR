@@ -1,4 +1,5 @@
-# Divk looks off, so looks like it will need to be corrected. These scripts hopefully will help train a gradient boosted or other model that could then be used to correct divK. 
+# DivK looks off, so looks like it will need to be corrected. These scripts hopefully will help train a gradient boosted or other model that could then be used to correct divK. 
+# get_training_data_parallel5 needs updated. it ran for multipe months. fast at first and then expontnetially slower. 
 
 # Remove non-ATCG characters. 
 python convert_nonbases.py athrep.updated.fasta_062024.ltr.full athrep.updated.fasta_062024.ltr.bases.full 

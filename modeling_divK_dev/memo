@@ -1,6 +1,9 @@
 # DivK looks off, so looks like it will need to be corrected. These scripts hopefully will help train a gradient boosted or other model that could then be used to correct divK. 
 # get_training_data_parallel5 needs updated. it ran for multipe months. fast at first and then expontnetially slower. 
 # My first pass is /home/chris/data/synLTR2/systematic_test/piecewise_regression/v3/lineage1/training_clean.tsv
+# We can use the above data, but note theres a line in the perl script that causes saturation and breaks model training: 'my $maxdist    = 0.1;   # maximum searching distance'.
+# I'd need to exclude values with 0.1 in column 1 (measured_divK) or re-run with larger  $maxdist.
+# If I exclude, i lose more than half data but still have >two million points. 'python model_tester_fast_plot.py -i training_clean2.tsv --fast -o corrected_output_fast.txt --pdf model_fit.pdf'
 
 # Remove non-ATCG characters. 
 python convert_nonbases.py athrep.updated.fasta_062024.ltr.full athrep.updated.fasta_062024.ltr.bases.full 

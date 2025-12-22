@@ -1037,11 +1037,13 @@ def _overlap_fraction_of_shorter(a: Tuple[int, int], b: Tuple[int, int]) -> floa
     lenb = b1 - b0 + 1
     return inter / min(lena, lenb)
 
-
 def dedup_kmer2ltr_tsv(kmer2ltr_tsv: str, out_tsv: str, threshold: float) -> None:
     """
     Dedup a Kmer2LTR output TSV (main output file), keeping the lowest p-distance (col7).
-    Assumes p-distance is column 7 (1-based), per your wrapper standard.
+    Tie-breaker: if p-distance ties, keep the record with the largest aln_len (col3).
+    Assumes:
+      - p-distance is column 7 (1-based) => parts[6]
+      - aln_len is column 3 (1-based)    => parts[2]
     """
     in_path = Path(kmer2ltr_tsv)
     if not in_path.exists() or in_path.stat().st_size == 0:
@@ -1050,8 +1052,6 @@ def dedup_kmer2ltr_tsv(kmer2ltr_tsv: str, out_tsv: str, threshold: float) -> Non
 
     tmp_sorted = in_path.parent / (in_path.name + ".sorted.tmp")
 
-    # External sort: chrom by ':' delimiter (k1), then numeric start (k2)
-    # We rely on sort being available (coreutils); if not, you can replace with a Python sort.
     r = run(["sort", "-t:", "-k1,1V", "-k2,2n", str(in_path)], check=True, capture=True)
     tmp_sorted.write_text(r.stdout or "")
 
@@ -1061,7 +1061,8 @@ def dedup_kmer2ltr_tsv(kmer2ltr_tsv: str, out_tsv: str, threshold: float) -> Non
     def flush_cluster(out_handle):
         if not cluster:
             return
-        best = min(cluster, key=lambda x: float(x["p"]))  # type: ignore
+        # choose lowest p; if tie, choose highest aln (column3)
+        best = min(cluster, key=lambda x: (float(x["p"]), -int(x["aln"])))  # type: ignore
         out_handle.write(best["line"])  # type: ignore
 
     with open(tmp_sorted, "r") as fin, open(out_tsv, "w") as out:
@@ -1085,7 +1086,13 @@ def dedup_kmer2ltr_tsv(kmer2ltr_tsv: str, out_tsv: str, threshold: float) -> Non
                 out.write(raw)
                 continue
 
-            rec = {"chrom": chrom, "s": s, "e": e, "p": p, "line": raw}
+            # Tie-breaker column: aln_len (col3, 0-based 2)
+            try:
+                aln = int(float(parts[2]))
+            except ValueError:
+                aln = 0
+
+            rec = {"chrom": chrom, "s": s, "e": e, "p": p, "aln": aln, "line": raw}
 
             if not cluster:
                 cluster = [rec]
@@ -1118,6 +1125,7 @@ def dedup_kmer2ltr_tsv(kmer2ltr_tsv: str, out_tsv: str, threshold: float) -> Non
         tmp_sorted.unlink()
     except Exception:
         pass
+
 
 def subset_fasta_by_name_set(in_fa: str, out_fa: str, keep_names: set) -> None:
     """
@@ -1658,3 +1666,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

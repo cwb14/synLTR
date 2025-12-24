@@ -1,7 +1,7 @@
 #!/usr/bin/env Rscript
 
 
-Rscript ltrharvest_plot.R --scn Bdact_ltr.ltrtools.stitched2.scn --gff=Bdact_ltr.work/Bdact_ltr.ltrtools.internals.fa.rexdb-plant.dom.gff3 --tsv=Bdact_ltr_kmer2ltr_dedup -o Bdact_plots
+Rscript ltrharvest_plot_struct.R --scn Bdact_ltr.ltrtools.stitched2.scn --gff=Bdact_ltr.work/Bdact_ltr.ltrtools.internals.fa.rexdb-plant.dom.gff3 --tsv=Bdact_ltr_kmer2ltr_dedup -o Bdact_plots
 suppressPackageStartupMessages({
   library(optparse)
 })

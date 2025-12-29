@@ -28,6 +28,7 @@ from typing import Dict, List, Tuple, Optional
 
 import matplotlib.pyplot as plt
 from matplotlib.patches import Patch
+from matplotlib.backends.backend_pdf import PdfPages
 
 
 # -----------------------------
@@ -747,6 +748,168 @@ def plot_all_elements_average(family_avg_map: Dict[str, FamilyAverages], out_pat
     plt.close(fig)
 
 
+def parse_fai(fai_path: str) -> Dict[str, int]:
+    """
+    Parse .fai: col1=seqname, col2=length.
+    Returns dict {chrom: length}.
+    """
+    chrom_lens: Dict[str, int] = {}
+    print(f"[INFO] Reading FAI: {fai_path}")
+    with open(fai_path, "r", encoding="utf-8") as f:
+        for ln, line in enumerate(f, start=1):
+            line = line.strip()
+            if not line:
+                continue
+            parts = line.split("\t")
+            if len(parts) < 2:
+                print(f"[WARN] FAI line {ln}: expected >=2 columns, got {len(parts)}. Skipping.")
+                continue
+            chrom = parts[0]
+            try:
+                L = int(parts[1])
+            except ValueError:
+                print(f"[WARN] FAI line {ln}: cannot parse length '{parts[1]}'. Skipping.")
+                continue
+            chrom_lens[chrom] = L
+    print(f"[INFO] FAI loaded: {len(chrom_lens)} contigs")
+    for k, v in list(chrom_lens.items())[:5]:
+        print(f"[DEBUG] FAI sample: {k} len={v}")
+    return chrom_lens
+
+
+def draw_element_genomic(ax, y: float, el: Element, height: float = 0.6, label: Optional[str] = None):
+    """
+    Draw a single element as a genomic track item.
+    X-axis is genomic coordinates (absolute).
+    Internal features are mapped from 1..el.length onto [el.start..el.end].
+    """
+    g0 = el.start
+    g1 = el.end
+    if g1 < g0:
+        g0, g1 = g1, g0
+
+    width = max(1, g1 - g0 + 1)
+
+    # outline of the element span
+    ax.add_patch(plt.Rectangle((g0, y - height/2), width, height, fill=False, linewidth=1.0))
+
+    # LTRs: use el.ltr_len (bp) at both ends in genomic coords
+    ltr_len = max(1, min(el.ltr_len, width))
+    ltr_col = FEATURE_COLORS.get("LTR", "#333333")
+
+    # left LTR
+    ax.add_patch(plt.Rectangle((g0, y - height/2), ltr_len, height,
+                               facecolor=ltr_col, edgecolor="black", linewidth=0.6))
+    # right LTR
+    ax.add_patch(plt.Rectangle((g1 - ltr_len + 1, y - height/2), ltr_len, height,
+                               facecolor=ltr_col, edgecolor="black", linewidth=0.6))
+
+    # map proteins relative->genomic
+    def rel_to_genome(pos_rel: int) -> int:
+        # pos_rel in [1..el.length]
+        # map to [g0..g1]
+        # use float scale then round to int
+        if el.length <= 1:
+            return g0
+        frac = (pos_rel - 1) / (el.length - 1)
+        return int(round(g0 + frac * (g1 - g0)))
+
+    for p in el.proteins:
+        s_rel = max(1, min(p.start, el.length))
+        e_rel = max(1, min(p.end, el.length))
+        if e_rel < s_rel:
+            s_rel, e_rel = e_rel, s_rel
+
+        gs = rel_to_genome(s_rel)
+        ge = rel_to_genome(e_rel)
+        if ge < gs:
+            gs, ge = ge, gs
+
+        w = max(1, ge - gs + 1)
+        col = FEATURE_COLORS.get(p.name, DEFAULT_COLOR)
+        ax.add_patch(plt.Rectangle((gs, y - height/2), w, height,
+                                   facecolor=col, edgecolor="black", linewidth=0.6))
+
+    if label:
+        ax.text(g0, y + height*0.85, label, ha="left", va="bottom", fontsize=7)
+
+
+def plot_chromosome_windows_pdf(
+    chrom: str,
+    chrom_len: int,
+    elements_on_chrom: List[Element],
+    out_pdf: str,
+    window: int,
+    step: int,
+    max_tracks: int
+):
+    """
+    Multi-page PDF: each page is a genomic window [w0..w1].
+    Draws each element at genomic position with internal colored structure.
+    """
+    print(f"[INFO] Chromosome plot -> {out_pdf} (len={chrom_len}, elements={len(elements_on_chrom)})")
+
+    if not elements_on_chrom:
+        # still emit a 1-page PDF noting no elements
+        with PdfPages(out_pdf) as pdf:
+            fig, ax = plt.subplots(figsize=(14, 2.2))
+            ax.set_title(f"{chrom} : no elements found")
+            ax.set_xlim(1, max(2, chrom_len))
+            ax.set_ylim(0, 1)
+            ax.set_yticks([])
+            ax.set_xlabel("Genomic position [bp]")
+            plt.tight_layout()
+            pdf.savefig(fig)
+            plt.close(fig)
+        return
+
+    # sort by genomic start
+    els = sorted(elements_on_chrom, key=lambda e: (e.start, e.end))
+
+    # union of proteins for legend
+    prots_seen = sorted(set(p.name for e in els for p in e.proteins))
+    features_present = ["LTR"] + prots_seen
+    legend_handles = build_legend_handles(features_present)
+
+    with PdfPages(out_pdf) as pdf:
+        w0 = 1
+        page = 0
+        while w0 <= chrom_len:
+            w1 = min(chrom_len, w0 + window - 1)
+            page += 1
+
+            # overlap filter
+            in_win = [e for e in els if not (e.end < w0 or e.start > w1)]
+            note = ""
+            if len(in_win) > max_tracks:
+                in_win = in_win[:max_tracks]
+                note = f" (showing first {max_tracks}; more exist)"
+
+            fig_h = max(3.0, 0.18 * len(in_win) + 1.8)
+            fig, ax = plt.subplots(figsize=(14, fig_h))
+
+            for i, e in enumerate(in_win):
+                y = len(in_win) - i
+                k2p_txt = "NA" if e.k2p is None else f"{e.k2p * 100:.1f}%"
+                # keep label short-ish
+                lbl = f"{e.superfamily}/{e.family}  {k2p_txt}"
+                draw_element_genomic(ax, y=y, el=e, height=0.65, label=lbl)
+
+            ax.set_title(f"{chrom} : window {w0}-{w1}{note}")
+            ax.set_xlim(w0, w1)
+            ax.set_ylim(0, len(in_win) + 1)
+            ax.set_yticks([])
+            ax.set_xlabel("Genomic position [bp]")
+
+            ax.legend(handles=legend_handles, loc="lower right", frameon=False,
+                      ncol=min(6, len(legend_handles)))
+
+            plt.tight_layout()
+            pdf.savefig(fig)
+            plt.close(fig)
+
+            w0 += step
+
 # -----------------------------
 # Main
 # -----------------------------
@@ -762,6 +925,11 @@ def main():
                     help="Min fraction of elements a protein must appear in to be included in the AVERAGE plot (default 0.10)")
     ap.add_argument("--boot", type=int, default=2000,
                     help="Bootstrap iterations for 95%% CI (default 2000). Increase for smoother CI.")
+    ap.add_argument("--fai", default=None, help="Optional FASTA .fai index to enable per-chromosome positional plots")
+    ap.add_argument("--chr_window", type=int, default=1_000_000, help="Window size (bp) per PDF page for chromosome plots")
+    ap.add_argument("--chr_step", type=int, default=1_000_000, help="Step size (bp) between windows (default = chr_window)")
+    ap.add_argument("--chr_max_tracks", type=int, default=250, help="Max elements drawn per window page (avoid huge pages)")
+
     ap.add_argument("--seed", type=int, default=1, help="Random seed for bootstrapping (default 1)")
 
     args = ap.parse_args()
@@ -778,6 +946,9 @@ def main():
 
     # Strand normalize (critical for averages + ordering)
     normalize_all_elements_strand(elements)
+
+    if args.chr_step <= 0:
+        args.chr_step = args.chr_window
 
     # Group by superfamily/family
     family_to_elements: Dict[str, List[Element]] = {}
@@ -830,6 +1001,41 @@ def main():
     # Global plot of averages
     out_all = os.path.join(args.out_dir, "all_elements.pdf")
     plot_all_elements_average(family_avg_map, out_all)
+
+
+    # Optional: per-chromosome positional plots
+    if args.fai:
+        chrom_lens = parse_fai(args.fai)
+
+        # group elements by chrom (TSV chrom field)
+        chrom_to_elements: Dict[str, List[Element]] = {}
+        for el in elements.values():
+            chrom_to_elements.setdefault(el.chrom, []).append(el)
+
+        chrom_outdir = os.path.join(args.out_dir, "chrom_plots")
+        os.makedirs(chrom_outdir, exist_ok=True)
+
+        for chrom, clen in chrom_lens.items():
+            out_pdf = os.path.join(chrom_outdir, f"{safe_name(chrom)}.pdf")
+            els = chrom_to_elements.get(chrom, [])
+            plot_chromosome_windows_pdf(
+                chrom=chrom,
+                chrom_len=clen,
+                elements_on_chrom=els,
+                out_pdf=out_pdf,
+                window=args.chr_window,
+                step=args.chr_step,
+                max_tracks=args.chr_max_tracks
+            )
+
+        # warn about elements on contigs not in FAI
+        missing_contigs = sorted([c for c in chrom_to_elements.keys() if c not in chrom_lens])
+        if missing_contigs:
+            print(f"[WARN] {len(missing_contigs)} contigs had elements but were not found in FAI. First 10:")
+            for c in missing_contigs[:10]:
+                print(f"       - {c}")
+
+        print(f"[INFO] Chromosome plots written to: {chrom_outdir}")
 
     print("\n[INFO] Done.")
     print(f"[INFO] Output directory: {args.out_dir}")

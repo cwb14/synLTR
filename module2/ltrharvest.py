@@ -128,7 +128,11 @@ class Interval:
     start: int  # 0-based inclusive
     end: int    # 0-based exclusive
 
-def parse_mrna_intervals_from_gff_text(gff_text: str) -> Dict[str, List[Interval]]:
+def parse_feature_intervals_from_gff_text(gff_text: str, feature_types: set) -> Dict[str, List[Interval]]:
+    """
+    Extract intervals for any requested feature types (e.g., {"mRNA"} or {"CDS"}).
+    Coordinates in GFF are 1-based inclusive; we convert to 0-based half-open.
+    """
     intervals: Dict[str, List[Interval]] = {}
     for line in gff_text.splitlines():
         if not line or line.startswith("#"):
@@ -137,7 +141,7 @@ def parse_mrna_intervals_from_gff_text(gff_text: str) -> Dict[str, List[Interval
         if len(parts) < 9:
             continue
         seqid, ftype = parts[0], parts[2]
-        if ftype != "mRNA":
+        if ftype not in feature_types:
             continue
         try:
             s = int(parts[3]) - 1
@@ -187,7 +191,9 @@ def hardmask_fasta_by_intervals(in_fasta: str, intervals: Dict[str, List[Interva
 
 def run_miniprot_gene_mask(in_fasta: str, protein_faa: str, out_prefix: str,
                            threads: int, miniprot_path: str,
-                           outn: int = 1, outs: float = 0.8, outc: float = 0.5):
+                           outn: int = 1, outs: float = 0.8, outc: float = 0.5,
+                           gene_mask: str = "mRNA"):
+
     gff_path = f"{out_prefix}.genic.gff"
     bed_path = f"{out_prefix}.genic.mask.bed"
     masked_fasta = f"{out_prefix}.genic_masked.fa"
@@ -210,7 +216,15 @@ def run_miniprot_gene_mask(in_fasta: str, protein_faa: str, out_prefix: str,
     gff_text = r.stdout or ""
     Path(gff_path).write_text(gff_text)
 
-    intervals = merge_intervals_per_chrom(parse_mrna_intervals_from_gff_text(gff_text))
+    if gene_mask == "mRNA":
+        feature_types = {"mRNA"}
+    elif gene_mask == "CDS":
+        feature_types = {"CDS"}
+    else:
+        feature_types = {"mRNA", "CDS"}
+
+    intervals = merge_intervals_per_chrom(parse_feature_intervals_from_gff_text(gff_text, feature_types))
+
     if not intervals:
         shutil.copyfile(in_fasta, masked_fasta)
         Path(bed_path).write_text("")
@@ -1310,6 +1324,7 @@ def main():
     ap.add_argument("--outn", type=int, default=1000, help="miniprot --outn")
     ap.add_argument("--outs", type=float, default=0.99, help="miniprot --outs")
     ap.add_argument("--outc", type=float, default=0.1, help="miniprot --outc")
+    ap.add_argument("--gene-mask", default="CDS", choices=["mRNA", "CDS", "both"], help="Which miniprot GFF features to mask in the genome") # CDS is importablt for simulated data where TEs may insert into genes. Probably less importnat in real data.
 
     # minimap2 defaults
     ap.add_argument("--mm2-p", type=float, default=0.0, help="minimap2 -p")
@@ -1339,11 +1354,10 @@ def main():
                     help="TEsorter HMM database (-db)")
     ap.add_argument("--tesorter-cov", type=int, default=10,
                     help="TEsorter min coverage (-cov)")
-    ap.add_argument("--tesorter-eval", default="1e-2",
+    ap.add_argument("--tesorter-eval", default="1e-3",
                     help="TEsorter max E-value (-eval)")
-    ap.add_argument("--tesorter-rule", default="70-30-80",
+    ap.add_argument("--tesorter-rule", default="80-80-80", # Probably dont use 70-30-80. It gives lots. mostly junk.
                     help="TEsorter pass2 rule (-rule)")
-
 
     # Optional phylogeny (slow!)
     ap.add_argument("--tesorter-tree", action="store_true",
@@ -1420,6 +1434,7 @@ def main():
         outn=args.outn,
         outs=args.outs,
         outc=args.outc,
+        gene_mask=args.gene_mask,
     )
 
     # Step 3
@@ -1667,4 +1682,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

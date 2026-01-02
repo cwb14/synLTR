@@ -1352,9 +1352,9 @@ def main():
     # TEsorter (required)
     ap.add_argument("--tesorter-db", default="rexdb-plant",
                     help="TEsorter HMM database (-db)")
-    ap.add_argument("--tesorter-cov", type=int, default=10,
+    ap.add_argument("--tesorter-cov", type=int, default=20,
                     help="TEsorter min coverage (-cov)")
-    ap.add_argument("--tesorter-eval", default="1e-3",
+    ap.add_argument("--tesorter-eval", default="1e-2",
                     help="TEsorter max E-value (-eval)")
     ap.add_argument("--tesorter-rule", default="80-80-80", # Probably dont use 70-30-80. It gives lots. mostly junk.
                     help="TEsorter pass2 rule (-rule)")

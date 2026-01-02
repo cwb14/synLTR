@@ -1367,7 +1367,8 @@ def main():
 
     ap.add_argument(
         "--ltrfinder-args",
-        default="-w 2 -C -D 15000 -d 100 -L 7000 -l 100 -p 15 -M 0.75 -S 5.0",
+#        default="-w 2 -C -D 15000 -d 100 -L 7000 -l 100 -p 15 -M 0.75 -S 5.0",
+        default="-w 2 -C -D 15000 -d 100 -L 7000 -l 100 -p 20 -M 0.00 -S 0.0", 
         help="Quoted string of args appended to ltr_finder (NOTE: -w 2 is required)"
     )
 

@@ -975,6 +975,7 @@ def run_tesorter(stitched_fa: str, tesorter_py_path: str, outdir: Path,
         "-p", str(threads),
         "-cov", str(cov),
         "-eval", str(evalue),
+#        "--no-cleanup",
         "-rule", str(rule),
     ]
 

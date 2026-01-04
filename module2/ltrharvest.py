@@ -770,17 +770,68 @@ def scn_to_internal_fasta(stitched_scn: str, genome_fa: str, out_fa: str):
     if n_written == 0:
         Path(out_fa).touch()
 
+
+
+def load_tesorter_te_to_annotation(cls_tsv_path: str) -> Dict[str, str]:
+    """
+    Build mapping:
+      TE (e.g. CP002684.1:7065623-7075763) -> "Order/Superfamily/Clade" (e.g. "LTR/Gypsy/Retand")
+
+    cls.tsv columns (header):
+      TE  Order  Superfamily  Clade  Complete  Strand  Domains
+    """
+    te2ann: Dict[str, str] = {}
+
+    p = Path(cls_tsv_path)
+    if not p.exists() or p.stat().st_size == 0:
+        return te2ann
+
+    with p.open("r") as f:
+        header_seen = False
+        for line in f:
+            line = line.rstrip("\n")
+            if not line:
+                continue
+
+            if not header_seen:
+                header_seen = True
+                if line.startswith("TE\t") or line.lower().startswith("te\t"):
+                    continue  # skip header
+
+            cols = line.split("\t")
+            if len(cols) < 4:
+                continue
+
+            te, order, superfam, clade = cols[0], cols[1], cols[2], cols[3]
+            if not te:
+                continue
+
+            # If any fields are missing, keep placeholders to maintain consistency
+            order = order or "unknown"
+            superfam = superfam or "unknown"
+            clade = clade or "unknown"
+
+            te2ann[te] = f"{order}/{superfam}/{clade}"
+
+    return te2ann
+
 # -----------------------------
 # Step 8: build kmer2ltr.domain from stitched SCN
 # -----------------------------
 
-def scn_to_kmer2ltr_domain(stitched_scn: str, out_domain: str):
+def scn_to_kmer2ltr_domain(stitched_scn: str, out_domain: str, tesorter_cls_tsv: Optional[str] = None):
     """
-    Writes: {chrom}:{s(ret)}-{e(ret)} <TAB> max(l(lLTR), l(rLTR))
+    Writes:
+      {chrom}:{s(ret)}-{e(ret)}#{Order/Superfamily/Clade} <TAB> max(l(lLTR), l(rLTR))
 
-    Assumes stitched SCN has chromosome appended as last field, like:
-      c[0]=sret, c[1]=eret, c[5]=l(lLTR), c[8]=l(rLTR), c[11]=chrom
+    If tesorter_cls_tsv is None or TE not found in mapping, we still write a suffix
+    for consistency:
+      #{LTR/unknown/unknown}
     """
+    te2ann: Dict[str, str] = {}
+    if tesorter_cls_tsv:
+        te2ann = load_tesorter_te_to_annotation(tesorter_cls_tsv)
+
     n_written = 0
     with open(stitched_scn, "r") as fin, open(out_domain, "w") as out:
         for line in fin:
@@ -788,12 +839,11 @@ def scn_to_kmer2ltr_domain(stitched_scn: str, out_domain: str):
             if not line or line.startswith("#"):
                 continue
             c = line.split()
-            # Need at least 12 columns to match your one-liner indexing
             if len(c) < 12:
                 continue
 
             sret, eret = c[0], c[1]
-            chrom = c[11]
+            chrom = c[-1]
 
             if not (sret.isdigit() and eret.isdigit()):
                 continue
@@ -803,7 +853,10 @@ def scn_to_kmer2ltr_domain(stitched_scn: str, out_domain: str):
             except ValueError:
                 continue
 
-            out.write(f"{chrom}:{sret}-{eret}\t{max(ll, rl)}\n")
+            te_key = f"{chrom}:{sret}-{eret}"
+            ann = te2ann.get(te_key, "LTR/unknown/unknown")
+
+            out.write(f"{te_key}#{ann}\t{max(ll, rl)}\n")
             n_written += 1
 
     if n_written == 0:
@@ -990,13 +1043,12 @@ def run_tesorter(stitched_fa: str, tesorter_py_path: str, outdir: Path,
     return cls_lib, cls_pep, cls_tsv
     
 def run_kmer2ltr(kmer2ltr_py: str, in_fa: str, out_prefix: str, outdir: Path,
-                threads: int, max_win_overdisp: float, min_retained_fraction: float) -> str:
+                threads: int, max_win_overdisp: float, min_retained_fraction: float,
+                domain_file: Optional[str] = None) -> str:
     """
     Runs Kmer2LTR in outdir.
     Returns the path to the main TSV output (the file named exactly out_prefix).
-    Produces (in outdir): kmer2ltr_density.pdf, {out_prefix}.summary, {out_prefix}, {out_prefix}.log (per README). :contentReference[oaicite:1]{index=1}
     """
-    
     mkdirp(outdir)
     which_or_die("mafft")
     which_or_die("trimal")
@@ -1009,9 +1061,15 @@ def run_kmer2ltr(kmer2ltr_py: str, in_fa: str, out_prefix: str, outdir: Path,
         "--max-win-overdisp", str(max_win_overdisp),
         "--min-retained-fraction", str(min_retained_fraction),
         "-p", str(threads),
+        "--purge-subdirs",
         "-o", out_prefix,
     ]
 
+    if domain_file:
+        df = Path(domain_file).resolve()
+        if not df.exists() or df.stat().st_size == 0:
+            raise RuntimeError(f"Kmer2LTR domain file requested but missing/empty: {df}")
+        cmd += ["-D", str(df)]
 
     r = subprocess.run(cmd, cwd=str(outdir), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     if r.returncode != 0:
@@ -1349,6 +1407,22 @@ def main():
                     help="Kmer2LTR --min-retained-fraction")
     ap.add_argument("--dedup-threshold", type=float, default=0.80,
                     help="Overlap threshold (fraction of shorter interval) for dedup (default: 0.80)")
+    # default ON
+    ap.add_argument(
+        "--kmer2ltr-domains",
+        dest="kmer2ltr_domains",
+        action="store_true",
+        default=True,
+        help="Pass {out_prefix}.kmer2ltr.domain to Kmer2LTR via -D"
+    )
+    # allow turning it OFF explicitly
+    ap.add_argument(
+        "--no-kmer2ltr-domains",
+        dest="kmer2ltr_domains",
+        action="store_false",
+        help="Do not pass a domain file to Kmer2LTR"
+    )
+
 
     # TEsorter (required)
     ap.add_argument("--tesorter-db", default="rexdb-plant",
@@ -1613,9 +1687,17 @@ def main():
     build_tesorter_full_length_ltr_fasta_from_cls_tsv(cls_tsv_path, args.genome, tesorter_lib_fa)
 
 
+    # Step 8: kmer2ltr.domain from stitched SCN  (MOVE THIS UP before Kmer2LTR)
+    kmer2ltr_domain = str(workdir / f"{out_prefix}.kmer2ltr.domain")
+    print(f"[Step8] building kmer2ltr domain -> {kmer2ltr_domain}")
+    scn_to_kmer2ltr_domain(merged_scn, kmer2ltr_domain, tesorter_cls_tsv=cls_tsv_path)
+
     # Step 9b: Kmer2LTR on full-length FASTA (for dedup)
     print("[Step9b] running Kmer2LTR (dedup driver) on full-length LTR FASTA...")
     k2l_prefix = f"{out_prefix}_kmer2ltr"  # basename, created in workdir
+
+    domain_arg = kmer2ltr_domain if args.kmer2ltr_domains else None
+
     k2l_main = run_kmer2ltr(
         kmer2ltr_py=kmer2ltr_py,
         in_fa=tesorter_lib_fa,
@@ -1624,6 +1706,7 @@ def main():
         threads=args.threads,
         max_win_overdisp=args.kmer2ltr_max_win_overdisp,
         min_retained_fraction=args.kmer2ltr_min_retained_fraction,
+        domain_file=domain_arg,
     )
 
     # Primary output #1 (in ./): dedup TSV
@@ -1656,12 +1739,6 @@ def main():
         )
 
 
-    # Step 8: kmer2ltr.domain from stitched SCN
-    kmer2ltr_domain = str(workdir / f"{out_prefix}.kmer2ltr.domain")
-
-    print(f"[Step8] building kmer2ltr domain -> {kmer2ltr_domain}")
-    scn_to_kmer2ltr_domain(merged_scn, kmer2ltr_domain)
-
     print("\nDone.")
     print("Primary outputs:")
     print(f"  Kmer2LTR dedup TSV:          {out_prefix}_kmer2ltr_dedup")
@@ -1679,7 +1756,6 @@ def main():
     if args.clean:
         print(f"[CLEAN] removing workdir: {workdir}")
         shutil.rmtree(workdir, ignore_errors=True)
-
 
 if __name__ == "__main__":
     main()

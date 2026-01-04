@@ -1369,8 +1369,8 @@ def main():
     )
 
     ap.add_argument("--genome", required=True, help="Input genome FASTA")
-    ap.add_argument("--proteins", required=True, help="Protein FASTA for miniprot")
-    ap.add_argument("--te-library", required=True, help="TE library FASTA (records containing 'LTR' in header are excluded for step3)")
+    ap.add_argument("--proteins", default=None, help="Protein FASTA for miniprot (optional; if omitted, skip gene masking)")
+    ap.add_argument("--te-library", default=None, help="TE library FASTA (optional; if omitted, skip non-LTR TE masking)")
     ap.add_argument("--out-prefix", required=True, help="Output prefix")
     ap.add_argument("--threads", type=int, default=8, help="Threads for miniprot/minimap2 and chunk parallelism")
     ap.add_argument("--workdir", default=None, help="Working directory (default: {out_prefix}.work)")
@@ -1481,7 +1481,9 @@ def main():
     tesorter_py_path = ensure_tesorter(tools_dir)
     kmer2ltr_py = ensure_kmer2ltr(tools_dir)
 
-    which_or_die("bedtools")
+    if args.proteins or args.te_library:
+        which_or_die("bedtools")
+
     which_or_die(args.gt)
     if args.ltr_tools in ("both", "ltr_finder"):
         which_or_die(args.ltrfinder)
@@ -1498,53 +1500,68 @@ def main():
                     raise RuntimeError("ltr_finder output format must be '-w 2' for SCN conversion compatibility")
 
 
-    # Step 2
-    print("[Step2] miniprot gene masking...")
-    gff_path, genic_bed, genic_masked_fa = run_miniprot_gene_mask(
-        in_fasta=args.genome,
-        protein_faa=args.proteins,
-        out_prefix=str(workdir / out_prefix),
-        threads=args.threads,
-        miniprot_path=miniprot_path,
-        outn=args.outn,
-        outs=args.outs,
-        outc=args.outc,
-        gene_mask=args.gene_mask,
-    )
+    # Step 2    
+    if args.proteins:
+        print("[Step2] miniprot gene masking...")
+        gff_path, genic_bed, genic_masked_fa = run_miniprot_gene_mask(
+            in_fasta=args.genome,
+            protein_faa=args.proteins,
+            out_prefix=str(workdir / out_prefix),
+            threads=args.threads,
+            miniprot_path=miniprot_path,
+            outn=args.outn,
+            outs=args.outs,
+            outc=args.outc,
+            gene_mask=args.gene_mask,
+        )
+    else:
+        print("[Step2] skipping gene masking (no --proteins provided).")
+        gff_path = str(workdir / f"{out_prefix}.genic.gff")
+        genic_bed = str(workdir / f"{out_prefix}.genic.mask.bed")
+        genic_masked_fa = str(workdir / f"{out_prefix}.genic_masked.fa")
+        Path(gff_path).write_text("")
+        Path(genic_bed).write_text("")
+        shutil.copyfile(args.genome, genic_masked_fa)
+
 
     # Step 3
-    print("[Step3] minimap2 non-LTR masking...")
-    nonltr_fa = str(workdir / f"{out_prefix}.nonLTR_TE_library.fa")
-    write_nonltr_library(args.te_library, nonltr_fa)
+    if args.te_library:
+        print("[Step3] minimap2 non-LTR masking...")
+        nonltr_fa = str(workdir / f"{out_prefix}.nonLTR_TE_library.fa")
+        write_nonltr_library(args.te_library, nonltr_fa)
 
-    paf_path = str(workdir / f"{out_prefix}.nonLTR_vs_genome.paf")
-    cmd_mm2 = [
-        minimap2_path,
-        "-c", "--cs=short",
-        "-t", str(args.threads),
-        "--secondary=yes",
-        "-p", str(args.mm2_p),
-        "-N", str(args.mm2_N),
-        f"-k{args.mm2_k}",
-        f"-w{args.mm2_w}",
-        genic_masked_fa,
-        nonltr_fa,
-    ]
-    r = run(cmd_mm2)
-    if r.returncode != 0:
-        raise RuntimeError(f"minimap2 failed:\n{(r.stderr or '').strip()}")
-    Path(paf_path).write_text(r.stdout or "")
+        paf_path = str(workdir / f"{out_prefix}.nonLTR_vs_genome.paf")
+        cmd_mm2 = [
+            minimap2_path,
+            "-c", "--cs=short",
+            "-t", str(args.threads),
+            "--secondary=yes",
+            "-p", str(args.mm2_p),
+            "-N", str(args.mm2_N),
+            f"-k{args.mm2_k}",
+            f"-w{args.mm2_w}",
+            genic_masked_fa,
+            nonltr_fa,
+        ]
+        r = run(cmd_mm2)
+        if r.returncode != 0:
+            raise RuntimeError(f"minimap2 failed:\n{(r.stderr or '').strip()}")
+        Path(paf_path).write_text(r.stdout or "")
 
-    repeats_bed = str(workdir / f"{out_prefix}.repeats.bed")
-    paf_to_bed_filtered(paf_path, repeats_bed, args.seq_ident, args.aln_len, args.qcov)
+        repeats_bed = str(workdir / f"{out_prefix}.repeats.bed")
+        paf_to_bed_filtered(paf_path, repeats_bed, args.seq_ident, args.aln_len, args.qcov)
 
-    merged_bed = str(workdir / f"{out_prefix}.repeats.merged.bed")
-    r = run(["bedtools", "merge", "-i", repeats_bed], check=True)
-    Path(merged_bed).write_text(r.stdout or "")
+        merged_bed = str(workdir / f"{out_prefix}.repeats.merged.bed")
+        r = run(["bedtools", "merge", "-i", repeats_bed], check=True)
+        Path(merged_bed).write_text(r.stdout or "")
 
-    # (5) store prefix.gene_TEmasked.fa inside prefix.work
-    gene_te_masked_fa = str(workdir / f"{out_prefix}.gene_TEmasked.fa")
-    run(["bedtools", "maskfasta", "-fi", genic_masked_fa, "-bed", merged_bed, "-fo", gene_te_masked_fa], check=True, capture=True)
+        gene_te_masked_fa = str(workdir / f"{out_prefix}.gene_TEmasked.fa")
+        run(["bedtools", "maskfasta", "-fi", genic_masked_fa, "-bed", merged_bed, "-fo", gene_te_masked_fa],
+        check=True, capture=True)
+    else:
+        print("[Step3] skipping non-LTR TE masking (no --te-library provided).")
+        gene_te_masked_fa = str(workdir / f"{out_prefix}.gene_TEmasked.fa")
+        shutil.copyfile(genic_masked_fa, gene_te_masked_fa)
 
     # Step 4
     print("[Step4] chunking masked genome...")

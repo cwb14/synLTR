@@ -7,27 +7,32 @@
 (5) Purges duplicate LTR-RTs based on kmer2ltr LTR divergence.
 NOTE: "--tesorter-tree" currently broken. To fix, we'd simply re-run TEsorter on the remaining deduped full length LTR-RTs.
 
+Benchmarking suggests including the gene protein file is a good idea while non-LTR TEs is optional: 
+| Approach              | TP       | FP     | FN      | Precision | Recall    | F1        |
+| --------------------- | -------- | ------ | ------- | --------- | --------- | --------- |
+| (1) NO prot file      | 3079     | 145    | 692     | 0.955     | 0.816     | 0.880     |
+| **(2) NO TE file**    | **3268** | 101    | **503** | 0.970     | **0.867** | **0.915** |
+| (3) NO prot / NO TE   | 3179     | 210    | 592     | 0.938     | 0.843     | 0.888     |
+| (4) prot + TE file    | 3160     | **49** | 611     | **0.985** | 0.838     | 0.905     |
+| (5) EDTA pass + trunc | 2813     | 124    | 958     | 0.958     | 0.746     | 0.839     |
+**** This is a friendlier simulation. Durring burn-in, non-LTR-RTs are all fragmented and LTR-RTs are all intact. Durring simulation, only LTR-RTs are mobile ****
 
-Tools:
-- Uses ./tools/minimap2/minimap2 and ./tools/miniprot/miniprot by default.
-- If missing/unusable, auto-downloads and compiles into ./tools/.
 
-Default parameters are benchmarked with PrinTE:
-- bash ./PrinTE/PrinTE.sh --cds_percent 17 -itp 5 -sz 168.5Mb -mb ../Athal.ancestral.LTR.bins.freq2 -TsTv 2.0 --ex_LTR -ftp 60 -t 100 -m 2e-9 --burnin_only --TE_lib ../maize_rice_arab_curated_TE.lib.fa -cn 5
+| Approach                                | TP       | FP       | FN     | Precision | Recall    | F1        |
+| --------------------------------------- | -------- | -------- | ------ | --------- | --------- | --------- |
+| (6) EDTA pass + trunc                   | 1255     | **73**   | 806    | **0.945** | 0.609     | 0.741     |
+| (7) NO TEsorter                         | **1968** | 1527     | **93** | 0.563     | **0.955** | 0.709     |
+| (8) NO TEsorter + SCN filters           | 1928     | 565      | 133    | 0.773     | 0.935     | **0.846** |
+| (9) TEsorter                            | 1689     | 405      | 372    | 0.807     | 0.820     | 0.813     |
+| **(10) TEsorter + SCN filters**         | 1684     | 285      | 377    | 0.855     | 0.817     | 0.836     |
+**** SCN filters are: --scn-min-ltr-len 100 --scn-min-ret-len 800 --scn-max-ret-len 15000 --scn-min-int-len 500 --scn-max-int-len 12000 ****
+**** This is a more complicated simulation.  Durring burn-in, all TEs (LTR and non-LTR) are both fragmented and intact. Durring simulation, all TEs (LTR and non-LTR) are mobile ****
 
-- python ltrharvest.py --genome burnin.fasta --proteins PrinTE/data/TAIR10.pep.fa.gz --te-library lib_clean.fa --out-prefix myrun --threads 100
-
-# ltrharvest.
-- python ./PrinTE/util/bedtools.py -pass_scn myrun.ltrharvest.stitched.scn -bed <(cat burnin.bed | grep -v FRAG | grep -v gene | grep LTR) -r 0.90 -print unique-bed
-  Overlapping entries: 1800 (1793 unique)
-  Entries unique to SCN/PASS file: 8
-  Entries unique to BED file: 6
-
-# ltrharvest + TEsorter.
-- python ./PrinTE/util/bedtools.py -pass_scn <(cat myrun.ltrharvest.stitched.fa.rexdb-plant.cls.lib.fa | grep '>' | sed 's/^>//; s/#.*//') -bed <(cat burnin.bed | grep -v FRAG | grep -v gene | grep LTR) -r 0.90
-  Overlapping entries: 1658 (1651 unique)
-  Entries unique to SCN/PASS file: 4
-  Entries unique to BED file: 148
+# Suggested run:
+# Combine #2 and #10. 
+# With real data, I suspect TEsorter is required since ltrharvest and ltrfinder parameters are selected to optimize specificity.
+# My PriNTE simulations do not test the impact of low-complexity repeats. 
+python ltrharvest.py --genome Athal.fa --proteins TAIR10.pep.fa.gz --threads 20 --out-prefix Athal_ltr --scn-min-ltr-len 100 --scn-min-ret-len 800 --scn-max-ret-len 15000 --scn-min-int-len 500 --scn-max-int-len 12000
 """
 
 import argparse
@@ -696,6 +701,100 @@ def merge_stitched_scns(stitched_scns: List[str], merged_out: str):
 
     if n_written == 0:
         Path(merged_out).touch()
+        
+def filter_scn_by_lengths(
+    in_scn: str,
+    out_scn: str,
+    min_ltr_len: int = 0,
+    min_ret_len: int = 0,
+    max_ret_len: int = 0,
+    min_int_len: int = 0,
+    max_int_len: int = 0,
+) -> Dict[str, int]:
+    """
+    Filters an LTRharvest tabout-like SCN file by size criteria.
+
+    Expected columns (0-based indices):
+      0 s(ret)
+      1 e(ret)
+      2 l(ret)
+      3 s(lLTR)
+      4 e(lLTR)
+      5 l(lLTR)
+      6 s(rLTR)
+      7 e(rLTR)
+      8 l(rLTR)
+      9 sim(LTRs)
+      10 seq-nr
+      11 chrom   (or more; your stitched adds chrom at end)
+
+    Returns counts for reporting.
+    """
+    counts = {
+        "kept": 0,
+        "total": 0,
+        "fail_min_ltr": 0,
+        "fail_ret_range": 0,
+        "fail_int_range": 0,
+        "malformed": 0,
+    }
+
+    inp = Path(in_scn)
+    if not inp.exists() or inp.stat().st_size == 0:
+        Path(out_scn).touch()
+        return counts
+
+    with open(in_scn, "r") as fin, open(out_scn, "w") as out:
+        for line in fin:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+
+            parts = re.split(r"\s+", line)
+            if len(parts) < 12:
+                counts["malformed"] += 1
+                continue
+
+            counts["total"] += 1
+
+            # Length fields
+            try:
+                lret = int(parts[2])
+                lltr = int(parts[5])
+                rltr = int(parts[8])
+            except ValueError:
+                counts["malformed"] += 1
+                continue
+
+            # (1) Min LTR length: exclude if either LTR is too short
+            if min_ltr_len and (lltr < min_ltr_len or rltr < min_ltr_len):
+                counts["fail_min_ltr"] += 1
+                continue
+
+            # (2) Min/Max LTR-RT (lret)
+            if min_ret_len and lret < min_ret_len:
+                counts["fail_ret_range"] += 1
+                continue
+            if max_ret_len and lret > max_ret_len:
+                counts["fail_ret_range"] += 1
+                continue
+
+            # (3) Min/Max internal length
+            internal = lret - lltr - rltr
+            if min_int_len and internal < min_int_len:
+                counts["fail_int_range"] += 1
+                continue
+            if max_int_len and internal > max_int_len:
+                counts["fail_int_range"] += 1
+                continue
+
+            out.write("  ".join(parts) + "\n")
+            counts["kept"] += 1
+
+    if counts["kept"] == 0:
+        Path(out_scn).touch()
+
+    return counts
 
 # -----------------------------
 # Step 7: build LTR FASTA from stitched SCN
@@ -770,6 +869,56 @@ def scn_to_internal_fasta(stitched_scn: str, genome_fa: str, out_fa: str):
     if n_written == 0:
         Path(out_fa).touch()
 
+def scn_to_intact_fasta(stitched_scn: str, genome_fa: str, out_fa: str):
+    """
+    Extract FULL intact LTR-RT sequence using s(ret) and e(ret) (1-based inclusive),
+    plus chrom (last column).
+
+    Header:
+      >chr1:s(ret)-e(ret)
+    """
+    genome = load_fasta_as_dict(genome_fa)
+
+    n_written = 0
+    with open(out_fa, "w") as out, open(stitched_scn, "r") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = re.split(r"\s+", line)
+            if len(parts) < 12:
+                continue
+
+            sret, eret = parts[0], parts[1]
+            chrom = parts[-1]
+
+            if not (sret.isdigit() and eret.isdigit()):
+                continue
+
+            sret1 = int(sret)
+            eret1 = int(eret)
+            if eret1 < sret1:
+                sret1, eret1 = eret1, sret1
+
+            seq = genome.get(chrom)
+            if seq is None:
+                continue
+
+            start0 = sret1 - 1
+            end0 = eret1  # inclusive -> exclusive
+
+            if start0 < 0 or end0 > len(seq):
+                continue
+
+            header = f"{chrom}:{sret1}-{eret1}"
+            out.write(f">{header}\n")
+            frag = seq[start0:end0]
+            for i in range(0, len(frag), 60):
+                out.write(frag[i:i+60] + "\n")
+            n_written += 1
+
+    if n_written == 0:
+        Path(out_fa).touch()
 
 
 def load_tesorter_te_to_annotation(cls_tsv_path: str) -> Dict[str, str]:
@@ -1400,6 +1549,19 @@ def main():
     ap.add_argument("--size", type=int, default=5_000_000, help="Chunk size (bp)")
     ap.add_argument("--overlap", type=int, default=30_000, help="Chunk overlap (bp)")
 
+    # SCN size-based filtering (optional; applied to merged_scn before FASTA/TEsorter/Kmer2LTR)
+    ap.add_argument("--scn-min-ltr-len", type=int, default=0,
+                    help="Min LTR length filter (exclude if l(lLTR) or l(rLTR) < this; 0 disables)")
+    ap.add_argument("--scn-min-ret-len", type=int, default=0,
+                    help="Min LTR-RT length filter on l(ret); 0 disables")
+    ap.add_argument("--scn-max-ret-len", type=int, default=0,
+                    help="Max LTR-RT length filter on l(ret); 0 disables")
+    ap.add_argument("--scn-min-int-len", type=int, default=0,
+                    help="Min internal length filter on (l(ret)-l(lLTR)-l(rLTR)); 0 disables")
+    ap.add_argument("--scn-max-int-len", type=int, default=0,
+                    help="Max internal length filter on (l(ret)-l(lLTR)-l(rLTR)); 0 disables")
+
+
     # Kmer2LTR + dedup controls
     ap.add_argument("--kmer2ltr-max-win-overdisp", type=float, default=1000.0,
                     help="Kmer2LTR --max-win-overdisp")
@@ -1424,7 +1586,21 @@ def main():
     )
 
 
-    # TEsorter (required)
+    # TEsorter optional toggle (default ON to preserve current behavior)
+    ap.add_argument(
+        "--tesorter",
+        dest="use_tesorter",
+        action="store_true",
+        default=True,
+        help="Use TEsorter filtering + cls annotation (default: enabled)."
+    )
+    ap.add_argument(
+        "--no-tesorter",
+        dest="use_tesorter",
+        action="store_false",
+        help="Skip TEsorter entirely; build intact FASTA from SCN and feed directly to Kmer2LTR."
+    )
+
     ap.add_argument("--tesorter-db", default="rexdb-plant",
                     help="TEsorter HMM database (-db)")
     ap.add_argument("--tesorter-cov", type=int, default=20,
@@ -1479,6 +1655,10 @@ def main():
     tools_dir = Path("./tools")
     minimap2_path, miniprot_path = ensure_tools(tools_dir)
     tesorter_py_path = ensure_tesorter(tools_dir)
+    tesorter_py_path = None
+    if args.use_tesorter:
+        tesorter_py_path = ensure_tesorter(tools_dir)
+
     kmer2ltr_py = ensure_kmer2ltr(tools_dir)
 
     if args.proteins or args.te_library:
@@ -1677,47 +1857,94 @@ def main():
     print(f"[Step6] merging stitched SCN(s) -> {merged_scn}")
     merge_stitched_scns(to_merge, merged_scn)
 
+    # Optional: size-based filtering of merged SCN to reduce downstream runtime
+    if any([
+        args.scn_min_ltr_len,
+        args.scn_min_ret_len,
+        args.scn_max_ret_len,
+        args.scn_min_int_len,
+        args.scn_max_int_len,
+    ]):
+        filtered_scn = f"{out_prefix}.ltrtools.stitched.filtered.scn"
+        print(f"[Step6b] filtering SCN by lengths -> {filtered_scn}")
+
+        stats = filter_scn_by_lengths(
+            in_scn=merged_scn,
+            out_scn=filtered_scn,
+            min_ltr_len=args.scn_min_ltr_len,
+            min_ret_len=args.scn_min_ret_len,
+            max_ret_len=args.scn_max_ret_len,
+            min_int_len=args.scn_min_int_len,
+            max_int_len=args.scn_max_int_len,
+        )
+
+        print(
+            f"[Step6b] SCN filter: kept {stats['kept']}/{stats['total']} | "
+            f"minLTR_fail={stats['fail_min_ltr']} retRange_fail={stats['fail_ret_range']} "
+            f"intRange_fail={stats['fail_int_range']} malformed={stats['malformed']}"
+        )
+
+        merged_scn = filtered_scn  # downstream steps use the filtered SCN
+    else:
+        print("[Step6b] skipping SCN length filtering (no --scn-* filters set).")
+
     # (2) build LTR FASTA from stitched SCN using s(ret)/e(ret)
     internals_fa = str(workdir / f"{out_prefix}.ltrtools.internals.fa")
-    print(f"[Step7] building INTERNALS FASTA from SCN -> {internals_fa}")
-    scn_to_internal_fasta(merged_scn, args.genome, internals_fa)
+    intact_fa = f"{out_prefix}.ltrtools.intact.fa"  # requested path (in ./)
 
+    if args.use_tesorter:
+        print(f"[Step7] building INTERNALS FASTA from SCN -> {internals_fa}")
+        scn_to_internal_fasta(merged_scn, args.genome, internals_fa)
+    else:
+        print(f"[Step7] building INTACT FASTA from SCN -> {intact_fa}")
+        scn_to_intact_fasta(merged_scn, args.genome, intact_fa)
 
     # Step 9: TEsorter on stitched FASTA (required)
-    tesorter_outdir = workdir  # store ALL TEsorter outputs in {prefix}.work/
-    print(f"[Step9] running TEsorter on stitched FASTA (outputs -> {tesorter_outdir})")
+    cls_tsv_path = None
+    tesorter_lib_fa = None
 
-    cls_lib_path, cls_pep_path, cls_tsv_path = run_tesorter(
-        stitched_fa=internals_fa,
-        tesorter_py_path=tesorter_py_path,
-        outdir=tesorter_outdir,
-        db=args.tesorter_db,
-        cov=args.tesorter_cov,
-        evalue=args.tesorter_eval,
-        rule=args.tesorter_rule,
-        threads=args.threads,
-    )
+    if args.use_tesorter:
+        tesorter_outdir = workdir  # store ALL TEsorter outputs in {prefix}.work/
+        print(f"[Step9] running TEsorter on stitched FASTA (outputs -> {tesorter_outdir})")
 
-    # Now build FULL-LENGTH LTR-RT FASTA from genome + cls.tsv (Order == LTR)
-    tesorter_lib_fa = str(workdir / f"{out_prefix}.ltrharvest.full_length.fa.{args.tesorter_db}.cls.lib.fa")
-    print(f"[Step9] building full-length LTR FASTA from cls.tsv -> {tesorter_lib_fa}")
-    build_tesorter_full_length_ltr_fasta_from_cls_tsv(cls_tsv_path, args.genome, tesorter_lib_fa)
+        cls_lib_path, cls_pep_path, cls_tsv_path = run_tesorter(
+            stitched_fa=internals_fa,
+            tesorter_py_path=tesorter_py_path,
+            outdir=tesorter_outdir,
+            db=args.tesorter_db,
+            cov=args.tesorter_cov,
+            evalue=args.tesorter_eval,
+            rule=args.tesorter_rule,
+            threads=args.threads,
+        )
 
+        # Build FULL-LENGTH LTR-RT FASTA from genome + cls.tsv (Order == LTR)
+        tesorter_lib_fa = str(workdir / f"{out_prefix}.ltrharvest.full_length.fa.{args.tesorter_db}.cls.lib.fa")
+        print(f"[Step9] building full-length LTR FASTA from cls.tsv -> {tesorter_lib_fa}")
+        build_tesorter_full_length_ltr_fasta_from_cls_tsv(cls_tsv_path, args.genome, tesorter_lib_fa)
+    else:
+        print("[Step9] skipping TEsorter (--no-tesorter).")
 
     # Step 8: kmer2ltr.domain from stitched SCN  (MOVE THIS UP before Kmer2LTR)
     kmer2ltr_domain = str(workdir / f"{out_prefix}.kmer2ltr.domain")
     print(f"[Step8] building kmer2ltr domain -> {kmer2ltr_domain}")
     scn_to_kmer2ltr_domain(merged_scn, kmer2ltr_domain, tesorter_cls_tsv=cls_tsv_path)
 
+
     # Step 9b: Kmer2LTR on full-length FASTA (for dedup)
-    print("[Step9b] running Kmer2LTR (dedup driver) on full-length LTR FASTA...")
-    k2l_prefix = f"{out_prefix}_kmer2ltr"  # basename, created in workdir
+    print("[Step9b] running Kmer2LTR (dedup driver)...")
+    k2l_prefix = f"{out_prefix}_kmer2ltr"
 
     domain_arg = kmer2ltr_domain if args.kmer2ltr_domains else None
 
+    if args.use_tesorter:
+        k2l_in_fa = tesorter_lib_fa
+    else:
+        k2l_in_fa = intact_fa
+
     k2l_main = run_kmer2ltr(
         kmer2ltr_py=kmer2ltr_py,
-        in_fa=tesorter_lib_fa,
+        in_fa=k2l_in_fa,
         out_prefix=k2l_prefix,
         outdir=workdir,
         threads=args.threads,
@@ -1726,16 +1953,27 @@ def main():
         domain_file=domain_arg,
     )
 
+
     # Primary output #1 (in ./): dedup TSV
     k2l_dedup_out = f"{out_prefix}_kmer2ltr_dedup"
     print(f"[Step9b] deduping Kmer2LTR output -> {k2l_dedup_out}")
     dedup_kmer2ltr_tsv(k2l_main, k2l_dedup_out, threshold=args.dedup_threshold)
 
     # Primary output #2 (in ./): dedupbed full-length FASTA
-    tesorter_lib_fa_dedup = f"{out_prefix}.ltrharvest.full_length.dedup.fa.{args.tesorter_db}.cls.lib.fa"
-    print(f"[Step9b] subsetting full-length FASTA by dedup list -> {tesorter_lib_fa_dedup}")
+    k2l_dedup_out = f"{out_prefix}_kmer2ltr_dedup"
+    print(f"[Step9b] deduping Kmer2LTR output -> {k2l_dedup_out}")
+    dedup_kmer2ltr_tsv(k2l_main, k2l_dedup_out, threshold=args.dedup_threshold)
+
     keep_names = names_from_kmer2ltr_dedup(k2l_dedup_out)
-    subset_fasta_by_name_set(tesorter_lib_fa, tesorter_lib_fa_dedup, keep_names)
+
+    if args.use_tesorter:
+        tesorter_lib_fa_dedup = f"{out_prefix}.ltrharvest.full_length.dedup.fa.{args.tesorter_db}.cls.lib.fa"
+        print(f"[Step9b] subsetting full-length FASTA by dedup list -> {tesorter_lib_fa_dedup}")
+        subset_fasta_by_name_set(tesorter_lib_fa, tesorter_lib_fa_dedup, keep_names)
+    else:
+        intact_dedup_fa = f"{out_prefix}.ltrtools.intact.dedup.fa"
+        print(f"[Step9b] subsetting intact FASTA by dedup list -> {intact_dedup_fa}")
+        subset_fasta_by_name_set(intact_fa, intact_dedup_fa, keep_names)
 
 
     # Optional: tree building (VERY slow)
@@ -1759,10 +1997,16 @@ def main():
     print("\nDone.")
     print("Primary outputs:")
     print(f"  Kmer2LTR dedup TSV:          {out_prefix}_kmer2ltr_dedup")
-    print(f"  TEsorter full-length dedup FASTA: {out_prefix}.ltrharvest.full_length.dedup.fa.{args.tesorter_db}.cls.lib.fa")
-    print("")
-    print("Workdir outputs:")
-    print(f"  Full-length (pre-dedup) FASTA: {tesorter_lib_fa}")
+
+    if args.use_tesorter:
+        print(f"  TEsorter full-length dedup FASTA: {out_prefix}.ltrharvest.full_length.dedup.fa.{args.tesorter_db}.cls.lib.fa")
+        print("")
+        print("Workdir outputs:")
+        print(f"  Full-length (pre-dedup) FASTA: {tesorter_lib_fa}")
+    else:
+        print(f"  Intact dedup FASTA:          {out_prefix}.ltrtools.intact.dedup.fa")
+        print(f"  Intact (pre-dedup) FASTA:    {out_prefix}.ltrtools.intact.fa")
+
     print(f"  Kmer2LTR outputs prefix:       {workdir}/{out_prefix}_kmer2ltr*")
 
     if args.tesorter_tree:

@@ -33,6 +33,30 @@ Benchmarking suggests including the gene protein file is a good idea while non-L
 # With real data, I suspect TEsorter is required since ltrharvest and ltrfinder parameters are selected to optimize specificity.
 # My PriNTE simulations do not test the impact of low-complexity repeats. 
 python ltrharvest.py --genome Athal.fa --proteins TAIR10.pep.fa.gz --threads 20 --out-prefix Athal_ltr --scn-min-ltr-len 100 --scn-min-ret-len 800 --scn-max-ret-len 15000 --scn-min-int-len 500 --scn-max-int-len 12000
+
+ 
+# Goldstandard
+perl EDTA/EDTA_raw.pl --genome Athal_chr1.fa --type ltr --threads 10
+# Finished in 23min.
+# Identifes 39 LTR-RTs.
+    DB="repbase_RM.nucl"
+    Q="Athal.fa.mod.EDTA.raw/LTR/Athal.fa.mod.pass.list.fa"
+    PFX="Athal_vs_repbase"
+    blastn -task blastn -query "$Q" -db "$DB" -evalue 1e-10 -max_target_seqs 50 -max_hsps 1 -outfmt '6 qseqid sseqid pident length mismatch gapopen qstart qend qlen sstart send slen evalue bitscore qcovhsp' -num_threads 16 > "${PFX}.raw.tsv"
+    LC_ALL=C sort -k1,1 -k14,14gr -k13,13g "${PFX}.raw.tsv" | awk 'BEGIN{FS=OFS="\t"} !seen[$1]++' > "${PFX}.best.tsv"
+    awk 'BEGIN{FS=OFS="\t"}{qcov=100.0*$4/$9; scov=100.0*$4/$12; print $0, sprintf("%.2f",qcov), sprintf("%.2f",scov)}' "${PFX}.best.tsv" > "${PFX}.best.with_cov.tsv"
+    { echo -e "qseqid\tsseqid\tpident\taln_len\tmismatch\tgapopen\tqstart\tqend\tqlen\tsstart\tsend\tslen\tevalue\tbitscore\tqcovhsp\tqcov_pct\tscov_pct"; cat "${PFX}.best.with_cov.tsv"; } > "${PFX}.best.with_cov.header.tsv"
+    awk 'BEGIN{FS=OFS="\t"} NR==1 || $2 !~ /LTR/ {print}' "${PFX}.best.with_cov.header.tsv" > "${PFX}.no_LTR_hits.tsv"
+    awk 'BEGIN{FS="\t"} NR>1 && $2 !~ /LTR/ {n++} END{print n}' "${PFX}.best.with_cov.header.tsv"
+# 37 of the 39 have an LTR-RT best-hit in the repbase lib. 2 are LINE.
+
+# This pipeline.
+python ltrharvest.py --genome Athal_chr1.fa --proteins ../PrinTE/data/TAIR10.pep.fa.gz --threads 10 --out-prefix ltrharvest --scn-min-ltr-len 100 --scn-min-ret-len 800 --scn-max-ret-len 15000 --scn-min-int-len 500 --scn-max-int-len 12000 --size 500000
+# Finished in 30min.
+# Identifes 170 LTR-RTs.
+# 146 of the 170 have an LTR-RT best-hit in the repbase lib.
+# Most of the non LTR-RT alignments are identified using TEsorter 2-pass (LTR/Gypsy/unknown) and very poorly aligned (1-6% query cov). 
+# Previous benchmarking suggest TEsorter 2-pass 80-80-80 was useful for detecting real LTR-RTs and lowering 80-80-80 generated artifacts
 """
 
 import argparse

@@ -9,6 +9,8 @@ Takes genome FAI and the dedup results of the FAI to plot LTR-RT annotation feat
 
 python3 ltrharvest_plot.py --k2p-xmax 0.2 --bin 200 --legend-page --stacked
 python3 ltrharvest_plot.py --k2p-xmax 0.2 --bin 200 --legend-page
+# Large genomes need --chr-rasterize.
+python ltrharvest_plot.py --species B73 --aln-suffix _kmer2ltr_dedup --outpdf B73_ltr3.pdf --bin 100 --k2p-xmax 0.1 --legend-page --timing --chr-rasterize --chr-merge-gap 50
 
 LTR-RT multi-page PDF plots across species.
 
@@ -49,6 +51,9 @@ Assumptions:
 import re
 import math
 import argparse
+import sys
+import time
+from datetime import datetime
 from collections import defaultdict, OrderedDict
 
 import numpy as np
@@ -58,6 +63,38 @@ from matplotlib.patches import Patch
 
 
 COL1_RE = re.compile(r"^(?P<chrom>[^:]+):(?P<start>\d+)-(?P<end>\d+)#(?P<typ>.+)$")
+
+
+# -----------------------------
+# Timing / logging
+# -----------------------------
+def _now_str():
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def tlog(msg, enabled=True):
+    """Timestamped log to stderr."""
+    if enabled:
+        print(f"[{_now_str()}] {msg}", file=sys.stderr, flush=True)
+
+
+class Timer:
+    """Context manager for timing blocks."""
+    def __init__(self, label, enabled=True):
+        self.label = label
+        self.enabled = enabled
+        self.t0 = None
+
+    def __enter__(self):
+        if self.enabled:
+            tlog(f"START: {self.label}", enabled=True)
+            self.t0 = time.perf_counter()
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        if self.enabled and self.t0 is not None:
+            dt = time.perf_counter() - self.t0
+            tlog(f"END:   {self.label}  (elapsed {dt:.3f}s)", enabled=True)
 
 
 # -----------------------------
@@ -145,6 +182,209 @@ def parse_alignment_file(path):
                 }
             )
     return records
+
+
+def compute_chrom_density(records, chrom2len, window_bp=1_000_000, step_bp=500_000):
+    """
+    Sliding-window density per chromosome per TE type.
+    Returns:
+      dens[chrom][type] = np.array(density_fraction_per_window)
+      centers_bp[chrom] = np.array(window_center_positions_bp)
+    Density is fraction of bases in window covered by that TE type (0..1).
+    """
+    dens = {}
+    centers = {}
+
+    if window_bp <= 0 or step_bp <= 0:
+        return dens, centers
+
+    # index intervals by chrom
+    by_chrom = defaultdict(list)
+    for r in records:
+        chrom = r["chrom"]
+        if "sca" in chrom.lower():
+            continue
+        if chrom not in chrom2len:
+            continue
+        start = max(0, int(r["start"]))
+        end = min(int(r["end"]), int(chrom2len[chrom]))
+        if end <= start:
+            continue
+        by_chrom[chrom].append((start, end, r["type"]))
+
+    for chrom, L in chrom2len.items():
+        if chrom not in by_chrom:
+            continue
+
+        # windows: [i*step, i*step+window)
+        # include last window whose start < L
+        nwin = int(math.floor((max(L - 1, 0)) / step_bp)) + 1
+        w_starts = np.arange(0, nwin * step_bp, step_bp, dtype=np.int64)
+        w_ends = w_starts + window_bp
+        centers_bp = w_starts + window_bp / 2.0
+
+        # accumulate covered bp per window per type
+        acc = defaultdict(lambda: np.zeros(nwin, dtype=np.float64))
+
+        for start, end, typ in by_chrom[chrom]:
+            # window indices that could overlap this interval
+            i0 = max(0, int((start - window_bp) // step_bp))
+            i1 = min(nwin - 1, int(end // step_bp))
+            for i in range(i0, i1 + 1):
+                ws = int(w_starts[i])
+                we = int(w_ends[i])
+                ov = max(0, min(end, we) - max(start, ws))
+                if ov:
+                    acc[typ][i] += ov
+
+        # convert bp-covered to density fraction in the window (cap at 1)
+        dens[chrom] = {}
+        for typ, covered in acc.items():
+            d = covered / float(window_bp)
+            d[d < 0] = 0
+            d[d > 1] = 1
+            dens[chrom][typ] = d
+
+        centers[chrom] = centers_bp
+
+    return dens, centers
+
+
+def filter_density_types(dens_by_chrom, threshold_percent=None, top_n=14):
+    """
+    dens_by_chrom: dens[chrom][type] = np.array(0..1)
+    Returns list of kept types sorted by max density desc.
+    """
+    max_by_type = defaultdict(float)
+    for chrom, m in dens_by_chrom.items():
+        for t, arr in m.items():
+            if arr.size:
+                mx = float(np.nanmax(arr))
+                if np.isfinite(mx):
+                    max_by_type[t] = max(max_by_type[t], mx)
+
+    types = list(max_by_type.keys())
+    # threshold
+    if threshold_percent is not None:
+        thr = float(threshold_percent) / 100.0
+        types = [t for t in types if max_by_type[t] > thr]
+
+    # sort by max density desc
+    types.sort(key=lambda t: max_by_type[t], reverse=True)
+
+    # cap
+    if top_n is not None and int(top_n) > 0 and len(types) > int(top_n):
+        types = types[: int(top_n)]
+
+    return types
+
+
+def style_minimal_axes(ax):
+    # simple "theme_minimal-ish" without global matplotlib styles
+    ax.grid(True, alpha=0.2)
+    ax.set_axisbelow(True)
+    for spine in ax.spines.values():
+        spine.set_alpha(0.25)
+    ax.tick_params(labelsize=8)
+
+
+def plot_chrom_density_facets(
+    pdf, sp, chrom2len, records, type_colors,
+    window_bp=1_000_000, step_bp=500_000,
+    threshold_percent=None, top_n=14,
+    legend_page=False, embedded_legend_cols=2,
+    timing=False,
+):
+    """
+    One PDF page for a species: facet grid of chromosomes; line per type.
+    X in Mb, Y in percent.
+    """
+    with Timer(f"[{sp}] compute_chrom_density(window={window_bp}, step={step_bp})", enabled=timing):
+        dens, centers = compute_chrom_density(records, chrom2len, window_bp=window_bp, step_bp=step_bp)
+
+    if not dens:
+        fig, ax = plt.subplots(figsize=(11, 6))
+        ax.text(0.5, 0.5, f"{sp}: No density data", ha="center", va="center")
+        ax.set_axis_off()
+        pdf.savefig(fig)
+        plt.close(fig)
+        return
+
+    with Timer(f"[{sp}] filter_density_types(thr={threshold_percent}, top_n={top_n})", enabled=timing):
+        kept_types = filter_density_types(dens, threshold_percent=threshold_percent, top_n=top_n)
+
+    if not kept_types:
+        fig, ax = plt.subplots(figsize=(11, 6))
+        ax.text(0.5, 0.5, f"{sp}: No types pass filters", ha="center", va="center")
+        ax.set_axis_off()
+        pdf.savefig(fig)
+        plt.close(fig)
+        return
+
+    chroms = [c for c in chrom2len.keys() if c in dens]  # preserve sorted chrom order
+    r, c = panel_grid(len(chroms))
+
+    with Timer(f"[{sp}] plot_chrom_density_facets(render + save)", enabled=timing):
+        fig, axes = plt.subplots(r, c, figsize=(11, 8.5), squeeze=False)
+        axes_flat = axes.ravel()
+
+        # shared y max across facets for readability
+        y_max = 0.0
+        for chrom in chroms:
+            for t in kept_types:
+                arr = dens[chrom].get(t)
+                if arr is not None and arr.size:
+                    y_max = max(y_max, float(np.nanmax(arr) * 100.0))
+        y_max = y_max * 1.05 if y_max > 0 else None
+
+        for i, chrom in enumerate(chroms):
+            ax = axes_flat[i]
+            x_mb = centers[chrom] / 1e6
+
+            for t in kept_types:
+                y = dens[chrom].get(t)
+                if y is None:
+                    continue
+                ax.plot(x_mb, y * 100.0, linewidth=1.2, alpha=0.9, color=type_colors.get(t, (0, 0, 0, 1)))
+
+            ax.set_title(chrom, fontsize=9)
+            ax.set_xlim(0, float(chrom2len[chrom]) / 1e6)
+            if y_max is not None:
+                ax.set_ylim(0, y_max)
+            style_minimal_axes(ax)
+
+            # label only left/bottom panels
+            if i % c == 0:
+                ax.set_ylabel("% in window", fontsize=9)
+            else:
+                ax.set_ylabel("")
+            if i >= (r - 1) * c:
+                ax.set_xlabel("Position (Mb)", fontsize=9)
+            else:
+                ax.set_xlabel("")
+
+        # turn off unused
+        for j in range(len(chroms), len(axes_flat)):
+            axes_flat[j].set_axis_off()
+
+        step_mb = step_bp / 1e6
+        win_mb = window_bp / 1e6
+        title = f"{sp}: Chromosome distribution (density-style)  |  window={win_mb:g}Mb step={step_mb:g}Mb"
+        if threshold_percent is not None:
+            title += f"  |  thr>{float(threshold_percent):g}%"
+        if top_n and int(top_n) > 0:
+            title += f"  |  top={int(top_n)}"
+        fig.suptitle(title, fontsize=12)
+
+        # legend handling matches your existing philosophy
+        if not legend_page:
+            add_embedded_legend(fig, {t: type_colors[t] for t in kept_types if t in type_colors}, ncol=embedded_legend_cols, fontsize=7)
+            fig.tight_layout(rect=[0, 0, 0.72, 0.96])
+        else:
+            fig.tight_layout(rect=[0, 0, 1, 0.96])
+
+        pdf.savefig(fig)
+        plt.close(fig)
 
 
 # -----------------------------
@@ -343,7 +583,28 @@ def plot_k2p_panel(ax, sp_label, k2p_data, type_colors, y_max=None, show_global_
     ax.tick_params(labelsize=8)
 
 
-def plot_chrom_panel(ax, sp_label, chrom2len, records, type_colors, dot_types, x_max=None):
+from collections import defaultdict
+
+def merge_ranges(xranges, gap=0):
+    """Merge sorted (start, width) into non-overlapping (start, width)."""
+    if not xranges:
+        return []
+    xranges = sorted(xranges, key=lambda x: x[0])
+    merged = []
+    s0, w0 = xranges[0]
+    e0 = s0 + w0
+    for s, w in xranges[1:]:
+        e = s + w
+        if s <= e0 + gap:   # overlap / near-touch
+            e0 = max(e0, e)
+        else:
+            merged.append((s0, e0 - s0))
+            s0, e0 = s, e
+    merged.append((s0, e0 - s0))
+    return merged
+
+def plot_chrom_panel(ax, sp_label, chrom2len, records, type_colors, dot_types, x_max=None,
+                    merge_gap_bp=0, rasterize=True):
     ax.set_title(sp_label, fontsize=10)
 
     if not chrom2len:
@@ -351,7 +612,8 @@ def plot_chrom_panel(ax, sp_label, chrom2len, records, type_colors, dot_types, x
         ax.set_axis_off()
         return
 
-    intervals = defaultdict(list)
+    # intervals_by_chrom_type[chrom][type] = [(start, width), ...]
+    intervals_by_chrom_type = defaultdict(lambda: defaultdict(list))
     dots = defaultdict(list)
     dot_set = set(dot_types) if dot_types else set()
 
@@ -368,7 +630,7 @@ def plot_chrom_panel(ax, sp_label, chrom2len, records, type_colors, dot_types, x
             continue
 
         t = r["type"]
-        intervals[chrom].append((start, end - start, t))
+        intervals_by_chrom_type[chrom][t].append((start, end - start))
 
         if dot_set and t in dot_set:
             dots[chrom].append((start + end) / 2.0)
@@ -379,22 +641,38 @@ def plot_chrom_panel(ax, sp_label, chrom2len, records, type_colors, dot_types, x
     height = 6
     y_positions = {c: (n - 1 - i) * ystep for i, c in enumerate(chrom_names)}
 
+    # chromosome backbones (cheap)
     for chrom in chrom_names:
         y = y_positions[chrom]
         L = chrom2len[chrom]
-        ax.broken_barh([(0, L)], (y, height), facecolors=(0, 0, 0, 0.08), edgecolors=(0, 0, 0, 0.12), linewidth=0.5)
+        ax.broken_barh([(0, L)], (y, height),
+                       facecolors=(0, 0, 0, 0.08),
+                       edgecolors=(0, 0, 0, 0.12),
+                       linewidth=0.5)
 
-    for chrom, segs in intervals.items():
+    # TE intervals (batched + optionally merged)
+    for chrom, type_map in intervals_by_chrom_type.items():
         y = y_positions[chrom]
-        for x0, w, t in segs:
-            ax.broken_barh([(x0, w)], (y, height), facecolors=type_colors[t], edgecolors="none", alpha=0.85)
+        for t, xranges in type_map.items():
+            if merge_gap_bp is not None and merge_gap_bp >= 0:
+                xranges = merge_ranges(xranges, gap=int(merge_gap_bp))
+            coll = ax.broken_barh(
+                xranges,
+                (y, height),
+                facecolors=type_colors.get(t, (0, 0, 0, 1)),
+                edgecolors="none",
+                alpha=0.85,
+            )
+            if rasterize:
+                coll.set_rasterized(True)  # huge PDF speedup
 
+    # dots (usually not the bottleneck)
     if dot_set:
         for chrom, mids in dots.items():
             if not mids:
                 continue
             y = y_positions[chrom] + height + 0.8
-            ax.scatter(mids, [y] * len(mids), s=6)
+            ax.scatter(mids, [y] * len(mids), s=6, rasterized=rasterize)
 
     max_len = max(chrom2len.values())
     xmax = x_max if x_max is not None else max_len
@@ -404,7 +682,6 @@ def plot_chrom_panel(ax, sp_label, chrom2len, records, type_colors, dot_types, x
     ax.set_yticklabels(chrom_names, fontsize=7)
     ax.grid(True, axis="x", alpha=0.2)
     ax.tick_params(labelsize=8)
-
 
 def plot_size_panel(ax, sp_label, counts_by_type, bins, type_colors, y_max=None):
     ax.set_title(sp_label, fontsize=10)
@@ -477,6 +754,11 @@ def main():
         default=None,
         help="If set, fix K2P density x-axis max to this value (x-axis will be [0, xmax])",
     )
+    ap.add_argument("--chr-merge-gap", type=int, default=0,
+                help="Merge TE intervals if separated by <= this many bp (default: 0).")
+    ap.add_argument("--chr-rasterize", action="store_true",
+                help="Rasterize TE rectangles in chromosome plot for speed (recommended).")
+
     ap.add_argument(
         "--dot-type",
         action="append",
@@ -505,284 +787,362 @@ def main():
         action="store_true",
         help="Draw a thin outline of the global density on top of the stacked fill (verification).",
     )
+    ap.add_argument("--dens-window", type=int, default=1_000_000, help="Window size for chrom density (bp). Default: 1,000,000")
+    ap.add_argument("--dens-step", type=int, default=500_000, help="Step size for chrom density (bp). Default: 500,000")
+    ap.add_argument("--dens-threshold", type=float, default=None, help="Exclude types whose max density percent never exceeds this value (0-100).")
+    ap.add_argument("--dens-top-types", type=int, default=14, help="Keep only top N types by max density (default: 14). Use 0 for no cap.")
+    ap.add_argument(
+        "--timing",
+        action="store_true",
+        help="Print timestamped timing logs to stderr to identify bottlenecks.",
+    )
+
     args = ap.parse_args()
+    timing = bool(args.timing)
 
-    # Load species and build global TE type set for consistent colors
-    species_data = {}
-    all_types = set()
-    for sp in args.species:
-        fai = f"{sp}{args.fai_suffix}"
-        aln = f"{sp}{args.aln_suffix}"
-        chrom2len = read_fai_lengths(fai)
-        records = parse_alignment_file(aln)
-        for r in records:
-            all_types.add(r["type"])
-        species_data[sp] = {"chrom2len": chrom2len, "records": records}
+    with Timer("Load species: read FAI + parse alignment + collect global TE types", enabled=timing):
+        # Load species and build global TE type set for consistent colors
+        species_data = {}
+        all_types = set()
+        for sp in args.species:
+            fai = f"{sp}{args.fai_suffix}"
+            aln = f"{sp}{args.aln_suffix}"
 
-    type_colors = make_type_colors(all_types)
+            with Timer(f"[{sp}] read_fai_lengths({fai})", enabled=timing):
+                chrom2len = read_fai_lengths(fai)
 
-    with PdfPages(args.outpdf) as pdf:
-        # Legend-only page
-        if args.legend_page:
-            make_legend_page(pdf, type_colors, ncol=args.legend_cols)
+            with Timer(f"[{sp}] parse_alignment_file({aln})", enabled=timing):
+                records = parse_alignment_file(aln)
 
-        # Helper: embed legend unless legend-page mode
-        def maybe_embed_legend(fig):
-            if not args.legend_page:
-                add_embedded_legend(fig, type_colors, ncol=args.embedded_legend_cols, fontsize=7)
+            with Timer(f"[{sp}] collect types + store species_data", enabled=timing):
+                for r in records:
+                    all_types.add(r["type"])
+                species_data[sp] = {"chrom2len": chrom2len, "records": records}
 
-        if args.stacked:
-            # ---------- Precompute shared axes limits ----------
-            # K2P shared x: use args.k2p_xmax if provided else global max across species
-            k2p_cache = {}
-            global_k2p_xmax = 0.0
-            global_k2p_ymax = 0.0
-            for sp in args.species:
-                kdat = compute_species_k2p_stack(species_data[sp]["records"], k2p_xmax=args.k2p_xmax)
-                k2p_cache[sp] = kdat
-                if kdat is None:
-                    continue
-                xgrid, dens_global, _ = kdat
-                global_k2p_xmax = max(global_k2p_xmax, float(xgrid[-1]))
-                global_k2p_ymax = max(global_k2p_ymax, float(np.nanmax(dens_global)))
+            tlog(f"[{sp}] parsed records: {len(species_data[sp]['records'])}", enabled=timing)
+            tlog(f"[{sp}] chromosomes kept (non-sca): {len(species_data[sp]['chrom2len'])}", enabled=timing)
 
-            # If not fixed, recompute each species to use global xmax so x-axes match
-            if args.k2p_xmax is None and global_k2p_xmax > 0:
-                for sp in args.species:
-                    k2p_cache[sp] = compute_species_k2p_stack(species_data[sp]["records"], k2p_xmax=global_k2p_xmax)
+    with Timer("Build global type_colors", enabled=timing):
+        type_colors = make_type_colors(all_types)
+        tlog(f"Global TE types: {len(type_colors)}", enabled=timing)
 
-            # Chromosome shared x max
-            global_chr_xmax = 0
-            for sp in args.species:
-                c2l = species_data[sp]["chrom2len"]
-                if c2l:
-                    global_chr_xmax = max(global_chr_xmax, max(c2l.values()))
+    with Timer(f"Open PDF for writing: {args.outpdf}", enabled=timing):
+        with PdfPages(args.outpdf) as pdf:
+            # Legend-only page
+            if args.legend_page:
+                with Timer("Write legend-only page", enabled=timing):
+                    make_legend_page(pdf, type_colors, ncol=args.legend_cols)
 
-            # Size shared bins and y-max
-            bin_size = int(args.bin)
-
-            def global_bins_for_key(key):
-                vmax = 0.0
-                for sp in args.species:
-                    vals = []
-                    for r in species_data[sp]["records"]:
-                        v = r.get(key, None)
-                        if v is None or not np.isfinite(v) or v < 0:
-                            continue
-                        vals.append(float(v))
-                    if vals:
-                        vmax = max(vmax, float(np.nanmax(vals)))
-                vmax = max(vmax, float(bin_size))
-                return np.arange(0, vmax + bin_size, bin_size)
-
-            bins_full = global_bins_for_key("full_len")
-            bins_ltr = global_bins_for_key("ltr_len")
-            bins_int = global_bins_for_key("internal_len")
-
-            size_cache = {"full_len": {}, "ltr_len": {}, "internal_len": {}}
-            y_full = y_ltr = y_int = 0.0
-
-            def stacked_ymax(counts_by_type):
-                if not counts_by_type:
-                    return 0.0
-                mat = np.vstack(list(counts_by_type.values()))
-                return float(np.sum(mat, axis=0).max()) if mat.size else 0.0
-
-            for sp in args.species:
-                recs = species_data[sp]["records"]
-
-                cb = compute_hist_counts(compute_size_by_type(recs, "full_len"), bins_full)
-                size_cache["full_len"][sp] = cb
-                y_full = max(y_full, stacked_ymax(cb))
-
-                cb = compute_hist_counts(compute_size_by_type(recs, "ltr_len"), bins_ltr)
-                size_cache["ltr_len"][sp] = cb
-                y_ltr = max(y_ltr, stacked_ymax(cb))
-
-                cb = compute_hist_counts(compute_size_by_type(recs, "internal_len"), bins_int)
-                size_cache["internal_len"][sp] = cb
-                y_int = max(y_int, stacked_ymax(cb))
-
-            # ---------- Page builder: multi-panel ----------
-            def save_multipanel_page(title, plotter, xlabel=None, ylabel=None, embed_legend=True):
-                r, c = panel_grid(len(args.species))
-                fig, axes = plt.subplots(r, c, figsize=(11, 8.5), squeeze=False)
-                axes_flat = axes.ravel()
-
-                for i, sp in enumerate(args.species):
-                    ax = axes_flat[i]
-                    plotter(ax, sp)
-
-                    if ylabel is not None:
-                        if i % c == 0:
-                            ax.set_ylabel(ylabel, fontsize=9)
-                        else:
-                            ax.set_ylabel("")
-                    if xlabel is not None:
-                        if i >= (r - 1) * c:
-                            ax.set_xlabel(xlabel, fontsize=9)
-                        else:
-                            ax.set_xlabel("")
-
-                for j in range(len(args.species), len(axes_flat)):
-                    axes_flat[j].set_axis_off()
-
-                fig.suptitle(title, fontsize=12)
-
-                if embed_legend and (not args.legend_page):
+            # Helper: embed legend unless legend-page mode
+            def maybe_embed_legend(fig):
+                if not args.legend_page:
                     add_embedded_legend(fig, type_colors, ncol=args.embedded_legend_cols, fontsize=7)
-                    fig.tight_layout(rect=[0, 0, 0.72, 0.96])
-                else:
-                    fig.tight_layout(rect=[0, 0, 1, 0.96])
 
-                pdf.savefig(fig)
-                plt.close(fig)
+            if args.stacked:
+                # ---------- Precompute shared axes limits ----------
+                with Timer("STACKED precompute: K2P cache + global x/y limits", enabled=timing):
+                    k2p_cache = {}
+                    global_k2p_xmax = 0.0
+                    global_k2p_ymax = 0.0
+                    for sp in args.species:
+                        with Timer(f"[{sp}] compute_species_k2p_stack(initial)", enabled=timing):
+                            kdat = compute_species_k2p_stack(species_data[sp]["records"], k2p_xmax=args.k2p_xmax)
+                        k2p_cache[sp] = kdat
+                        if kdat is None:
+                            continue
+                        xgrid, dens_global, _ = kdat
+                        global_k2p_xmax = max(global_k2p_xmax, float(xgrid[-1]))
+                        global_k2p_ymax = max(global_k2p_ymax, float(np.nanmax(dens_global)))
 
-            # K2P multipanel
-            def k2p_plotter(ax, sp):
-                plot_k2p_panel(
-                    ax=ax,
-                    sp_label=sp,
-                    k2p_data=k2p_cache[sp],
-                    type_colors=type_colors,
-                    y_max=global_k2p_ymax * 1.02 if global_k2p_ymax > 0 else None,
-                    show_global_line=args.density_global_line,
-                )
+                    # If not fixed, recompute each species to use global xmax so x-axes match
+                    if args.k2p_xmax is None and global_k2p_xmax > 0:
+                        for sp in args.species:
+                            with Timer(f"[{sp}] compute_species_k2p_stack(recompute global xmax={global_k2p_xmax:.4g})", enabled=timing):
+                                k2p_cache[sp] = compute_species_k2p_stack(species_data[sp]["records"], k2p_xmax=global_k2p_xmax)
 
-            save_multipanel_page(
-                title="LTR-RT K2P density (shared axes; area partitioned by type)",
-                plotter=k2p_plotter,
-                xlabel="K2P",
-                ylabel="Density",
-                embed_legend=True,
-            )
+                with Timer("STACKED precompute: global chromosome x max", enabled=timing):
+                    global_chr_xmax = 0
+                    for sp in args.species:
+                        c2l = species_data[sp]["chrom2len"]
+                        if c2l:
+                            global_chr_xmax = max(global_chr_xmax, max(c2l.values()))
+                    tlog(f"Global chromosome max length (bp): {global_chr_xmax}", enabled=timing)
 
-            # Chromosome multipanel
-            dot_note = ("  |  dots: " + ", ".join(args.dot_type)) if args.dot_type else ""
-            def chr_plotter(ax, sp):
-                plot_chrom_panel(
-                    ax=ax,
-                    sp_label=sp,
-                    chrom2len=species_data[sp]["chrom2len"],
-                    records=species_data[sp]["records"],
-                    type_colors=type_colors,
-                    dot_types=args.dot_type,
-                    x_max=global_chr_xmax if global_chr_xmax > 0 else None,
-                )
+                # Size shared bins and y-max
+                bin_size = int(args.bin)
 
-            save_multipanel_page(
-                title=f"Chromosome distribution of LTR-RTs (shared x-axis){dot_note}",
-                plotter=chr_plotter,
-                xlabel="bp",
-                ylabel="Chromosomes",
-                embed_legend=True,
-            )
+                def global_bins_for_key(key):
+                    vmax = 0.0
+                    for sp in args.species:
+                        vals = []
+                        for r in species_data[sp]["records"]:
+                            v = r.get(key, None)
+                            if v is None or not np.isfinite(v) or v < 0:
+                                continue
+                            vals.append(float(v))
+                        if vals:
+                            vmax = max(vmax, float(np.nanmax(vals)))
+                    vmax = max(vmax, float(bin_size))
+                    return np.arange(0, vmax + bin_size, bin_size)
 
-            # Size pages
-            def make_size_page(key, bins, y_max, title, xlabel):
-                def size_plotter(ax, sp):
-                    plot_size_panel(
+                with Timer("STACKED precompute: global bins for size plots", enabled=timing):
+                    bins_full = global_bins_for_key("full_len")
+                    bins_ltr = global_bins_for_key("ltr_len")
+                    bins_int = global_bins_for_key("internal_len")
+
+                size_cache = {"full_len": {}, "ltr_len": {}, "internal_len": {}}
+                y_full = y_ltr = y_int = 0.0
+
+                def stacked_ymax(counts_by_type):
+                    if not counts_by_type:
+                        return 0.0
+                    mat = np.vstack(list(counts_by_type.values()))
+                    return float(np.sum(mat, axis=0).max()) if mat.size else 0.0
+
+                with Timer("STACKED precompute: hist counts per species + y-max", enabled=timing):
+                    for sp in args.species:
+                        recs = species_data[sp]["records"]
+
+                        with Timer(f"[{sp}] hist full_len", enabled=timing):
+                            cb = compute_hist_counts(compute_size_by_type(recs, "full_len"), bins_full)
+                        size_cache["full_len"][sp] = cb
+                        y_full = max(y_full, stacked_ymax(cb))
+
+                        with Timer(f"[{sp}] hist ltr_len", enabled=timing):
+                            cb = compute_hist_counts(compute_size_by_type(recs, "ltr_len"), bins_ltr)
+                        size_cache["ltr_len"][sp] = cb
+                        y_ltr = max(y_ltr, stacked_ymax(cb))
+
+                        with Timer(f"[{sp}] hist internal_len", enabled=timing):
+                            cb = compute_hist_counts(compute_size_by_type(recs, "internal_len"), bins_int)
+                        size_cache["internal_len"][sp] = cb
+                        y_int = max(y_int, stacked_ymax(cb))
+
+                # ---------- Page builder: multi-panel ----------
+                def save_multipanel_page(title, plotter, xlabel=None, ylabel=None, embed_legend=True):
+                    with Timer(f"Render+save multipanel page: {title}", enabled=timing):
+                        r, c = panel_grid(len(args.species))
+                        fig, axes = plt.subplots(r, c, figsize=(11, 8.5), squeeze=False)
+                        axes_flat = axes.ravel()
+
+                        for i, sp in enumerate(args.species):
+                            ax = axes_flat[i]
+                            plotter(ax, sp)
+
+                            if ylabel is not None:
+                                if i % c == 0:
+                                    ax.set_ylabel(ylabel, fontsize=9)
+                                else:
+                                    ax.set_ylabel("")
+                            if xlabel is not None:
+                                if i >= (r - 1) * c:
+                                    ax.set_xlabel(xlabel, fontsize=9)
+                                else:
+                                    ax.set_xlabel("")
+
+                        for j in range(len(args.species), len(axes_flat)):
+                            axes_flat[j].set_axis_off()
+
+                        fig.suptitle(title, fontsize=12)
+
+                        if embed_legend and (not args.legend_page):
+                            add_embedded_legend(fig, type_colors, ncol=args.embedded_legend_cols, fontsize=7)
+                            fig.tight_layout(rect=[0, 0, 0.72, 0.96])
+                        else:
+                            fig.tight_layout(rect=[0, 0, 1, 0.96])
+
+                        pdf.savefig(fig)
+                        plt.close(fig)
+
+                # K2P multipanel
+                def k2p_plotter(ax, sp):
+                    plot_k2p_panel(
                         ax=ax,
                         sp_label=sp,
-                        counts_by_type=size_cache[key][sp],
-                        bins=bins,
+                        k2p_data=k2p_cache[sp],
                         type_colors=type_colors,
-                        y_max=y_max * 1.05 if y_max > 0 else None,
+                        y_max=global_k2p_ymax * 1.02 if global_k2p_ymax > 0 else None,
+                        show_global_line=args.density_global_line,
                     )
+
                 save_multipanel_page(
-                    title=title,
-                    plotter=size_plotter,
-                    xlabel=xlabel,
-                    ylabel="Count",
+                    title="LTR-RT K2P density (shared axes; area partitioned by type)",
+                    plotter=k2p_plotter,
+                    xlabel="K2P",
+                    ylabel="Density",
                     embed_legend=True,
                 )
 
-            make_size_page("full_len", bins_full, y_full, f"Full-length LTR-RT size distribution (bin={bin_size} bp; shared axes)", "Full length (bp)")
-            make_size_page("ltr_len", bins_ltr, y_ltr, f"LTR size distribution (bin={bin_size} bp; shared axes)", "LTR length (bp)")
-            make_size_page("internal_len", bins_int, y_int, f"Internal size distribution (bin={bin_size} bp; shared axes)", "Internal length (bp)")
-
-        else:
-            # Non-stacked: 5 pages/species
-            for sp in args.species:
-                chrom2len = species_data[sp]["chrom2len"]
-                records = species_data[sp]["records"]
-
-                # 1) K2P density
-                kdat = compute_species_k2p_stack(records, k2p_xmax=args.k2p_xmax)
-                fig, ax = plt.subplots(figsize=(11, 6))
-                plot_k2p_panel(
-                    ax=ax,
-                    sp_label=f"{sp}: LTR-RT K2P density",
-                    k2p_data=kdat,
-                    type_colors=type_colors,
-                    y_max=None,
-                    show_global_line=args.density_global_line,
-                )
-                ax.set_xlabel("K2P divergence")
-                ax.set_ylabel("Density")
-                maybe_embed_legend(fig)
-                if not args.legend_page:
-                    fig.tight_layout(rect=[0, 0, 0.72, 1])
-                else:
-                    fig.tight_layout()
-                pdf.savefig(fig)
-                plt.close(fig)
-
-                # 2) Chromosome distribution
-                fig_h = max(6, 0.35 * max(1, len(chrom2len)))
-                fig, ax = plt.subplots(figsize=(11, fig_h))
-                dot_note = (" | dots: " + ", ".join(args.dot_type)) if args.dot_type else ""
-                plot_chrom_panel(
-                    ax=ax,
-                    sp_label=f"{sp}: Chromosome distribution{dot_note}",
-                    chrom2len=chrom2len,
-                    records=records,
-                    type_colors=type_colors,
-                    dot_types=args.dot_type,
-                    x_max=None,
-                )
-                ax.set_xlabel("Position (bp)")
-                maybe_embed_legend(fig)
-                if not args.legend_page:
-                    fig.tight_layout(rect=[0, 0, 0.72, 1])
-                else:
-                    fig.tight_layout()
-                pdf.savefig(fig)
-                plt.close(fig)
-
-                # 3/4/5) Size distributions
-                for key, title, xlabel in [
-                    ("full_len", "Full-length LTR-RT size distribution", "Full length (bp)"),
-                    ("ltr_len", "LTR size distribution", "LTR length (bp)"),
-                    ("internal_len", "Internal size distribution", "Internal length (bp)"),
-                ]:
-                    vb = compute_size_by_type(records, key)
-                    # per-species bins in non-stacked mode
-                    all_vals = []
-                    for vals in vb.values():
-                        all_vals.extend([v for v in vals if np.isfinite(v) and v >= 0])
-                    vmax = max(all_vals) if all_vals else float(args.bin)
-                    bins = np.arange(0, max(vmax, float(args.bin)) + args.bin, args.bin)
-                    counts_by_type = compute_hist_counts(vb, bins)
-
-                    fig, ax = plt.subplots(figsize=(11, 6))
-                    plot_size_panel(
+                # Chromosome multipanel
+                dot_note = ("  |  dots: " + ", ".join(args.dot_type)) if args.dot_type else ""
+                def chr_plotter(ax, sp):
+                    plot_chrom_panel(
                         ax=ax,
-                        sp_label=f"{sp}: {title} (bin={args.bin} bp)",
-                        counts_by_type=counts_by_type,
-                        bins=bins,
+                        sp_label=sp,
+                        chrom2len=species_data[sp]["chrom2len"],
+                        records=species_data[sp]["records"],
                         type_colors=type_colors,
-                        y_max=None,
+                        dot_types=args.dot_type,
+                        x_max=global_chr_xmax if global_chr_xmax > 0 else None,
                     )
-                    ax.set_xlabel(xlabel)
-                    ax.set_ylabel("Count")
-                    maybe_embed_legend(fig)
-                    if not args.legend_page:
-                        fig.tight_layout(rect=[0, 0, 0.72, 1])
-                    else:
-                        fig.tight_layout()
-                    pdf.savefig(fig)
-                    plt.close(fig)
+
+                save_multipanel_page(
+                    title=f"Chromosome distribution of LTR-RTs (shared x-axis){dot_note}",
+                    plotter=chr_plotter,
+                    xlabel="bp",
+                    ylabel="Chromosomes",
+                    embed_legend=True,
+                )
+
+                # Density-style chromosome distribution (one page per species; faceted by chromosome)
+                for sp in args.species:
+                    plot_chrom_density_facets(
+                        pdf=pdf,
+                        sp=sp,
+                        chrom2len=species_data[sp]["chrom2len"],
+                        records=species_data[sp]["records"],
+                        type_colors=type_colors,
+                        window_bp=args.dens_window,
+                        step_bp=args.dens_step,
+                        threshold_percent=args.dens_threshold,
+                        top_n=args.dens_top_types,
+                        legend_page=args.legend_page,
+                        embedded_legend_cols=args.embedded_legend_cols,
+                        timing=timing,
+                    )
+
+                # Size pages
+                def make_size_page(key, bins, y_max, title, xlabel):
+                    def size_plotter(ax, sp):
+                        plot_size_panel(
+                            ax=ax,
+                            sp_label=sp,
+                            counts_by_type=size_cache[key][sp],
+                            bins=bins,
+                            type_colors=type_colors,
+                            y_max=y_max * 1.05 if y_max > 0 else None,
+                        )
+                    save_multipanel_page(
+                        title=title,
+                        plotter=size_plotter,
+                        xlabel=xlabel,
+                        ylabel="Count",
+                        embed_legend=True,
+                    )
+
+                make_size_page("full_len", bins_full, y_full, f"Full-length LTR-RT size distribution (bin={bin_size} bp; shared axes)", "Full length (bp)")
+                make_size_page("ltr_len", bins_ltr, y_ltr, f"LTR size distribution (bin={bin_size} bp; shared axes)", "LTR length (bp)")
+                make_size_page("internal_len", bins_int, y_int, f"Internal size distribution (bin={bin_size} bp; shared axes)", "Internal length (bp)")
+
+            else:
+                # Non-stacked: 5 pages/species
+                for sp in args.species:
+                    chrom2len = species_data[sp]["chrom2len"]
+                    records = species_data[sp]["records"]
+
+                    # 1) K2P density
+                    with Timer(f"[{sp}] page: K2P density compute+render+save", enabled=timing):
+                        with Timer(f"[{sp}] compute_species_k2p_stack", enabled=timing):
+                            kdat = compute_species_k2p_stack(records, k2p_xmax=args.k2p_xmax)
+
+                        fig, ax = plt.subplots(figsize=(11, 6))
+                        plot_k2p_panel(
+                            ax=ax,
+                            sp_label=f"{sp}: LTR-RT K2P density",
+                            k2p_data=kdat,
+                            type_colors=type_colors,
+                            y_max=None,
+                            show_global_line=args.density_global_line,
+                        )
+                        ax.set_xlabel("K2P divergence")
+                        ax.set_ylabel("Density")
+                        maybe_embed_legend(fig)
+                        if not args.legend_page:
+                            fig.tight_layout(rect=[0, 0, 0.72, 1])
+                        else:
+                            fig.tight_layout()
+                        pdf.savefig(fig)
+                        plt.close(fig)
+
+                    # 2) Chromosome distribution
+                    with Timer(f"[{sp}] page: Chromosome distribution render+save", enabled=timing):
+                        fig_h = max(6, 0.35 * max(1, len(chrom2len)))
+                        fig, ax = plt.subplots(figsize=(11, fig_h))
+                        dot_note = (" | dots: " + ", ".join(args.dot_type)) if args.dot_type else ""
+                        plot_chrom_panel(
+                            ax=ax,
+                            sp_label=f"{sp}: Chromosome distribution{dot_note}",
+                            chrom2len=chrom2len,
+                            records=records,
+                            type_colors=type_colors,
+                            dot_types=args.dot_type,
+                            x_max=None,
+                            merge_gap_bp=args.chr_merge_gap,
+                            rasterize=args.chr_rasterize,
+                        )
+
+                        ax.set_xlabel("Position (bp)")
+                        maybe_embed_legend(fig)
+                        if not args.legend_page:
+                            fig.tight_layout(rect=[0, 0, 0.72, 1])
+                        else:
+                            fig.tight_layout()
+                        pdf.savefig(fig)
+                        plt.close(fig)
+
+                    # 2b) Chromosome distribution (density-style; faceted)
+                    plot_chrom_density_facets(
+                        pdf=pdf,
+                        sp=sp,
+                        chrom2len=chrom2len,
+                        records=records,
+                        type_colors=type_colors,
+                        window_bp=args.dens_window,
+                        step_bp=args.dens_step,
+                        threshold_percent=args.dens_threshold,
+                        top_n=args.dens_top_types,
+                        legend_page=args.legend_page,
+                        embedded_legend_cols=args.embedded_legend_cols,
+                        timing=timing,
+                    )
+
+                    # 3/4/5) Size distributions
+                    for key, title, xlabel in [
+                        ("full_len", "Full-length LTR-RT size distribution", "Full length (bp)"),
+                        ("ltr_len", "LTR size distribution", "LTR length (bp)"),
+                        ("internal_len", "Internal size distribution", "Internal length (bp)"),
+                    ]:
+                        with Timer(f"[{sp}] page: {key} size dist compute+render+save", enabled=timing):
+                            with Timer(f"[{sp}] compute_size_by_type({key})", enabled=timing):
+                                vb = compute_size_by_type(records, key)
+
+                            # per-species bins in non-stacked mode
+                            with Timer(f"[{sp}] bins + hist({key})", enabled=timing):
+                                all_vals = []
+                                for vals in vb.values():
+                                    all_vals.extend([v for v in vals if np.isfinite(v) and v >= 0])
+                                vmax = max(all_vals) if all_vals else float(args.bin)
+                                bins = np.arange(0, max(vmax, float(args.bin)) + args.bin, args.bin)
+                                counts_by_type = compute_hist_counts(vb, bins)
+
+                            fig, ax = plt.subplots(figsize=(11, 6))
+                            plot_size_panel(
+                                ax=ax,
+                                sp_label=f"{sp}: {title} (bin={args.bin} bp)",
+                                counts_by_type=counts_by_type,
+                                bins=bins,
+                                type_colors=type_colors,
+                                y_max=None,
+                            )
+                            ax.set_xlabel(xlabel)
+                            ax.set_ylabel("Count")
+                            maybe_embed_legend(fig)
+                            if not args.legend_page:
+                                fig.tight_layout(rect=[0, 0, 0.72, 1])
+                            else:
+                                fig.tight_layout()
+                            pdf.savefig(fig)
+                            plt.close(fig)
 
     print(f"Wrote: {args.outpdf}")
 

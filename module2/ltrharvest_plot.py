@@ -388,6 +388,7 @@ def style_minimal_axes(ax):
 
 def plot_chrom_density_facets(
     pdf, sp, chrom2len, records, type_colors,
+    type_counts=None,
     window_bp=1_000_000, step_bp=500_000,
     threshold_percent=None, top_n=14,
     legend_page=False, embedded_legend_cols=2,
@@ -476,7 +477,8 @@ def plot_chrom_density_facets(
 
         # legend handling matches your existing philosophy
         if not legend_page:
-            add_embedded_legend(fig, {t: type_colors[t] for t in kept_types if t in type_colors}, ncol=embedded_legend_cols, fontsize=7)
+            add_embedded_legend(fig, type_colors, type_counts=type_counts, subset_types=kept_types, ncol=embedded_legend_cols, fontsize=7)
+
             fig.tight_layout(rect=[0, 0, 0.72, 0.96])
         else:
             fig.tight_layout(rect=[0, 0, 1, 0.96])
@@ -616,14 +618,31 @@ def make_type_colors(all_types):
     return colors
 
 
-def build_legend_handles(type_colors):
-    types_sorted = sorted(type_colors.keys())
+def build_legend_handles(type_colors, type_counts=None, subset_types=None):
+    """
+    Build legend handles sorted by type counts (desc), then name.
+    If subset_types is provided, only include those types (still sorted by counts).
+    """
+    types = list(type_colors.keys())
+    if subset_types is not None:
+        subset = set(subset_types)
+        types = [t for t in types if t in subset]
+
+    if type_counts is None:
+        # fallback: alphabetical
+        types_sorted = sorted(types)
+    else:
+        types_sorted = sorted(
+            types,
+            key=lambda t: (-int(type_counts.get(t, 0)), t)
+        )
+
     return [Patch(facecolor=type_colors[t], edgecolor="none", label=t, alpha=0.85) for t in types_sorted]
 
 
-def make_legend_page(pdf, type_colors, ncol=2, title="TE type color legend"):
+def make_legend_page(pdf, type_colors, type_counts=None, ncol=2, title="TE type color legend"):
     """Legend-only page."""
-    handles = build_legend_handles(type_colors)
+    handles = build_legend_handles(type_colors, type_counts=type_counts)
     n = len(handles)
     rows = max(1, math.ceil(n / ncol))
     fig_h = min(20, max(6, rows * 0.3))
@@ -636,13 +655,12 @@ def make_legend_page(pdf, type_colors, ncol=2, title="TE type color legend"):
     plt.close(fig)
 
 
-def add_embedded_legend(fig, type_colors, ncol=2, fontsize=7):
+def add_embedded_legend(fig, type_colors, type_counts=None, subset_types=None, ncol=2, fontsize=7):
     """
     Add an embedded legend into the figure without overlapping axes by reserving a right-side margin.
     This works for both single-plot pages and multi-panel pages.
     """
-    handles = build_legend_handles(type_colors)
-    # Reserve space on right for legend
+    handles = build_legend_handles(type_colors, type_counts=type_counts, subset_types=subset_types)
     fig.subplots_adjust(right=0.72)
     fig.legend(
         handles=handles,
@@ -689,6 +707,56 @@ def gaussian_kde_numpy(x, grid, bandwidth):
     dens = np.exp(-0.5 * diffs**2).sum(axis=1) / (n * h * np.sqrt(2 * np.pi))
     return dens
 
+def compute_species_k2p_hist_stack(records, k2p_xmax, bin_width=0.0005):
+    """
+    Returns (bin_edges, dens_weighted_by_type, dens_global_step)
+    where densities are histogram densities (count / (n_total * bin_width)),
+    so stacked sum equals global histogram density.
+    """
+    per_type = defaultdict(list)
+    all_vals = []
+
+    for r in records:
+        k = r.get("k2p", None)
+        if k is None or (not np.isfinite(k)) or k < 0:
+            continue
+        per_type[r["type"]].append(float(k))
+        all_vals.append(float(k))
+
+    if not all_vals:
+        return None
+
+    all_vals = np.asarray(all_vals, dtype=float)
+    if k2p_xmax is None:
+        data_max = float(np.nanmax(all_vals)) if np.isfinite(np.nanmax(all_vals)) else 0.1
+        pad = 0.05 * data_max if data_max > 0 else 0.01
+        xmax = max(data_max + pad, 0.05)
+    else:
+        xmax = float(k2p_xmax)
+
+    bw = float(bin_width)
+    if not np.isfinite(bw) or bw <= 0:
+        bw = 0.0005
+
+    # bin edges [0, xmax] inclusive-ish
+    nb = int(math.ceil(xmax / bw))
+    edges = np.linspace(0.0, nb * bw, nb + 1)
+
+    n_total = float(len(all_vals))
+    dens_by_type = {}
+    total_counts = np.zeros(nb, dtype=float)
+
+    for t, vals in per_type.items():
+        vv = np.asarray(vals, dtype=float)
+        vv = vv[np.isfinite(vv) & (vv >= 0) & (vv <= edges[-1])]
+        if vv.size == 0:
+            continue
+        counts, _ = np.histogram(vv, bins=edges)
+        total_counts += counts
+        dens_by_type[t] = counts.astype(float) / (n_total * bw)
+
+    dens_global = total_counts / (n_total * bw)
+    return edges, dens_by_type, dens_global
 
 # -----------------------------
 # Computation for plots
@@ -763,7 +831,8 @@ def compute_hist_counts(values_by_type, bins):
 # -----------------------------
 # Plotting (no legends here; legend handled by caller)
 # -----------------------------
-def plot_k2p_panel(ax, sp_label, k2p_data, type_colors, y_max=None, show_global_line=False):
+def plot_k2p_panel(ax, sp_label, k2p_data, type_colors, y_max=None,
+                   show_global_line=False, k2p_mode="kde", type_counts=None):
     ax.set_title(sp_label, fontsize=10)
 
     if k2p_data is None:
@@ -771,31 +840,86 @@ def plot_k2p_panel(ax, sp_label, k2p_data, type_colors, y_max=None, show_global_
         ax.set_axis_off()
         return
 
-    xgrid, dens_global, dens_weighted = k2p_data
-    types_order = sorted(
-        dens_weighted.keys(),
-        key=lambda t: float(np.trapz(dens_weighted[t], xgrid)),
-        reverse=True,
-    )
+    if k2p_mode == "kde":
+        xgrid, dens_global, dens_weighted = k2p_data
 
-    base = np.zeros_like(xgrid)
-    for t in types_order:
-        d = dens_weighted[t]
-        ax.fill_between(xgrid, base, base + d, color=type_colors[t], alpha=0.65, linewidth=0.0)
-        base = base + d
+        # order by counts (preferred), else by area
+        if type_counts is not None:
+            types_order = sorted(dens_weighted.keys(), key=lambda t: (-int(type_counts.get(t, 0)), t))
+        else:
+            types_order = sorted(
+                dens_weighted.keys(),
+                key=lambda t: float(np.trapz(dens_weighted[t], xgrid)),
+                reverse=True,
+            )
 
-    if show_global_line:
-        ax.plot(xgrid, dens_global, linewidth=1.0)
+        base = np.zeros_like(xgrid)
+        for t in types_order:
+            d = dens_weighted[t]
+            ax.fill_between(xgrid, base, base + d, color=type_colors[t], alpha=0.65, linewidth=0.0)
+            base = base + d
 
-    ax.set_xlim(float(xgrid[0]), float(xgrid[-1]))
+        if show_global_line:
+            ax.plot(xgrid, dens_global, linewidth=1.0)
+
+        ax.set_xlim(float(xgrid[0]), float(xgrid[-1]))
+
+    else:
+        # hist mode
+        edges, dens_by_type, dens_global = k2p_data
+        bw = float(edges[1] - edges[0]) if len(edges) > 1 else 0.0005
+        x = edges[:-1]
+
+        if type_counts is not None:
+            types_order = sorted(dens_by_type.keys(), key=lambda t: (-int(type_counts.get(t, 0)), t))
+        else:
+            types_order = sorted(dens_by_type.keys(), key=lambda t: float(np.sum(dens_by_type[t])), reverse=True)
+
+        bottom = np.zeros_like(x, dtype=float)
+        for t in types_order:
+            h = dens_by_type[t]
+            ax.bar(
+                x,
+                h,
+                width=bw,
+                bottom=bottom,
+                align="edge",
+                alpha=0.65,
+                edgecolor="none",
+                color=type_colors[t],
+            )
+            bottom += h
+
+        if show_global_line:
+            # step line along bin edges
+            ax.step(edges[:-1], dens_global, where="post", linewidth=1.0)
+
+        ax.set_xlim(float(edges[0]), float(edges[-1]))
+
     if y_max is not None and np.isfinite(y_max) and y_max > 0:
         ax.set_ylim(0, y_max)
 
     ax.grid(True, alpha=0.2)
     ax.tick_params(labelsize=8)
+    
+def filter_records_by_k2p_range(records, k2p_min, k2p_max, inclusive_max=False):
+    """
+    Keep only records with finite k2p in [k2p_min, k2p_max) by default.
+    If inclusive_max=True, use [k2p_min, k2p_max].
+    """
+    out = []
+    for r in records:
+        k = r.get("k2p", None)
+        if k is None or (not np.isfinite(k)) or k < 0:
+            continue
+        if inclusive_max:
+            if (k >= k2p_min) and (k <= k2p_max):
+                out.append(r)
+        else:
+            if (k >= k2p_min) and (k < k2p_max):
+                out.append(r)
+    return out
 
-
-from collections import defaultdict
 
 def merge_ranges(xranges, gap=0):
     """Merge sorted (start, width) into non-overlapping (start, width)."""
@@ -983,6 +1107,19 @@ def main():
         help="Stack like plots onto single pages for easy cross-species comparison (shared axes).",
     )
     ap.add_argument(
+        "--k2p-mode",
+        choices=["kde", "hist"],
+        default="kde",
+        help="K2P plot mode: 'kde' (default) or 'hist' (stacked binned bars).",
+    )
+    ap.add_argument(
+        "--k2p-bin-width",
+        type=float,
+        default=0.0005,
+        help="Bin width for --k2p-mode hist (default: 0.0005).",
+    )
+
+    ap.add_argument(
         "--legend-page",
         action="store_true",
         help="Add a legend-only page and omit legends from all plots.",
@@ -1016,6 +1153,8 @@ def main():
         # Load species and build global TE type set for consistent colors
         species_data = {}
         all_types = set()
+        global_type_counts = defaultdict(int)
+
         for sp in args.species:
             fai = f"{sp}{args.fai_suffix}"
             aln = f"{sp}{args.aln_suffix}"
@@ -1029,6 +1168,7 @@ def main():
             with Timer(f"[{sp}] collect types + store species_data", enabled=timing):
                 for r in records:
                     all_types.add(r["type"])
+                    global_type_counts[r["type"]] += 1
                 species_data[sp] = {"chrom2len": chrom2len, "records": records}
 
             tlog(f"[{sp}] parsed records: {len(species_data[sp]['records'])}", enabled=timing)
@@ -1043,12 +1183,19 @@ def main():
             # Legend-only page
             if args.legend_page:
                 with Timer("Write legend-only page", enabled=timing):
-                    make_legend_page(pdf, type_colors, ncol=args.legend_cols)
+                    make_legend_page(pdf, type_colors, type_counts=global_type_counts, ncol=args.legend_cols)
+
 
             # Helper: embed legend unless legend-page mode
             def maybe_embed_legend(fig):
                 if not args.legend_page:
-                    add_embedded_legend(fig, type_colors, ncol=args.embedded_legend_cols, fontsize=7)
+                    add_embedded_legend(
+                        fig,
+                        type_colors,
+                        type_counts=global_type_counts,
+                        ncol=args.embedded_legend_cols,
+                        fontsize=7
+                    )
 
             if args.stacked:
                 # ---------- Precompute shared axes limits ----------
@@ -1056,21 +1203,40 @@ def main():
                     k2p_cache = {}
                     global_k2p_xmax = 0.0
                     global_k2p_ymax = 0.0
+
                     for sp in args.species:
-                        with Timer(f"[{sp}] compute_species_k2p_stack(initial)", enabled=timing):
-                            kdat = compute_species_k2p_stack(species_data[sp]["records"], k2p_xmax=args.k2p_xmax)
-                        k2p_cache[sp] = kdat
-                        if kdat is None:
-                            continue
-                        xgrid, dens_global, _ = kdat
-                        global_k2p_xmax = max(global_k2p_xmax, float(xgrid[-1]))
-                        global_k2p_ymax = max(global_k2p_ymax, float(np.nanmax(dens_global)))
+                        recs = species_data[sp]["records"]
+                        if args.k2p_mode == "kde":
+                            kdat = compute_species_k2p_stack(recs, k2p_xmax=args.k2p_xmax)
+                            k2p_cache[sp] = kdat
+                            if kdat is None:
+                                continue
+                            xgrid, dens_global, _ = kdat
+                            global_k2p_xmax = max(global_k2p_xmax, float(xgrid[-1]))
+                            global_k2p_ymax = max(global_k2p_ymax, float(np.nanmax(dens_global)))
+                        else:
+                            kdat = compute_species_k2p_hist_stack(recs, k2p_xmax=args.k2p_xmax, bin_width=args.k2p_bin_width)
+                            k2p_cache[sp] = kdat
+                            if kdat is None:
+                                continue
+                            edges, _, dens_global = kdat
+                            global_k2p_xmax = max(global_k2p_xmax, float(edges[-1]))
+                            global_k2p_ymax = max(global_k2p_ymax, float(np.nanmax(dens_global)))
 
                     # If not fixed, recompute each species to use global xmax so x-axes match
-                    if args.k2p_xmax is None and global_k2p_xmax > 0:
-                        for sp in args.species:
-                            with Timer(f"[{sp}] compute_species_k2p_stack(recompute global xmax={global_k2p_xmax:.4g})", enabled=timing):
-                                k2p_cache[sp] = compute_species_k2p_stack(species_data[sp]["records"], k2p_xmax=global_k2p_xmax)
+
+                    if args.k2p_mode == "kde":
+                        if args.k2p_xmax is None and global_k2p_xmax > 0:
+                            for sp in args.species:
+                                with Timer(
+                                    f"[{sp}] compute_species_k2p_stack(recompute global xmax={global_k2p_xmax:.4g})",
+                                    enabled=timing
+                                ):
+                                    k2p_cache[sp] = compute_species_k2p_stack(
+                                        species_data[sp]["records"],
+                                        k2p_xmax=global_k2p_xmax
+                                    )
+
 
                 with Timer("STACKED precompute: global chromosome x max", enabled=timing):
                     global_chr_xmax = 0
@@ -1158,7 +1324,8 @@ def main():
                         fig.suptitle(title, fontsize=12)
 
                         if embed_legend and (not args.legend_page):
-                            add_embedded_legend(fig, type_colors, ncol=args.embedded_legend_cols, fontsize=7)
+                            add_embedded_legend(fig, type_colors, type_counts=type_counts, ncol=args.embedded_legend_cols, fontsize=7)
+
                             fig.tight_layout(rect=[0, 0, 0.72, 0.96])
                         else:
                             fig.tight_layout(rect=[0, 0, 1, 0.96])
@@ -1175,10 +1342,16 @@ def main():
                         type_colors=type_colors,
                         y_max=global_k2p_ymax * 1.02 if global_k2p_ymax > 0 else None,
                         show_global_line=args.density_global_line,
+                        k2p_mode=args.k2p_mode,
+                        type_counts=global_type_counts,
                     )
 
+
+
+                mode_note = "KDE" if args.k2p_mode == "kde" else f"hist (bin={args.k2p_bin_width:g})"
                 save_multipanel_page(
-                    title="LTR-RT K2P density (shared axes; area partitioned by type)",
+                    title=f"LTR-RT K2P density ({mode_note}; shared axes; area partitioned by type)",
+
                     plotter=k2p_plotter,
                     xlabel="K2P",
                     ylabel="Density",
@@ -1206,6 +1379,37 @@ def main():
                     embed_legend=True,
                 )
 
+                # Extra chromosome multipanel page: only records in first K2P hist bin
+                if args.k2p_mode == "hist":
+                    k2p_lo = 0.0
+                    k2p_hi = float(args.k2p_bin_width)
+                    dot_note2 = ("  |  dots: " + ", ".join(args.dot_type)) if args.dot_type else ""
+
+                    def chr_plotter_k2p0(ax, sp):
+                        recs0 = filter_records_by_k2p_range(
+                            species_data[sp]["records"], k2p_lo, k2p_hi, inclusive_max=False
+                        )
+                        plot_chrom_panel(
+                            ax=ax,
+                            sp_label=sp,
+                            chrom2len=species_data[sp]["chrom2len"],
+                            records=recs0,
+                            type_colors=type_colors,
+                            dot_types=args.dot_type,
+                            x_max=global_chr_xmax if global_chr_xmax > 0 else None,
+                            merge_gap_bp=args.chr_merge_gap,
+                            rasterize=args.chr_rasterize,
+                        )
+
+                    save_multipanel_page(
+                        title=f"Chromosome distribution (K2P in [{k2p_lo:.4f},{k2p_hi:.4f})) (shared x-axis){dot_note2}",
+                        plotter=chr_plotter_k2p0,
+                        xlabel="bp",
+                        ylabel="Chromosomes",
+                        embed_legend=True,
+                    )
+
+
                 # Density-style chromosome distribution (one page per species; faceted by chromosome)
                 for sp in args.species:
                     plot_chrom_density_facets(
@@ -1214,6 +1418,7 @@ def main():
                         chrom2len=species_data[sp]["chrom2len"],
                         records=species_data[sp]["records"],
                         type_colors=type_colors,
+                        type_counts=global_type_counts,
                         window_bp=args.dens_window,
                         step_bp=args.dens_step,
                         threshold_percent=args.dens_threshold,
@@ -1266,9 +1471,14 @@ def main():
                     # 1) K2P density
                     with Timer(f"[{sp}] page: K2P density compute+render+save", enabled=timing):
                         with Timer(f"[{sp}] compute_species_k2p_stack", enabled=timing):
-                            kdat = compute_species_k2p_stack(records, k2p_xmax=args.k2p_xmax)
+                            if args.k2p_mode == "kde":
+                                kdat = compute_species_k2p_stack(records, k2p_xmax=args.k2p_xmax)
+                            else:
+                                kdat = compute_species_k2p_hist_stack(records, k2p_xmax=args.k2p_xmax, bin_width=args.k2p_bin_width)
+
 
                         fig, ax = plt.subplots(figsize=(11, 6))
+
                         plot_k2p_panel(
                             ax=ax,
                             sp_label=f"{sp}: LTR-RT K2P density",
@@ -1276,7 +1486,10 @@ def main():
                             type_colors=type_colors,
                             y_max=None,
                             show_global_line=args.density_global_line,
+                            k2p_mode=args.k2p_mode,
+                            type_counts=global_type_counts,
                         )
+                        
                         ax.set_xlabel("K2P divergence")
                         ax.set_ylabel("Density")
                         maybe_embed_legend(fig)
@@ -1324,6 +1537,7 @@ def main():
                         step_bp=args.dens_step,
                         threshold_percent=args.dens_threshold,
                         top_n=args.dens_top_types,
+                        type_counts=global_type_counts,
                         legend_page=args.legend_page,
                         embedded_legend_cols=args.embedded_legend_cols,
                         timing=timing,
@@ -1339,6 +1553,39 @@ def main():
                             legend_page=args.legend_page,
                             timing=timing,
                         )
+
+
+                    # 2a) Chromosome distribution for first K2P hist bin only (hist mode only)
+                    if args.k2p_mode == "hist":
+                        k2p_lo = 0.0
+                        k2p_hi = float(args.k2p_bin_width)
+
+                        records_k2p0 = filter_records_by_k2p_range(records, k2p_lo, k2p_hi, inclusive_max=False)
+
+                        with Timer(f"[{sp}] page: Chromosome distribution (K2P in [{k2p_lo:.4f},{k2p_hi:.4f}))", enabled=timing):
+                            fig_h = max(6, 0.35 * max(1, len(chrom2len)))
+                            fig, ax = plt.subplots(figsize=(11, fig_h))
+
+                            plot_chrom_panel(
+                                ax=ax,
+                                sp_label=f"{sp}: Chromosome distribution (K2P in [{k2p_lo:.4f},{k2p_hi:.4f}))",
+                                chrom2len=chrom2len,
+                                records=records_k2p0,
+                                type_colors=type_colors,
+                                dot_types=args.dot_type,
+                                x_max=None,
+                                merge_gap_bp=args.chr_merge_gap,
+                                rasterize=args.chr_rasterize,
+                            )
+
+                            ax.set_xlabel("Position (bp)")
+                            maybe_embed_legend(fig)
+                            if not args.legend_page:
+                                fig.tight_layout(rect=[0, 0, 0.72, 1])
+                            else:
+                                fig.tight_layout()
+                            pdf.savefig(fig)
+                            plt.close(fig)
 
 
                     # 3/4/5) Size distributions

@@ -249,6 +249,104 @@ def compute_chrom_density(records, chrom2len, window_bp=1_000_000, step_bp=500_0
 
     return dens, centers
 
+def compute_chrom_k2p_window_stats(records, chrom2len, window_bp=1_000_000, step_bp=500_000):
+    """
+    Sliding-window mean K2P per chromosome (all types pooled).
+
+    Each TE contributes its K2P to every window whose [start, end) contains the TE midpoint.
+    (This matches the idea of sliding windows with overlap without double-counting by bp.)
+
+    Returns:
+      mean_k2p[chrom] = np.array(mean per window; NaN where n==0)
+      err_k2p[chrom]  = np.array(95% CI half-width; NaN where n<2)
+      n_k2p[chrom]    = np.array(count per window)
+      centers_bp[chrom] = np.array(window centers in bp)
+    """
+    mean_k2p = {}
+    err_k2p = {}
+    n_k2p = {}
+    centers = {}
+
+    if window_bp <= 0 or step_bp <= 0:
+        return mean_k2p, err_k2p, n_k2p, centers
+
+    # index per chrom
+    by_chrom = defaultdict(list)
+    for r in records:
+        chrom = r["chrom"]
+        if "sca" in chrom.lower():
+            continue
+        if chrom not in chrom2len:
+            continue
+        k = r.get("k2p", None)
+        if k is None or (not np.isfinite(k)) or k < 0:
+            continue
+        start = max(0, int(r["start"]))
+        end = min(int(r["end"]), int(chrom2len[chrom]))
+        if end <= start:
+            continue
+        mid = 0.5 * (start + end)
+        by_chrom[chrom].append((mid, float(k)))
+
+    for chrom, L in chrom2len.items():
+        if chrom not in by_chrom:
+            continue
+
+        nwin = int(math.floor((max(L - 1, 0)) / step_bp)) + 1
+        w_starts = np.arange(0, nwin * step_bp, step_bp, dtype=np.int64)
+        w_ends = w_starts + window_bp
+        centers_bp = w_starts + window_bp / 2.0
+
+        s = np.zeros(nwin, dtype=np.float64)
+        ss = np.zeros(nwin, dtype=np.float64)
+        c = np.zeros(nwin, dtype=np.int64)
+
+        # For each midpoint, add to all windows where ws <= mid < we.
+        # Window i has ws = i*step, we = ws+window.
+        # Solve for i:
+        #   i*step <= mid < i*step + window
+        #   (mid - window) < i*step <= mid
+        # So:
+        #   i0 = floor((mid - window)/step) + 1  (smallest integer i satisfying i*step > mid-window)
+        #   i1 = floor(mid/step)
+        for mid, k in by_chrom[chrom]:
+            i1 = int(math.floor(mid / step_bp))
+            i0 = int(math.floor((mid - window_bp) / step_bp) + 1)
+            if i1 < 0 or i0 > (nwin - 1):
+                continue
+            i0 = max(i0, 0)
+            i1 = min(i1, nwin - 1)
+            if i1 < i0:
+                continue
+            # vectorized update on slice
+            s[i0:i1+1] += k
+            ss[i0:i1+1] += k * k
+            c[i0:i1+1] += 1
+
+        mean = np.full(nwin, np.nan, dtype=np.float64)
+        err = np.full(nwin, np.nan, dtype=np.float64)
+
+        ok = c > 0
+        mean[ok] = s[ok] / c[ok]
+
+        # sample SD only defined for n>=2; CI uses SE = sd/sqrt(n)
+        ok2 = c >= 2
+        # var = (sumsq - sum^2/n) / (n-1)
+        var = np.zeros(nwin, dtype=np.float64)
+        var[ok2] = (ss[ok2] - (s[ok2] ** 2) / c[ok2]) / (c[ok2] - 1)
+        var[var < 0] = 0.0
+        sd = np.sqrt(var)
+        se = np.zeros(nwin, dtype=np.float64)
+        se[ok2] = sd[ok2] / np.sqrt(c[ok2])
+        err[ok2] = 1.96 * se[ok2]  # 95% CI half-width
+
+        mean_k2p[chrom] = mean
+        err_k2p[chrom] = err
+        n_k2p[chrom] = c
+        centers[chrom] = centers_bp
+
+    return mean_k2p, err_k2p, n_k2p, centers
+
 
 def filter_density_types(dens_by_chrom, threshold_percent=None, top_n=14):
     """
@@ -383,6 +481,120 @@ def plot_chrom_density_facets(
         else:
             fig.tight_layout(rect=[0, 0, 1, 0.96])
 
+        pdf.savefig(fig)
+        plt.close(fig)
+
+def plot_chrom_k2p_mean_facets(
+    pdf, sp, chrom2len, records,
+    window_bp=1_000_000, step_bp=500_000,
+    legend_page=False,  # kept for API symmetry; no legend needed here
+    timing=False,
+):
+    """
+    One PDF page per species: facet grid of chromosomes;
+    plot windowed mean K2P with 95% CI error bars.
+    """
+    with Timer(f"[{sp}] compute_chrom_k2p_window_stats(window={window_bp}, step={step_bp})", enabled=timing):
+        mean_k2p, err_k2p, n_k2p, centers = compute_chrom_k2p_window_stats(
+            records, chrom2len, window_bp=window_bp, step_bp=step_bp
+        )
+
+    if not mean_k2p:
+        fig, ax = plt.subplots(figsize=(11, 6))
+        ax.text(0.5, 0.5, f"{sp}: No K2P window stats", ha="center", va="center")
+        ax.set_axis_off()
+        pdf.savefig(fig)
+        plt.close(fig)
+        return
+
+    chroms = [c for c in chrom2len.keys() if c in mean_k2p]
+    r, c = panel_grid(len(chroms))
+
+    with Timer(f"[{sp}] plot_chrom_k2p_mean_facets(render + save)", enabled=timing):
+        fig, axes = plt.subplots(r, c, figsize=(11, 8.5), squeeze=False)
+        axes_flat = axes.ravel()
+
+        # shared y-lims
+        y_min = np.inf
+        y_max = -np.inf
+        for chrom in chroms:
+            m = mean_k2p[chrom]
+            e = err_k2p[chrom]
+
+            ok = np.isfinite(m)
+            if np.any(ok):
+                y_min = min(y_min, float(np.nanmin(m[ok])))
+                y_max = max(y_max, float(np.nanmax(m[ok])))
+
+            ok2 = ok & np.isfinite(e)
+            if np.any(ok2):
+                y_min = min(y_min, float(np.nanmin(m[ok2] - e[ok2])))
+                y_max = max(y_max, float(np.nanmax(m[ok2] + e[ok2])))
+
+
+        if not np.isfinite(y_min) or not np.isfinite(y_max):
+            y_min, y_max = 0.0, 1.0
+        pad = 0.05 * (y_max - y_min) if (y_max > y_min) else 0.01
+        y_min = max(0.0, y_min - pad)
+        y_max = y_max + pad
+
+        for i, chrom in enumerate(chroms):
+            ax = axes_flat[i]
+            x_mb = centers[chrom] / 1e6
+            m = mean_k2p[chrom]
+            e = err_k2p[chrom]
+            n = n_k2p[chrom]
+
+            ok = np.isfinite(m)
+            if np.any(ok):
+                # only draw error bars where defined (n>=2)
+                ok_err = ok & np.isfinite(e)
+                if np.any(ok_err):
+                    ax.errorbar(
+                        x_mb[ok_err],
+                        m[ok_err],
+                        yerr=e[ok_err],
+                        fmt="o",
+                        markersize=2.5,
+                        linewidth=0.8,
+                        capsize=2,
+                    )
+                # also show mean-only points where n==1 (no CI)
+                ok_noerr = ok & (~np.isfinite(e))
+                if np.any(ok_noerr):
+                    ax.plot(x_mb[ok_noerr], m[ok_noerr], "o", markersize=2.0, alpha=0.7)
+
+            ax.set_title(chrom, fontsize=9)
+            ax.set_xlim(0, float(chrom2len[chrom]) / 1e6)
+            ax.set_ylim(y_min, y_max)
+            style_minimal_axes(ax)
+
+            # label only left/bottom panels
+            if i % c == 0:
+                ax.set_ylabel("Mean K2P", fontsize=9)
+            else:
+                ax.set_ylabel("")
+            if i >= (r - 1) * c:
+                ax.set_xlabel("Position (Mb)", fontsize=9)
+            else:
+                ax.set_xlabel("")
+
+            # tiny annotation: n summary (optional but helpful)
+            if n is not None and n.size:
+                nn = int(np.nanmax(n)) if np.any(n > 0) else 0
+                ax.text(0.98, 0.02, f"max n={nn}", transform=ax.transAxes,
+                        ha="right", va="bottom", fontsize=7, alpha=0.7)
+
+        for j in range(len(chroms), len(axes_flat)):
+            axes_flat[j].set_axis_off()
+
+        step_mb = step_bp / 1e6
+        win_mb = window_bp / 1e6
+        fig.suptitle(
+            f"{sp}: Windowed mean K2P (95% CI)  |  window={win_mb:g}Mb step={step_mb:g}Mb",
+            fontsize=12
+        )
+        fig.tight_layout(rect=[0, 0, 1, 0.96])
         pdf.savefig(fig)
         plt.close(fig)
 
@@ -1011,6 +1223,17 @@ def main():
                         timing=timing,
                     )
 
+                    plot_chrom_k2p_mean_facets(
+                            pdf=pdf,
+                            sp=sp,
+                            chrom2len=species_data[sp]["chrom2len"],
+                            records=species_data[sp]["records"],
+                            window_bp=args.dens_window,
+                            step_bp=args.dens_step,
+                            legend_page=args.legend_page,
+                            timing=timing,
+                        )
+
                 # Size pages
                 def make_size_page(key, bins, y_max, title, xlabel):
                     def size_plotter(ax, sp):
@@ -1105,6 +1328,18 @@ def main():
                         embedded_legend_cols=args.embedded_legend_cols,
                         timing=timing,
                     )
+
+                    plot_chrom_k2p_mean_facets(
+                            pdf=pdf,
+                            sp=sp,
+                            chrom2len=species_data[sp]["chrom2len"],
+                            records=species_data[sp]["records"],
+                            window_bp=args.dens_window,
+                            step_bp=args.dens_step,
+                            legend_page=args.legend_page,
+                            timing=timing,
+                        )
+
 
                     # 3/4/5) Size distributions
                     for key, title, xlabel in [

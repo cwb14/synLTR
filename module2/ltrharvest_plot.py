@@ -7,10 +7,11 @@ Takes genome FAI and the dedup results of the FAI to plot LTR-RT annotation feat
 (4) internal size dist.
 (5) Chrom locations.
 
-python3 ltrharvest_plot.py --k2p-xmax 0.2 --bin 200 --legend-page --stacked
-python3 ltrharvest_plot.py --k2p-xmax 0.2 --bin 200 --legend-page
-# Large genomes need --chr-rasterize.
-python ltrharvest_plot.py --species B73 --aln-suffix _kmer2ltr_dedup --outpdf B73_ltr3.pdf --bin 100 --k2p-xmax 0.1 --legend-page --timing --chr-rasterize --chr-merge-gap 50
+# Plot.
+python ltrharvest_plot.py --species Slati --aln-suffix _ltr_kmer2ltr_dedup --outpdf Slati_ltr.pdf --bin 100 --k2p-xmax 0.1 --legend-page --timing --k2p-mode hist
+# Cluster, and and plot family-level. 
+mmseqs easy-cluster Slati_ltr.ltrharvest.full_length.dedup.fa.rexdb-plant.cls.lib.fa ltr_808080 tmp_mmseqs --min-seq-id 0.8 -c 0.8 --cov-mode 5 --cluster-reassign 1 --threads 32 --seq-id-mode 1
+python ltrharvest_plot.py --species Slati --aln-suffix _ltr_kmer2ltr_dedup --outpdf Slati_ltr.pdf --bin 100 --k2p-xmax 0.1 --legend-page --timing --k2p-mode hist --mmseqs-tsv Slati_ltr_808080_cluster.tsv
 
 LTR-RT multi-page PDF plots across species.
 
@@ -168,9 +169,12 @@ def parse_alignment_file(path):
                 k2p = float(parts[10])  # column11
             except ValueError:
                 k2p = None
-
+            
+            rec_id = parts[0]
+            
             records.append(
                 {
+                    "id": rec_id,
                     "chrom": chrom,
                     "start": start,
                     "end": end,
@@ -248,6 +252,44 @@ def compute_chrom_density(records, chrom2len, window_bp=1_000_000, step_bp=500_0
         centers[chrom] = centers_bp
 
     return dens, centers
+
+def read_mmseqs_easycluster_tsv(tsv_path):
+    """
+    Returns:
+      rep2members: dict(rep -> set(members))
+      member2rep: dict(member -> rep)
+    File format: rep<TAB>member
+    """
+    rep2members = defaultdict(set)
+    member2rep = {}
+
+    with open(tsv_path, "r") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split()
+            if len(parts) < 2:
+                continue
+            rep, mem = parts[0], parts[1]
+            rep2members[rep].add(mem)
+            # if a member appears in multiple clusters, keep the first rep we saw
+            if mem not in member2rep:
+                member2rep[mem] = rep
+
+    # ensure reps themselves are members if present in file (mmseqs usually has rep->rep)
+    for rep in list(rep2members.keys()):
+        rep2members[rep].add(rep)
+        if rep not in member2rep:
+            member2rep[rep] = rep
+
+    return rep2members, member2rep
+
+
+def subset_records_by_ids(records, wanted_ids):
+    wanted = set(wanted_ids)
+    return [r for r in records if r.get("id") in wanted]
+
 
 def compute_chrom_k2p_window_stats(records, chrom2len, window_bp=1_000_000, step_bp=500_000):
     """
@@ -1120,6 +1162,24 @@ def main():
     )
 
     ap.add_argument(
+        "--mmseqs-tsv",
+        default=None,
+        help="Optional mmseqs easy-cluster TSV (rep<TAB>member). If provided, family pages are generated.",
+    )
+    ap.add_argument(
+        "--mmseqs-suffix",
+        default=None,
+        help="Optional suffix to load per-species mmseqs TSV as {species}{suffix}. Overrides --mmseqs-tsv if both are set.",
+    )
+    ap.add_argument(
+        "--family-min-count",
+        type=int,
+        default=50,
+        help="Minimum family member count to plot a per-family page (default: 50). Singletons are plotted on a separate page.",
+    )
+
+
+    ap.add_argument(
         "--legend-page",
         action="store_true",
         help="Add a legend-only page and omit legends from all plots.",
@@ -1398,7 +1458,7 @@ def main():
                             dot_types=args.dot_type,
                             x_max=global_chr_xmax if global_chr_xmax > 0 else None,
                             merge_gap_bp=args.chr_merge_gap,
-                            rasterize=args.chr_rasterize,
+                            rasterize=False,
                         )
 
                     save_multipanel_page(
@@ -1575,7 +1635,7 @@ def main():
                                 dot_types=args.dot_type,
                                 x_max=None,
                                 merge_gap_bp=args.chr_merge_gap,
-                                rasterize=args.chr_rasterize,
+                                rasterize=False,
                             )
 
                             ax.set_xlabel("Position (bp)")
@@ -1586,6 +1646,131 @@ def main():
                                 fig.tight_layout()
                             pdf.savefig(fig)
                             plt.close(fig)
+
+            # -----------------------------
+            # Optional: family-level pages via mmseqs easy-cluster
+            # -----------------------------
+            def get_mmseqs_path_for_species(sp):
+                if args.mmseqs_suffix:
+                    return f"{sp}{args.mmseqs_suffix}"
+                return args.mmseqs_tsv
+
+            if args.mmseqs_tsv or args.mmseqs_suffix:
+                for sp in args.species:
+                    mmseqs_path = get_mmseqs_path_for_species(sp)
+                    if not mmseqs_path:
+                        continue
+
+                    try:
+                        rep2members, member2rep = read_mmseqs_easycluster_tsv(mmseqs_path)
+                    except FileNotFoundError:
+                        tlog(f"[{sp}] mmseqs TSV not found: {mmseqs_path} (skipping family pages)", enabled=True)
+                        continue
+
+                    chrom2len = species_data[sp]["chrom2len"]
+                    records = species_data[sp]["records"]
+
+                    # Count members per rep
+                    rep_counts = {rep: len(mems) for rep, mems in rep2members.items()}
+
+                    # Partition reps into singletons and non-singletons
+                    singleton_reps = [rep for rep, n in rep_counts.items() if n == 1]
+                    big_reps = [rep for rep, n in rep_counts.items() if n >= int(args.family_min_count)]
+
+                    # Sort families: biggest first
+                    big_reps.sort(key=lambda r: (-rep_counts[r], r))
+
+                    # ---- helper: write a two-panel page ----
+                    def write_family_page(title_left, recs_left, title_right, recs_right, suptitle):
+                        fig, axes = plt.subplots(1, 2, figsize=(11, 6))
+                        ax1, ax2 = axes
+
+                        # K2P
+                        if args.k2p_mode == "kde":
+                            kdat = compute_species_k2p_stack(recs_left, k2p_xmax=args.k2p_xmax)
+                        else:
+                            kdat = compute_species_k2p_hist_stack(
+                                recs_left, k2p_xmax=args.k2p_xmax, bin_width=args.k2p_bin_width
+                            )
+
+                        plot_k2p_panel(
+                            ax=ax1,
+                            sp_label=title_left,
+                            k2p_data=kdat,
+                            type_colors=type_colors,
+                            y_max=None,
+                            show_global_line=args.density_global_line,
+                            k2p_mode=args.k2p_mode,
+                            type_counts=global_type_counts,
+                        )
+                        ax1.set_xlabel("K2P divergence")
+                        ax1.set_ylabel("Density")
+
+                        # Chrom (NEVER rasterized for family pages)
+                        plot_chrom_panel(
+                            ax=ax2,
+                            sp_label=title_right,
+                            chrom2len=chrom2len,
+                            records=recs_right,
+                            type_colors=type_colors,
+                            dot_types=args.dot_type,
+                            x_max=None,
+                            merge_gap_bp=args.chr_merge_gap,
+                            rasterize=False,
+                        )
+                        ax2.set_xlabel("Position (bp)")
+
+                        fig.suptitle(suptitle, fontsize=12)
+
+                        if not args.legend_page:
+                            add_embedded_legend(
+                                fig,
+                                type_colors,
+                                type_counts=global_type_counts,
+                                ncol=args.embedded_legend_cols,
+                                fontsize=7
+                            )
+                            fig.tight_layout(rect=[0, 0, 0.72, 0.95])
+                        else:
+                            fig.tight_layout(rect=[0, 0, 1, 0.95])
+
+                        pdf.savefig(fig)
+                        plt.close(fig)
+
+                    # ---- per-family pages (only >= family-min-count) ----
+                    for rep in big_reps:
+                        mems = rep2members[rep]
+                        fam_records = subset_records_by_ids(records, mems)
+                        if len(fam_records) < int(args.family_min_count):
+                            continue  # safety (in case some members absent from alignment file)
+
+                        fam_name = rep  # rep string is a great unique family label
+                        nmem = len(fam_records)
+
+                        write_family_page(
+                            title_left=f"{sp} family K2P\n{fam_name}\n(n={nmem})",
+                            recs_left=fam_records,
+                            title_right=f"{sp} family chrom\n{fam_name}\n(n={nmem})",
+                            recs_right=fam_records,
+                            suptitle=f"{sp}: Family-level plots (mmseqs cluster rep = {fam_name})",
+                        )
+
+                    # ---- singleton page (all reps with exactly 1 member) ----
+                    if singleton_reps:
+                        singleton_ids = []
+                        for rep in singleton_reps:
+                            # singleton cluster has exactly one member; just union them
+                            singleton_ids.extend(list(rep2members[rep]))
+
+                        singleton_records = subset_records_by_ids(records, singleton_ids)
+                        if singleton_records:
+                            write_family_page(
+                                title_left=f"{sp} singleton families K2P\n(total n={len(singleton_records)})",
+                                recs_left=singleton_records,
+                                title_right=f"{sp} singleton families chrom\n(total n={len(singleton_records)})",
+                                recs_right=singleton_records,
+                                suptitle=f"{sp}: Singleton families (mmseqs clusters with 1 member)",
+                            )
 
 
                     # 3/4/5) Size distributions
@@ -1631,3 +1816,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+    

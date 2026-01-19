@@ -57,6 +57,33 @@ python ltrharvest.py --genome Athal_chr1.fa --proteins ../PrinTE/data/TAIR10.pep
 # 146 of the 170 have an LTR-RT best-hit in the repbase lib.
 # Most of the non LTR-RT alignments are identified using TEsorter 2-pass (LTR/Gypsy/unknown) and very poorly aligned (1-6% query cov). 
 # Previous benchmarking suggest TEsorter 2-pass 80-80-80 was useful for detecting real LTR-RTs and lowering 80-80-80 generated artifacts
+
+### DEVELOPING ###
+# Nest inserion discovery.
+# Round1: Non-nest.
+python ltrharvest.py --genome Osati.fa --proteins Osati.pep --threads 100 --out-prefix Osati_r1 --scn-min-ltr-len 100 --scn-min-ret-len 800 --scn-max-ret-len 15000 --scn-min-int-len 500 --scn-max-int-len 12000 --size 500000
+# Discovers 4919 LTR-RTs.
+# Mask LTR-RTs with N. Only flanking sequence is unmasked. 
+python mask_ltr.py --features-fasta Osati_r1.ltrharvest.full_length.dedup.fa.rexdb-plant.cls.lib.fa --genome Osati.fa --feature-character N --far-character V --distance 15000 > Osati_r1.fa
+
+
+# Round2: 1-level nesting.
+# Require LTR-RTs to contain runs of N (ie a nested LTR-RT)
+# Expand exceptable max LTR-RT lengths since theyre now nested. 
+python ltrharvest.py --require-run-chars N --genome Osati_r1.fa --proteins Osati.pep --threads 100 --out-prefix Osati_r2 --scn-min-ltr-len 100 --scn-min-ret-len 1000 --scn-max-ret-len 30000 --scn-min-int-len 500 --scn-max-int-len 28000 --ltrharvest-args '-mindistltr 100 -minlenltr 100 -maxlenltr 7000 -mintsd 4 -maxtsd 6 -similar 70 -vic 30 -seed 15 -seqids yes -xdrop 10 -maxdistltr 30000' --ltrfinder-args '-w 2 -C -D 30000 -d 100 -L 7000 -l 100 -p 20 -M 0.00 -S 0.0'
+# Discovers 441 1-level nested LTR-RTs. 
+# 1-level LTR-RTs masked with N; 2-level LTR-RTs masked with R. Flanking sequence unmasked.
+python mask_ltr.py --features-fasta Osati_r2.ltrharvest.full_length.dedup.fa.rexdb-plant.cls.lib.fa --genome Osati.fa --feature-character R --far-character V --distance 15000 > Osati_r2.fa
+
+# Expand exceptable max LTR-RT lengths since theyre now double 2-level nested. 
+# Require LTR-RTs to contain runs of N and R (ie 2-level nesting)
+python ltrharvest.py --require-run-chars N,R --genome Osati_r2.fa --proteins Osati.pep --threads 100 --out-prefix Osati_r3 --scn-min-ltr-len 100 --scn-min-ret-len 1000 --scn-max-ret-len 45000 --scn-min-int-len 500 --scn-max-int-len 43000 --ltrharvest-args '-mindistltr 100 -minlenltr 100 -maxlenltr 7000 -mintsd 4 -maxtsd 6 -similar 70 -vic 30 -seed 15 -seqids yes -xdrop 10 -maxdistltr 45000' --ltrfinder-args '-w 2 -C -D 45000 -d 100 -L 7000 -l 100 -p 20 -M 0.00 -S 0.0'
+# Discovers 75  2-level nested LTR-RTs. 
+
+Needs benchmarked. It may be too strict to expect TEsoerter proteins on higher nesting orders, but this is an outline. 
+ Non-nest K2P    :	0.021463
+ 1-level nest K2P:	0.031816
+ 2-level nest K2P:	0.060179
 """
 
 import argparse
@@ -824,15 +851,34 @@ def filter_scn_by_lengths(
 # Step 7: build LTR FASTA from stitched SCN
 # -----------------------------
 
-def scn_to_internal_fasta(stitched_scn: str, genome_fa: str, out_fa: str):
+def scn_to_internal_fasta(
+    stitched_scn: str,
+    genome_fa: str,
+    out_fa: str,
+    require_run_chars: Optional[List[str]] = None,
+    run_len: int = 100,  # hardcoded default; you can leave this alone
+):
     """
     Uses e(lLTR) and s(rLTR) (1-based inclusive coords from ltrharvest tabout),
     plus chrom (last column), to extract INTERNAL sequence only (LTRs excluded).
+
+    Optional filter:
+      If require_run_chars is provided, the FULL LTR-RT (sret..eret) must contain
+      a run of `run_len` of EACH requested character somewhere in the full-length
+      sequence. Only then do we extract/write the internal.
 
     Header stays full-length LTR-RT coords:
       >chr1:s(ret)-e(ret)
     """
     genome = load_fasta_as_dict(genome_fa)
+
+    # Normalize required chars: uppercase, strip whitespace, drop empties
+    req = []
+    if require_run_chars:
+        for c in require_run_chars:
+            c = (c or "").strip().upper()
+            if c:
+                req.append(c)
 
     n_written = 0
     with open(out_fa, "w") as out, open(stitched_scn, "r") as f:
@@ -844,14 +890,9 @@ def scn_to_internal_fasta(stitched_scn: str, genome_fa: str, out_fa: str):
             if len(parts) < 12:
                 continue
 
-            # Full-length coords (header)
             sret, eret = parts[0], parts[1]
-
-            # Internal coords: e(lLTR) to s(rLTR)
-            # Columns: s(lLTR)=3, e(lLTR)=4, s(rLTR)=6, e(rLTR)=7 (0-based indices)
             el = parts[4]
             sr = parts[6]
-
             chrom = parts[-1]
 
             if not (sret.isdigit() and eret.isdigit() and el.isdigit() and sr.isdigit()):
@@ -862,24 +903,39 @@ def scn_to_internal_fasta(stitched_scn: str, genome_fa: str, out_fa: str):
             el1   = int(el)
             sr1   = int(sr)
 
-            # normalize full-length header interval
             if eret1 < sret1:
                 sret1, eret1 = eret1, sret1
 
             # internal is between LTRs: (e(lLTR)+1) .. (s(rLTR)-1)
             internal_start1 = el1 + 1
             internal_end1   = sr1 - 1
-
             if internal_end1 < internal_start1:
-                continue  # no internal region
+                continue
 
             seq = genome.get(chrom)
             if seq is None:
                 continue
 
-            start0 = internal_start1 - 1
-            end0   = internal_end1  # inclusive -> exclusive
+            # bounds check for full-length first
+            fl_start0 = sret1 - 1
+            fl_end0   = eret1
+            if fl_start0 < 0 or fl_end0 > len(seq):
+                continue
 
+            # ---- NEW: run-of-100 filter on FULL LENGTH ----
+            if req:
+                full_len_seq = seq[fl_start0:fl_end0].upper()
+                ok = True
+                for c in req:
+                    if (c * run_len) not in full_len_seq:
+                        ok = False
+                        break
+                if not ok:
+                    continue
+
+            # Now extract INTERNAL
+            start0 = internal_start1 - 1
+            end0   = internal_end1
             if start0 < 0 or end0 > len(seq):
                 continue
 
@@ -1648,6 +1704,12 @@ def main():
                     help="Path to ltr_finder v1.07 executable")
 
     ap.add_argument(
+        "--require-run-chars",
+        default=None,
+        help="Comma-separated chars that must each occur as a run of 100 in the FULL LTR-RT before internal is kept (e.g. 'Y' or 'Y,R'). Optional."
+    )
+
+    ap.add_argument(
         "--ltr-timeout",
         type=int,
         default=0,
@@ -1918,7 +1980,11 @@ def main():
 
     if args.use_tesorter:
         print(f"[Step7] building INTERNALS FASTA from SCN -> {internals_fa}")
-        scn_to_internal_fasta(merged_scn, args.genome, internals_fa)
+        req_chars = None
+        if args.require_run_chars:
+            req_chars = [x.strip() for x in args.require_run_chars.split(",") if x.strip()]
+        scn_to_internal_fasta(merged_scn, args.genome, internals_fa, require_run_chars=req_chars)
+
     else:
         print(f"[Step7] building INTACT FASTA from SCN -> {intact_fa}")
         scn_to_intact_fasta(merged_scn, args.genome, intact_fa)

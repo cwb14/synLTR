@@ -10,7 +10,7 @@ python v2/mask_ltr.py --features-fasta Oalta.ltrharvest.full_length.dedup.fa.rex
 python ./ltrharvest.py --require-run-chars N --genome Oalta_r1.fa --proteins Osati.pep --threads 100 --out-prefix Oalta_r2 --scn-min-ltr-len 100 --scn-min-ret-len 1000 --scn-max-ret-len 30000 --scn-min-int-len 200 --scn-max-int-len 28000 --ltrharvest-args '-mindistltr 100 -minlenltr 100 -maxlenltr 7000 -mintsd 4 -maxtsd 6 -similar 70 -vic 30 -seed 15 -seqids yes -xdrop 10 -maxdistltr 30000' --ltrfinder-args '-w 2 -C -D 30000 -d 100 -L 7000 -l 100 -p 20 -M 0.00 -S 0.0'
 
 # Merge non-nest and 1-level nesters. 
-sed '/^>/! s/[^ATCGatcg]//g' Oalta_r2.ltrharvest.full_length.dedup.fa.rexdb-plant.cls.lib.fa >temp.fa
+sed '/^>/! { s/[^ATCGatcg]//g; /^$/d }' Oalta_r2.ltrharvest.full_length.dedup.fa.rexdb-plant.cls.lib.fa >temp.fa
 cat temp.fa Oalta.ltrharvest.full_length.dedup.fa.rexdb-plant.cls.lib.fa > Oalta.ltr.lib.fa
 
 cat sg.config 

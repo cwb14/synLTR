@@ -1,9 +1,37 @@
 #!/usr/bin/env python3
 """
+Note 'ltrharvest_phasing.py' and 'ltrharvest_phasing2.py' use slightly different approaches and give slightly different results. Im not sure which is better, so theyre both included. 
+
 LTR-only SubPhaser-like subgenome phasing (with K2P integration + binned density PDF)
 + genomic windows exchange scan + optional chromosome painting with FAI.
 
-python ./test7.2.py --ltr_fasta Oalta.ltr.lib.fa --homoeolog_config sg.config --outdir ltr_phaser_out -k 15 --hash_size 100000000 --dump_min 3 --ratio_f 2 --q_min 200 --threads 8 --boot_reps 1000 --k2p_file  <(cat *_dedup) --k2p_col 11 --k2p_bin 0.0005 --genome_fai Oalta.fa.fai
+# Get non-nest.
+python ltrharvest.py --genome Oalta.fa --proteins Osati.pep --threads 20 --out-prefix Oalta_ltr --scn-min-ltr-len 100 --scn-min-ret-len 800 --scn-max-ret-len 15000 --scn-min-int-len 500 --scn-max-int-len 12000
+
+# Get 1-level nesters. 
+python v2/mask_ltr.py --features-fasta Oalta.ltrharvest.full_length.dedup.fa.rexdb-plant.cls.lib.fa --genome Oalta.fa --feature-character N --far-character V --distance 15000 > Oalta_r1.fa
+python ./ltrharvest.py --require-run-chars N --genome Oalta_r1.fa --proteins Osati.pep --threads 100 --out-prefix Oalta_r2 --scn-min-ltr-len 100 --scn-min-ret-len 1000 --scn-max-ret-len 30000 --scn-min-int-len 200 --scn-max-int-len 28000 --ltrharvest-args '-mindistltr 100 -minlenltr 100 -maxlenltr 7000 -mintsd 4 -maxtsd 6 -similar 70 -vic 30 -seed 15 -seqids yes -xdrop 10 -maxdistltr 30000' --ltrfinder-args '-w 2 -C -D 30000 -d 100 -L 7000 -l 100 -p 20 -M 0.00 -S 0.0'
+
+# Merge non-nest and 1-level nesters. 
+sed '/^>/! s/[^ATCGatcg]//g' Oalta_r2.ltrharvest.full_length.dedup.fa.rexdb-plant.cls.lib.fa >temp.fa
+cat temp.fa Oalta.ltrharvest.full_length.dedup.fa.rexdb-plant.cls.lib.fa > Oalta.ltr.lib.fa
+
+cat sg.config 
+CC1	DD1
+CC2	DD2
+CC3	DD3
+CC4	DD4
+CC5	DD5
+CC6	DD6
+CC7	DD7
+CC8	DD8
+CC9	DD9
+CC10	DD10
+CC11	DD11
+CC12	DD12
+
+# Now Phase. 
+python ./ltrharvest_phasing2.py --ltr_fasta Oalta.ltr.lib.fa --homoeolog_config sg.config --outdir ltr_phaser_out -k 15 --hash_size 100000000 --dump_min 3 --ratio_f 2 --q_min 200 --threads 8 --boot_reps 1000 --k2p_file  <(cat *_dedup) --k2p_col 11 --k2p_bin 0.0005 --genome_fai Oalta.fa.fai
 
 Adds (existing from your version):
   - --k2p_file: TSV where col1 is LTR id (exact header string) and K2P is column 11 (1-based)

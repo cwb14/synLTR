@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 """
+Note 'ltrharvest_phasing.py' and 'ltrharvest_phasing2.py' use slightly different approaches and give slightly different results. Im not sure which is better, so theyre both included. 
+
 # Get non-nest.
 python ltrharvest.py --genome Oalta.fa --proteins Osati.pep --threads 20 --out-prefix Oalta_ltr --scn-min-ltr-len 100 --scn-min-ret-len 800 --scn-max-ret-len 15000 --scn-min-int-len 500 --scn-max-int-len 12000
 

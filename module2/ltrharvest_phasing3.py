@@ -9,7 +9,7 @@ Its also
 # --kmer 17 or --kmer 15.
 python ltr_phasing3.py --fasta Fanan.ltr.lib.fa --config Fanan.config --outdir temp5 --threads 200 --canonical -L 3 --f_ratio 2 --q_min 40 --test kruskal --kmer 17
 
-ltr_phasing3.py
+# THose other scripts seem to work pretty well with the above parameters. they my just need updated for  kruskal,wilcoxon.
 
 Identify subgenome-specific LTR-RT k-mers (default k=15) from a polyploid LTR-RT library,
 using homoeologous chromosome sets from a config file.

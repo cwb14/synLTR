@@ -2,6 +2,8 @@
 """
 Note 'ltrharvest_phasing.py' and 'ltrharvest_phasing2.py' use slightly different approaches and give slightly different results. Im not sure which is better, so theyre both included. 
 
+Someone tried something similar here: https://www.pnas.org/doi/10.1073/pnas.2502814122
+
 LTR-only SubPhaser-like subgenome phasing (with K2P integration + binned density PDF)
 + genomic windows exchange scan + optional chromosome painting with FAI.
 

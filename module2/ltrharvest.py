@@ -949,15 +949,34 @@ def scn_to_internal_fasta(
     if n_written == 0:
         Path(out_fa).touch()
 
-def scn_to_intact_fasta(stitched_scn: str, genome_fa: str, out_fa: str):
+def scn_to_intact_fasta(
+    stitched_scn: str,
+    genome_fa: str,
+    out_fa: str,
+    require_run_chars: Optional[List[str]] = None,
+    run_len: int = 100,
+):
     """
     Extract FULL intact LTR-RT sequence using s(ret) and e(ret) (1-based inclusive),
     plus chrom (last column).
+
+    Optional filter:
+      If require_run_chars is provided, the FULL LTR-RT (sret..eret) must contain
+      a run of `run_len` of EACH requested character somewhere in the full-length
+      sequence. Only then do we write the intact.
 
     Header:
       >chr1:s(ret)-e(ret)
     """
     genome = load_fasta_as_dict(genome_fa)
+
+    # Normalize required chars: uppercase, strip whitespace, drop empties
+    req = []
+    if require_run_chars:
+        for c in require_run_chars:
+            c = (c or "").strip().upper()
+            if c:
+                req.append(c)
 
     n_written = 0
     with open(out_fa, "w") as out, open(stitched_scn, "r") as f:
@@ -986,13 +1005,24 @@ def scn_to_intact_fasta(stitched_scn: str, genome_fa: str, out_fa: str):
 
             start0 = sret1 - 1
             end0 = eret1  # inclusive -> exclusive
-
             if start0 < 0 or end0 > len(seq):
                 continue
 
+            frag = seq[start0:end0]
+
+            # ---- NEW: run-of-100 filter on FULL LENGTH ----
+            if req:
+                full_len_seq = frag.upper()
+                ok = True
+                for c in req:
+                    if (c * run_len) not in full_len_seq:
+                        ok = False
+                        break
+                if not ok:
+                    continue
+
             header = f"{chrom}:{sret1}-{eret1}"
             out.write(f">{header}\n")
-            frag = seq[start0:end0]
             for i in range(0, len(frag), 60):
                 out.write(frag[i:i+60] + "\n")
             n_written += 1
@@ -1987,7 +2017,17 @@ def main():
 
     else:
         print(f"[Step7] building INTACT FASTA from SCN -> {intact_fa}")
-        scn_to_intact_fasta(merged_scn, args.genome, intact_fa)
+
+        req_chars = None
+        if args.require_run_chars:
+            req_chars = [x.strip() for x in args.require_run_chars.split(",") if x.strip()]
+
+        scn_to_intact_fasta(
+            merged_scn,
+            args.genome,
+            intact_fa,
+            require_run_chars=req_chars,
+        )
 
     # Step 9: TEsorter on stitched FASTA (required)
     cls_tsv_path = None

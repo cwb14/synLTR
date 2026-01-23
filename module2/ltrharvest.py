@@ -7,6 +7,8 @@
 (5) Purges duplicate LTR-RTs based on kmer2ltr LTR divergence.
 NOTE: "--tesorter-tree" currently broken. To fix, we'd simply re-run TEsorter on the remaining deduped full length LTR-RTs.
 
+# I could consider adding DeepTE or CREATE as an alternative to TEsorter although I need to check their speed and efficiency feasiblility. 
+
 Benchmarking suggests including the gene protein file is a good idea while non-LTR TEs is optional: 
 | Approach              | TP       | FP     | FN      | Precision | Recall    | F1        |
 | --------------------- | -------- | ------ | ------- | --------- | --------- | --------- |

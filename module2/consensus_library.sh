@@ -12,7 +12,8 @@ set -euo pipefail
 # Merge all LTR-RTs. 
 cat ref*.ltrharvest.full_length.dedup.fa.rexdb-plant.cls.lib.fa | sed '/^>/! { s/[^ATCGatcg]//g; /^$/d }' > ref_all.fa
 # Clean headers for this consensus tool. 
-sed '/^>/ s/#.*//' ref_all.fa | sed 's/:/_/g' > all_intact_TEs.fa
+sed '/^>/ s/#.*//' ref_all.fa | sed 's/:/_/g' > LTR_intact_TEs.fa
+# I merged 'all_intact_TEs.fa' with '$.fa.mod.EDTA.intact.fa' from EDTA to create 'all_intact_TEs.fa'.
 
 # I run it:
 bash ./consensus_library.sh -i all_intact_TEs.fa -o TE_consensus_out -p all_intact_TEs -t 20 --min-seq-id 0.80 -c 0.80 --cov-mode 0 --cluster-mode 0 --mafft-mode auto --cons-tool consambig

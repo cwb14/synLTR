@@ -11,7 +11,8 @@ Behavior:
 - The feature interval (start-end) is always hard-masked (default: N; configurable via --feature-character)
 - Everything farther than --distance bp away from ANY feature is also masked
   (default: same as feature mask; configurable separately via --far-character)
-- Only the flanking bases within --distance bp on either side of each feature remain unmasked
+- Only the flanking bases within --distance bp on either side of each feature remain unmasked,
+  BUT flanks are truncated early if they would run into another feature interval.
 
 Coordinates:
 - Interprets start-end as 1-based, inclusive (common in genomics).
@@ -22,17 +23,17 @@ Masking characters:
 - --feature-character masks the feature interval itself
 - --far-character masks all other non-kept bases (farther than distance from any feature)
 
-NEW behavior :
+NEW behavior:
 - If using --features-fasta, the feature sequence itself is scanned.
   Any NON-ATCG character (case-insensitive) in the feature sequence is assumed to have been
   previously masked and will be preserved EXACTLY at the corresponding genome position
   within the feature interval in the output (e.g., 'X' stays 'X', 'N' stays 'N').
   ATCG positions inside the feature interval are still converted to --feature-character.
 
-Notes:
-- For --features-fasta, we assume the feature sequence corresponds to the interval length
-  (end-start+1). If the feature sequence length is shorter/longer, we map what we can
-  (truncate extras; ignore missing tail) and warn to stderr.
+Critical rule (fixed):
+- Masking ALWAYS takes precedence over keeping flanks.
+  Flanks never unmask any base that lies in ANY feature interval.
+  Flanks extend up to --distance, but stop early at neighboring feature boundaries.
 """
 
 import argparse
@@ -69,7 +70,7 @@ def parse_tsv_features(tsv_path: str) -> Dict[str, List[Tuple[int, int]]]:
     """
     feats: Dict[str, List[Tuple[int, int]]] = {}
     with open(tsv_path, "r", encoding="utf-8") as f:
-        for ln, line in enumerate(f, start=1):
+        for _ln, line in enumerate(f, start=1):
             line = line.strip()
             if not line or line.startswith("#"):
                 continue
@@ -130,7 +131,7 @@ def parse_features_fasta_with_overrides(features_fa: str) -> Tuple[
             end0 = e  # half-open
             feats.setdefault(contig, []).append((start0, end0))
 
-            expected_len = end0 - start0  # == e - (s-1) == e-s+1
+            expected_len = end0 - start0  # == e-s+1
             seq = seq.strip()
             if not seq:
                 continue
@@ -175,7 +176,7 @@ def merge_intervals(intervals: List[Tuple[int, int]]) -> List[Tuple[int, int]]:
 def wrap_fasta(seq: str, width: int) -> str:
     if width <= 0:
         return seq + "\n"
-    return "\n".join(seq[i : i + width] for i in range(0, len(seq), width)) + "\n"
+    return "\n".join(seq[i:i + width] for i in range(0, len(seq), width)) + "\n"
 
 
 def clip_intervals(intervals: List[Tuple[int, int]], n: int) -> List[Tuple[int, int]]:
@@ -189,19 +190,42 @@ def clip_intervals(intervals: List[Tuple[int, int]], n: int) -> List[Tuple[int, 
     return out
 
 
-def build_keep_flanks(features: List[Tuple[int, int]], n: int, dist: int) -> List[Tuple[int, int]]:
-    """Build merged keep-intervals = left/right flanks around each feature."""
+def build_keep_flanks_truncated(
+    feats_merged: List[Tuple[int, int]],
+    n: int,
+    dist: int
+) -> List[Tuple[int, int]]:
+    """
+    Build keep-intervals = left/right flanks around each feature, truncated so they
+    never enter any feature interval.
+
+    Given merged, sorted feature intervals feats_merged:
+      left flank of feature i: [max(prev_end, s - dist), s)
+      right flank of feature i: [e, min(next_start, e + dist))
+
+    This ensures:
+    - feature masking always wins
+    - flanks stop early at neighboring features
+    """
+    if dist <= 0 or not feats_merged:
+        return []
+
     keep: List[Tuple[int, int]] = []
-    for s, e in features:
-        # left flank: [s - dist, s)
-        ls = max(0, s - dist)
+    k = len(feats_merged)
+
+    for idx, (s, e) in enumerate(feats_merged):
+        prev_end = feats_merged[idx - 1][1] if idx > 0 else 0
+        next_start = feats_merged[idx + 1][0] if idx + 1 < k else n
+
+        # left flank, truncated by previous feature end
+        ls = max(0, s - dist, prev_end)
         le = s
         if le > ls:
             keep.append((ls, le))
 
-        # right flank: [e, e + dist)
+        # right flank, truncated by next feature start
         rs = e
-        re = min(n, e + dist)
+        re = min(n, e + dist, next_start)
         if re > rs:
             keep.append((rs, re))
 
@@ -218,14 +242,11 @@ def mask_contig(
 ) -> str:
     """
     Mask with two characters:
-      - keep flanks within dist of features: keep original bases
-      - feature interval itself: feature_char
+      - feature interval itself: feature_char (or override char if specified for that position)
+      - keep flanks within dist of features: keep original bases, but only outside ALL features
       - everything else (farther than dist from any feature): far_char
 
-    If override_map is provided:
-      - Within feature intervals ONLY, positions in override_map are emitted as that exact char
-        (preserving prior non-ATCG masking like 'X', 'N', etc.).
-      - ATCG positions in feature intervals remain feature_char.
+    Priority is ALWAYS: feature > keep > far
     """
     n = len(seq)
     if n == 0:
@@ -238,8 +259,8 @@ def mask_contig(
     if not feats:
         return far_char * n
 
-    # Keep intervals are just flanks (features themselves are never kept)
-    keep = build_keep_flanks(feats, n, dist)
+    # Keep intervals are truncated flanks that never enter any feature interval
+    keep = build_keep_flanks_truncated(feats, n, dist)
 
     out_chunks: List[str] = []
 
@@ -249,7 +270,6 @@ def mask_contig(
 
     # Prepare override scanning
     if override_map:
-        # Only keep overrides that are within contig bounds
         ov_items = [(p, c) for p, c in override_map.items() if 0 <= p < n]
         ov_items.sort(key=lambda x: x[0])
         ov_pos = [p for p, _c in ov_items]
@@ -271,35 +291,31 @@ def mask_contig(
         while op < len(ov_pos) and ov_pos[op] < i:
             op += 1
 
-        in_keep = in_interval(keep, kp, i)
         in_feat = in_interval(feats, fp, i)
+        in_keep = in_interval(keep, kp, i)
 
         # Determine the next boundary where state could change
         next_b = n
-        if kp < len(keep):
-            ks, ke = keep[kp]
-            if i < ks:
-                next_b = min(next_b, ks)
-            else:
-                next_b = min(next_b, ke)
         if fp < len(feats):
             fs, fe = feats[fp]
             if i < fs:
                 next_b = min(next_b, fs)
             else:
                 next_b = min(next_b, fe)
+        if kp < len(keep):
+            ks, ke = keep[kp]
+            if i < ks:
+                next_b = min(next_b, ks)
+            else:
+                next_b = min(next_b, ke)
 
-        # Emit chunk with priority: keep > feature > far
-        if in_keep:
-            out_chunks.append(seq[i:next_b])
-
-        elif in_feat:
+        # Emit chunk with priority: FEATURE > KEEP > FAR
+        if in_feat:
             # Feature interval: mostly feature_char, but preserve prior non-ATCG mask chars if provided
             if not ov_pos:
                 out_chunks.append(feature_char * (next_b - i))
             else:
                 start = i
-                # Emit until overrides inside [i, next_b)
                 while op < len(ov_pos) and ov_pos[op] < next_b:
                     p = ov_pos[op]
                     if p > start:
@@ -309,6 +325,9 @@ def mask_contig(
                     op += 1
                 if start < next_b:
                     out_chunks.append(feature_char * (next_b - start))
+
+        elif in_keep:
+            out_chunks.append(seq[i:next_b])
 
         else:
             out_chunks.append(far_char * (next_b - i))

@@ -11,6 +11,13 @@ NOTE: "--tesorter-tree" currently broken. To fix, we'd simply re-run TEsorter on
 # I could consider trying to recover some non-protein containing LTR-RTs by implmenting TSD, PPT, TG..CA, PBS scan, multi-copy searches (real LTR-RTs probably arent singleton clusters). PPT and PBS will give pretty high false positives. PPT is cheap, PBS is more costly due to tRNAscan-SE + alignment. TSD gives lowest false positves, but would need to be strict (exactly 5bp; no mismatches; no coordinate wiggle). I might be better off just reducing TEsorter thresholds, IDK. Copy number filters after clustering might give the fewest false positives... There are many overlaping (dupped) candidate LTR-RTs though, that Kmer2LTR purges. We'd need a mechanism to prevent retaining clusters that only contain overlapping LTR-RTs (ie non-protein containing LTR-RTs are retained if they cluster with non-overlapping LTR-RT candidates). 
 # Or i could recover some using a duel approach (ie, prioritize the TEsorter dedupped LTR-RTs but also retain the dedupped "--no-tesorter" LTR-RTs that do not overlap with one of the protein-containing LTR-RTs).
 
+# I could make '--require-run-chars' more robust. 
+# For example, if first level use '--require-run-chars N', second level use '--require-run-chars N,R', and third level use '--require-run-chars N,R,D':
+# For first level, I expect N length > 800 (ie min length of a non-nest LTR-RT). 
+# For second level, I expect N length > 800. THose Ns should be flanked by >100bp of R (eg, [new_ltr_5p][>100 bp R][>800 bp N][>100 bp R][new_ltr_3p]).
+# For third level, I expect N length > 800. THose Ns should be flanked by >100bp of R. Those R should be flanked by >100bp D (eg, [new_ltr_5p][>100 bp D][>100 bp R][>800 bp N][>100 bp R][>100 bp D][new_ltr_3p]).
+# With 'mask_ltr.py', i used '--far-character V'. This means my nested LTRs (1st, 2nd, 3rd shouldnt have Vs). 
+
 Benchmarking suggests including the gene protein file is a good idea while non-LTR TEs is optional: 
 | Approach              | TP       | FP     | FN      | Precision | Recall    | F1        |
 | --------------------- | -------- | ------ | ------- | --------- | --------- | --------- |

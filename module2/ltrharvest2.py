@@ -43,7 +43,7 @@ Benchmarking suggests including the gene protein file is a good idea while non-L
 # Combine #2 and #10. 
 # With real data, I suspect TEsorter is required since ltrharvest and ltrfinder parameters are selected to optimize specificity.
 # My PriNTE simulations do not test the impact of low-complexity repeats. 
-python ltrharvest.py --genome Athal.fa --proteins TAIR10.pep.fa.gz --threads 20 --out-prefix Athal_ltr --scn-min-ltr-len 100 --scn-min-ret-len 800 --scn-max-ret-len 15000 --scn-min-int-len 500 --scn-max-int-len 12000
+python ltrharvest.py --genome Athal.fa --proteins TAIR10.pep.fa.gz --threads 20 --out-prefix Athal_ltr --tsd-rescue --scn-min-ltr-len 100 --scn-min-ret-len 800 --scn-max-ret-len 15000 --scn-min-int-len 500 --scn-max-int-len 12000
 
  
 # Goldstandard
@@ -72,7 +72,7 @@ python ltrharvest.py --genome Athal_chr1.fa --proteins ../PrinTE/data/TAIR10.pep
 ### DEVELOPING ###
 # Nest inserion discovery.
 # Round1: Non-nest.
-python ltrharvest.py --genome Osati.fa --proteins Osati.pep --threads 100 --out-prefix Osati_r1 --scn-min-ltr-len 100 --scn-min-ret-len 800 --scn-max-ret-len 15000 --scn-min-int-len 500 --scn-max-int-len 12000 --size 500000
+python ltrharvest.py --genome Osati.fa --proteins Osati.pep --threads 100 --out-prefix Osati_r1 --tsd-rescue --scn-min-ltr-len 100 --scn-min-ret-len 800 --scn-max-ret-len 15000 --scn-min-int-len 500 --scn-max-int-len 12000 --size 500000
 # Discovers 4919 LTR-RTs.
 # Mask LTR-RTs with N. Only flanking sequence is unmasked. 
 python mask_ltr.py --features-fasta Osati_r1.ltrharvest.full_length.dedup.fa.rexdb-plant.cls.lib.fa --genome Osati.fa --feature-character N --far-character V --distance 15000 > Osati_r1.fa
@@ -81,15 +81,19 @@ python mask_ltr.py --features-fasta Osati_r1.ltrharvest.full_length.dedup.fa.rex
 # Round2: 1-level nesting.
 # Require LTR-RTs to contain runs of N (ie a nested LTR-RT)
 # Expand exceptable max LTR-RT lengths since theyre now nested. 
-python ltrharvest.py --require-run-chars N --genome Osati_r1.fa --proteins Osati.pep --threads 100 --out-prefix Osati_r2 --scn-min-ltr-len 100 --scn-min-ret-len 1000 --scn-max-ret-len 30000 --scn-min-int-len 500 --scn-max-int-len 28000 --ltrharvest-args '-mindistltr 100 -minlenltr 100 -maxlenltr 7000 -mintsd 4 -maxtsd 6 -similar 70 -vic 30 -seed 15 -seqids yes -xdrop 10 -maxdistltr 30000' --ltrfinder-args '-w 2 -C -D 30000 -d 100 -L 7000 -l 100 -p 20 -M 0.00 -S 0.0'
+python ltrharvest.py --require-run-chars N --genome Osati_r1.fa --proteins Osati.pep --threads 100 --out-prefix Osati_r2 --tsd-rescue --scn-min-ltr-len 100 --scn-min-ret-len 1000 --scn-max-ret-len 30000 --scn-min-int-len 500 --scn-max-int-len 28000 --ltrharvest-args '-mindistltr 100 -minlenltr 100 -maxlenltr 7000 -mintsd 0 -maxtsd 0 -similar 70 -vic 60 -seed 15 -seqids yes -xdrop 10 -maxdistltr 30000' --ltrfinder-args '-w 2 -C -D 30000 -d 100 -L 7000 -l 100 -p 20 -M 0.00 -S 0.0'
 # Discovers 441 1-level nested LTR-RTs. 
 # 1-level LTR-RTs masked with N; 2-level LTR-RTs masked with R. Flanking sequence unmasked.
 python mask_ltr.py --features-fasta Osati_r2.ltrharvest.full_length.dedup.fa.rexdb-plant.cls.lib.fa --genome Osati.fa --feature-character R --far-character V --distance 15000 > Osati_r2.fa
 
 # Expand exceptable max LTR-RT lengths since theyre now double 2-level nested. 
 # Require LTR-RTs to contain runs of N and R (ie 2-level nesting)
-python ltrharvest.py --require-run-chars N,R --genome Osati_r2.fa --proteins Osati.pep --threads 100 --out-prefix Osati_r3 --scn-min-ltr-len 100 --scn-min-ret-len 1000 --scn-max-ret-len 45000 --scn-min-int-len 500 --scn-max-int-len 43000 --ltrharvest-args '-mindistltr 100 -minlenltr 100 -maxlenltr 7000 -mintsd 4 -maxtsd 6 -similar 70 -vic 30 -seed 15 -seqids yes -xdrop 10 -maxdistltr 45000' --ltrfinder-args '-w 2 -C -D 45000 -d 100 -L 7000 -l 100 -p 20 -M 0.00 -S 0.0'
+python ltrharvest.py --require-run-chars N,R --genome Osati_r2.fa --proteins Osati.pep --threads 100 --out-prefix Osati_r3 --tsd-rescue --scn-min-ltr-len 100 --scn-min-ret-len 1000 --scn-max-ret-len 45000 --scn-min-int-len 500 --scn-max-int-len 43000 --ltrharvest-args '-mindistltr 100 -minlenltr 100 -maxlenltr 7000 -mintsd 0 -maxtsd 0 -similar 70 -vic 60 -seed 15 -seqids yes -xdrop 10 -maxdistltr 45000' --ltrfinder-args '-w 2 -C -D 45000 -d 100 -L 7000 -l 100 -p 20 -M 0.00 -S 0.0'
 # Discovers 75  2-level nested LTR-RTs. 
+# 1-level LTR-RTs masked with N; 2-level LTR-RTs masked with R. 3-level LTR-RTs masked with D. Flanking sequence unmasked.
+python mask_ltr.py --features-fasta Osati_r2.ltrharvest.full_length.dedup.fa.rexdb-plant.cls.lib.fa --genome Osati.fa --feature-character D --far-character V --distance 15000 > Osati_r3.fa
+
+python ltrharvest.py --require-run-chars N,R,D --genome Osati_r3.fa --proteins Osati.pep --threads 100 --out-prefix Osati_r3 --tsd-rescue --scn-min-ltr-len 100 --scn-min-ret-len 1000 --scn-max-ret-len 55000 --scn-min-int-len 500 --scn-max-int-len 54000 --ltrharvest-args '-mindistltr 100 -minlenltr 100 -maxlenltr 7000 -mintsd 0 -maxtsd 0 -similar 70 -vic 60 -seed 15 -seqids yes -xdrop 10 -maxdistltr 55000' --ltrfinder-args '-w 2 -C -D 55000 -d 100 -L 7000 -l 100 -p 20 -M 0.00 -S 0.0'
 
 Needs benchmarked. It may be too strict to expect TEsoerter proteins on higher nesting orders, but this is an outline. 
  Non-nest K2P    :	0.021463
@@ -675,6 +679,105 @@ def stitch_gff3(chunk_triplets: List[Tuple[ChunkInfo, str, str]], stitched_out: 
                     cols[4] = str(end + chunk_start0)
                     out.write("\t".join(cols) + "\n")
 
+def _is_valid_require_run_chars(require_run_chars: Optional[List[str]]) -> List[str]:
+    req: List[str] = []
+    if not require_run_chars:
+        return req
+    for c in require_run_chars:
+        c = (c or "").strip().upper()
+        if not c:
+            continue
+        if len(c) != 1:
+            raise ValueError(f"--require-run-chars expects single characters, got: {c!r}")
+        req.append(c)
+    return req
+
+
+def has_nested_run_signature(
+    seq: str,
+    chars: List[str],
+    base_min: int = 800,
+    flank_min: int = 80,
+) -> bool:
+    """
+    True iff seq contains an adjacent nested pattern:
+      chars[-1]{>=flank} ... chars[1]{>=flank} chars[0]{>=base} chars[1]{>=flank} ... chars[-1]{>=flank}
+
+    Example:
+      [N] => N{>=base}
+      [N,R] => R{>=flank} N{>=base} R{>=flank}
+      [N,R,D] => D{>=flank} R{>=flank} N{>=base} R{>=flank} D{>=flank}
+
+    Adjacency is enforced: the flank runs must directly touch the inner run.
+    """
+    if not chars:
+        return True
+
+    if base_min <= 0:
+        base_min = 1
+    if flank_min <= 0:
+        flank_min = 1
+
+    s = seq.upper()
+    c0 = chars[0]
+
+    n = len(s)
+    i = 0
+
+    # scan for runs of the base char (chars[0])
+    while i < n:
+        if s[i] != c0:
+            i += 1
+            continue
+
+        j = i
+        while j < n and s[j] == c0:
+            j += 1
+
+        run_len = j - i
+        if run_len >= base_min:
+            # We have a candidate base run [i, j)
+            left_idx = i       # boundary just before base run
+            right_idx = j      # boundary just after base run
+
+            ok = True
+            # require symmetric adjacent flanks for each nesting level
+            for level in range(1, len(chars)):
+                c = chars[level]
+
+                # left flank must end exactly at left_idx-1
+                l_end = left_idx
+                l_start = l_end
+                while l_start > 0 and s[l_start - 1] == c:
+                    l_start -= 1
+                left_run = l_end - l_start
+                if left_run < flank_min:
+                    ok = False
+                    break
+
+                # right flank must start exactly at right_idx
+                r_start = right_idx
+                r_end = r_start
+                while r_end < n and s[r_end] == c:
+                    r_end += 1
+                right_run = r_end - r_start
+                if right_run < flank_min:
+                    ok = False
+                    break
+
+                # move outward for next level
+                left_idx = l_start
+                right_idx = r_end
+
+            if ok:
+                return True
+
+        # continue scanning after this base run
+        i = j
+
+    return False
+
+
 def stitch_scn(chunk_triplets: List[Tuple[ChunkInfo, str, str]], stitched_out: str):
     """
     SCN/tabular line format (ltrharvest tabout):
@@ -867,7 +970,8 @@ def scn_to_internal_fasta(
     genome_fa: str,
     out_fa: str,
     require_run_chars: Optional[List[str]] = None,
-    run_len: int = 100,  # hardcoded default; you can leave this alone
+    base_min: int = 800,
+    flank_min: int = 80,
 ):
     """
     Uses e(lLTR) and s(rLTR) (1-based inclusive coords from ltrharvest tabout),
@@ -933,15 +1037,12 @@ def scn_to_internal_fasta(
             if fl_start0 < 0 or fl_end0 > len(seq):
                 continue
 
-            # ---- NEW: run-of-100 filter on FULL LENGTH ----
+            req = _is_valid_require_run_chars(require_run_chars)
+
+            # ---- nested signature filter on FULL LENGTH ----
             if req:
                 full_len_seq = seq[fl_start0:fl_end0].upper()
-                ok = True
-                for c in req:
-                    if (c * run_len) not in full_len_seq:
-                        ok = False
-                        break
-                if not ok:
+                if not has_nested_run_signature(full_len_seq, req, base_min=base_min, flank_min=flank_min):
                     continue
 
             # Now extract INTERNAL
@@ -965,7 +1066,8 @@ def scn_to_intact_fasta(
     genome_fa: str,
     out_fa: str,
     require_run_chars: Optional[List[str]] = None,
-    run_len: int = 100,
+    base_min: int = 800,
+    flank_min: int = 80,
 ):
     """
     Extract FULL intact LTR-RT sequence using s(ret) and e(ret) (1-based inclusive),
@@ -1021,16 +1123,14 @@ def scn_to_intact_fasta(
 
             frag = seq[start0:end0]
 
-            # ---- NEW: run-of-100 filter on FULL LENGTH ----
+            req = _is_valid_require_run_chars(require_run_chars)
+
+            # ---- nested signature filter on FULL LENGTH ----
             if req:
                 full_len_seq = frag.upper()
-                ok = True
-                for c in req:
-                    if (c * run_len) not in full_len_seq:
-                        ok = False
-                        break
-                if not ok:
+                if not has_nested_run_signature(full_len_seq, req, base_min=base_min, flank_min=flank_min):
                     continue
+
 
             header = f"{chrom}:{sret1}-{eret1}"
             out.write(f">{header}\n")
@@ -1662,6 +1762,9 @@ def rescue_nonautonomous_by_tsd_from_scn(
     tesorter_retained_te_keys: set,
     out_fa: str,
     min_len: int = 5,
+    require_run_chars: Optional[List[str]] = None,
+    base_min: int = 800,
+    flank_min: int = 80,
 ) -> int:
     """
     For each SCN candidate NOT present in tesorter_retained_te_keys, scan for TSD.
@@ -1730,6 +1833,12 @@ def rescue_nonautonomous_by_tsd_from_scn(
                 continue
 
             frag = seq[fl0:fr0]
+
+            req = _is_valid_require_run_chars(require_run_chars)
+            if req:
+                if not has_nested_run_signature(frag.upper(), req, base_min=base_min, flank_min=flank_min):
+                    continue
+                    
             hdr = f"{te_key}#LTR/unknown/unknown"
             out.write(f">{hdr}\n")
             for i in range(0, len(frag), 60):
@@ -1874,6 +1983,10 @@ def main():
         default=None,
         help="Comma-separated chars that must each occur as a run of 100 in the FULL LTR-RT before internal is kept (e.g. 'Y' or 'Y,R'). Optional."
     )
+    ap.add_argument("--nested-base-min", type=int, default=800,
+                    help="Min length for the first char in --require-run-chars (default: 800)")
+    ap.add_argument("--nested-flank-min", type=int, default=80,
+                    help="Min length for each flanking nesting char (default: 80)")
 
     ap.add_argument(
         "--ltr-timeout",
@@ -2150,7 +2263,11 @@ def main():
         req_chars = None
         if args.require_run_chars:
             req_chars = [x.strip() for x in args.require_run_chars.split(",") if x.strip()]
-        scn_to_internal_fasta(merged_scn, args.genome, internals_fa, require_run_chars=req_chars)
+
+        scn_to_internal_fasta(merged_scn, args.genome, internals_fa,
+                             require_run_chars=req_chars,
+                             base_min=args.nested_base_min,
+                             flank_min=args.nested_flank_min)
 
     else:
         print(f"[Step7] building INTACT FASTA from SCN -> {intact_fa}")
@@ -2215,14 +2332,18 @@ def main():
                         retained.add(te)
 
             rescued_fa = str(workdir / f"{out_prefix}.tsd_rescued.full_length.fa")
-            print(f"[Step9] TSD rescue enabled: scanning non-TEsorter LTR-RTs -> {rescued_fa}")
+            print(f"[Step9] TSD rescue enabled: scanning non-TEsorter LTR-RTs -> {rescued_fa}")     
             n_rescued = rescue_nonautonomous_by_tsd_from_scn(
                 stitched_scn=merged_scn,
                 genome_fa=args.genome,
                 tesorter_retained_te_keys=retained,
                 out_fa=rescued_fa,
                 min_len=args.tsd_min_len,
+                require_run_chars=req_chars,
+                base_min=args.nested_base_min,
+                flank_min=args.nested_flank_min,
             )
+
             print(f"[Step9] TSD rescue: rescued {n_rescued} candidates")
 
             # Merge TEsorter full-length + rescued into a single Kmer2LTR input
@@ -2282,12 +2403,6 @@ def main():
         min_retained_fraction=args.kmer2ltr_min_retained_fraction,
         domain_file=domain_arg,
     )
-
-
-    # Primary output #1 (in ./): dedup TSV
-    k2l_dedup_out = f"{out_prefix}_kmer2ltr_dedup"
-    print(f"[Step9b] deduping Kmer2LTR output -> {k2l_dedup_out}")
-    dedup_kmer2ltr_tsv(k2l_main, k2l_dedup_out, threshold=args.dedup_threshold)
 
     # Primary output #2 (in ./): dedupbed full-length FASTA
     k2l_dedup_out = f"{out_prefix}_kmer2ltr_dedup"

@@ -96,7 +96,7 @@ Needs benchmarked. It may be too strict to expect TEsoerter proteins on higher n
  Non-nest K2P    :	0.021463
  1-level nest K2P:	0.031816
  2-level nest K2P:	0.060179
-"""
+ """
 
 import argparse
 import os
@@ -1508,7 +1508,14 @@ def ensure_tesorter(tools_dir: Path) -> str:
 
     if not tool_usable_tesorter(te_dir):
         if not te_dir.exists():
-            run(["git", "clone", "https://github.com/cwb14/TEsorter.git", str(te_dir)], check=True)
+            run([
+                "git", "clone",
+                "--branch", "my-new-idea2",
+                "--single-branch",
+                "https://github.com/cwb14/TEsorter.git",
+                str(te_dir)
+            ], check=True)
+
         # Re-check after clone
         if not tool_usable_tesorter(te_dir):
             raise RuntimeError(
@@ -1516,7 +1523,8 @@ def ensure_tesorter(tools_dir: Path) -> str:
                 f"Try: PYTHONPATH={te_dir} python3 -m TEsorter -h"
             )
 
-    return str(te_dir)
+
+    return str(te_dir.resolve())
 
 def tool_usable_trfmod(bin_path: Path) -> bool:
     """
@@ -1560,7 +1568,8 @@ def ensure_trfmod(tools_dir: Path) -> str:
     return str(trf_bin)
 
 def run_tesorter(stitched_fa: str, tesorter_py_path: str, outdir: Path,
-                 db: str, cov: int, evalue: str, rule: str, threads: int) -> Tuple[str, str, str]:
+                 db: str, cov: int, evalue: str, rule: str, threads: int,
+                 pass2_classified_fasta: Optional[str] = None) -> Tuple[str, str, str]:
     """
     Runs TEsorter in outdir so outputs land in {prefix}.work/,
     but passes stitched_fa as an absolute path so it can be found.
@@ -1568,7 +1577,10 @@ def run_tesorter(stitched_fa: str, tesorter_py_path: str, outdir: Path,
     mkdirp(outdir)
 
     env = dict(os.environ)
-    env["PYTHONPATH"] = tesorter_py_path
+
+    te_abs = str(Path(tesorter_py_path).resolve())
+    env_py = env.get("PYTHONPATH", "")
+    env["PYTHONPATH"] = te_abs if not env_py else (te_abs + os.pathsep + env_py)
 
     stitched_fa_abs = str(Path(stitched_fa).resolve())  # <<< FIX
 
@@ -1582,6 +1594,13 @@ def run_tesorter(stitched_fa: str, tesorter_py_path: str, outdir: Path,
 #        "--no-cleanup",
         "-rule", str(rule),
     ]
+
+    if pass2_classified_fasta:
+        p2 = Path(pass2_classified_fasta).resolve()
+        if not p2.exists() or p2.stat().st_size == 0:
+            raise RuntimeError(f"--pass2-classified-fasta provided but missing/empty: {p2}")
+        cmd += ["--pass2-classified-fasta", str(p2)]
+
 
     r = subprocess.run(cmd, cwd=str(outdir), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env)
     if r.returncode != 0:
@@ -2135,6 +2154,13 @@ def main():
                     help="TEsorter pass2 rule (-rule)")
 
     ap.add_argument(
+        "--pass2-classified-fasta",
+        default=None,
+        help="Optional FASTA of previously-classified elements to augment TEsorter pass-2 database. "
+             "Headers must be like: >id#Order/Superfamily/Clade"
+    )
+
+    ap.add_argument(
         "--trf",
         dest="use_trf",
         action="store_true",
@@ -2522,6 +2548,7 @@ def main():
             evalue=args.tesorter_eval,
             rule=args.tesorter_rule,
             threads=args.threads,
+            pass2_classified_fasta=args.pass2_classified_fasta,
         )
 
         # Build FULL-LENGTH LTR-RT FASTA from genome + cls.tsv (Order == LTR)

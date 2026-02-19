@@ -9,6 +9,9 @@ NOTE: "--tesorter-tree" currently broken. To fix, we'd simply re-run TEsorter on
 
 # I could consider adding DeepTE or CREATE as an alternative to TEsorter although I need to check their speed and efficiency feasiblility. 
 
+# This script, 'ltrharvest3.py', differs from 'ltrharvest2.py' in that it adds option for TRF-finder and points to custom TEsorter where mmseq2 is used in place of blastn for 2-pass and custom libraries can also be input for 2-pass (useful for finding nested). 
+# Benchmarking shows 2-pass is important, but blastn is too slow on large datasets. Oddly though, the hmmsearch is slower with the custom TEsorter. Idk why. I use the same version of hmmsearch and same input files, but get slightly different result and slower hmm speed. 
+
 # Adds TRF-mod for hardmasking low-complexity sequence. 
 # LTR-RTs and their flanking sequence contain low-complexity sequence, thus masking will impact the result. 
 # Be conservative and only hardmask those with a high copy number. These are the ones that mostly bog down ltrharvest and can bottleneck the run. 
@@ -40,8 +43,7 @@ Benchmarking suggests including the gene protein file is a good idea while non-L
 # Combine #2 and #10. 
 # With real data, I suspect TEsorter is required since ltrharvest and ltrfinder parameters are selected to optimize specificity.
 # My PriNTE simulations do not test the impact of low-complexity repeats. 
-python ltrharvest.py --genome Athal.fa --proteins TAIR10.pep.fa.gz --threads 20 --out-prefix Athal_ltr --tsd-rescue --scn-min-ltr-len 100 --scn-min-ret-len 800 --scn-max-ret-len 15000 --scn-min-int-len 500 --scn-max-int-len 12000
-
+python ltrharvest.py --genome Athal.fa --proteins TAIR10.pep.fa.gz --threads 20 --out-prefix Athal_ltr --tsd-rescue --scn-min-ltr-len 100 --scn-min-ret-len 800 --scn-max-ret-len 15000 --scn-min-int-len 500 --scn-max-int-len 12000 --no-trf --size 500000 --overlap 15000 --tesorter-rule 70-70-80
  
 # Goldstandard
 perl EDTA/EDTA_raw.pl --genome Athal_chr1.fa --type ltr --threads 10

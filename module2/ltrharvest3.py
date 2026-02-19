@@ -80,7 +80,7 @@ python mask_ltr.py --features-fasta Osati_r1.ltrharvest.full_length.dedup.fa.rex
 # Round2: 1-level nesting.
 # Require LTR-RTs to contain runs of N (ie a nested LTR-RT)
 # Expand exceptable max LTR-RT lengths since theyre now nested. 
-python ltrharvest.py --require-run-chars N --genome Osati_r1.fa --proteins Osati.pep --threads 100 --out-prefix Osati_r2 --tsd-rescue --scn-min-ltr-len 100 --scn-min-ret-len 1000 --scn-max-ret-len 30000 --scn-min-int-len 500 --scn-max-int-len 28000 --ltrharvest-args '-mindistltr 100 -minlenltr 100 -maxlenltr 7000 -mintsd 0 -maxtsd 0 -similar 70 -vic 60 -seed 15 -seqids yes -xdrop 10 -maxdistltr 30000' --ltrfinder-args '-w 2 -C -D 30000 -d 100 -L 7000 -l 100 -p 20 -M 0.00 -S 0.0'
+python ltrharvest.py --require-run-chars N --genome Osati_r1.fa --proteins Osati.pep --threads 100 --out-prefix Osati_r2 --tsd-rescue --scn-min-ltr-len 100 --scn-min-ret-len 800 --scn-max-ret-len 30000 --scn-min-int-len 500 --scn-max-int-len 28000 --ltrharvest-args '-mindistltr 100 -minlenltr 100 -maxlenltr 7000 -mintsd 0 -maxtsd 0 -similar 70 -vic 60 -seed 15 -seqids yes -xdrop 10 -maxdistltr 30000' --ltrfinder-args '-w 2 -C -D 30000 -d 100 -L 7000 -l 100 -p 20 -M 0.00 -S 0.0' --no-trf --size 500000 --overlap 15000 --tesorter-rule 70-70-80 --pass2-classified-fasta Osati_r1.ltrharvest.full_length.dedup.fa.rexdb-plant.cls.lib.fa
 # Discovers 441 1-level nested LTR-RTs. 
 # 1-level LTR-RTs masked with N; 2-level LTR-RTs masked with R. Flanking sequence unmasked.
 python mask_ltr.py --features-fasta Osati_r2.ltrharvest.full_length.dedup.fa.rexdb-plant.cls.lib.fa --genome Osati.fa --feature-character R --far-character V --distance 15000 > Osati_r2.fa

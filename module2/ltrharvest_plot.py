@@ -10,7 +10,7 @@ Takes genome FAI and the dedup results of the FAI to plot LTR-RT annotation feat
 # Plot.
 python ltrharvest_plot.py --species Slati --aln-suffix _ltr_kmer2ltr_dedup --outpdf Slati_ltr.pdf --bin 100 --k2p-xmax 0.1 --legend-page --timing --k2p-mode hist
 # Cluster, and and plot family-level. 
-mmseqs easy-cluster Slati_ltr.ltrharvest.full_length.dedup.fa.rexdb-plant.cls.lib.fa ltr_808080 tmp_mmseqs --min-seq-id 0.8 -c 0.8 --cov-mode 5 --cluster-reassign 1 --threads 32 --seq-id-mode 1
+mmseqs easy-cluster Slati_ltr.ltrharvest.full_length.dedup.fa.rexdb-plant.cls.lib.fa ltr_808080 tmp_mmseqs --min-seq-id 0.8 -c 0.8 --cov-mode 1 --cluster-reassign 1 --threads 32 --seq-id-mode 1  --cluster-mode 2
 python ltrharvest_plot.py --species Slati --aln-suffix _ltr_kmer2ltr_dedup --outpdf Slati_ltr.pdf --bin 100 --k2p-xmax 0.1 --legend-page --timing --k2p-mode hist --mmseqs-tsv Slati_ltr_808080_cluster.tsv
 
 LTR-RT multi-page PDF plots across species.

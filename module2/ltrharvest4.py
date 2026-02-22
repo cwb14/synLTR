@@ -42,7 +42,7 @@ Benchmarking suggests including the gene protein file is a good idea while non-L
 # With real data, I suspect TEsorter is required since ltrharvest and ltrfinder parameters are selected to optimize specificity.
 # My PriNTE simulations do not test the impact of low-complexity repeats. 
 python ltrharvest.py --genome Athal.fa --proteins TAIR10.pep.fa.gz --threads 20 --out-prefix Athal_ltr --tsd-rescue --scn-min-ltr-len 100 --scn-min-ret-len 800 --scn-max-ret-len 15000 --scn-min-int-len 500 --scn-max-int-len 12000
-
+# Probably speed it up with a very conservative trf masking (strictly mono-, bi-, and tri- nucleotide repeats longer than some strict cutoffoff
  
 # Goldstandard
 perl EDTA/EDTA_raw.pl --genome Athal_chr1.fa --type ltr --threads 10

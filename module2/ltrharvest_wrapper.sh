@@ -24,10 +24,10 @@ set -euo pipefail
 GENOME=""
 PROTEINS=""
 TERMINATE_COUNT=100
-SCRIPT_PATH=""     # if empty: directory of this wrapper
+SCRIPT_PATH=""
 THREADS=20
 OUT_PREFIX="ltrs"
-
+RUN_TRF=false
 # ----------------------------
 # Helpers
 # ----------------------------
@@ -48,7 +48,7 @@ Optional:
   --script_path         Path containing ltrharvest4.py and mask_ltr.py (default: same dir as this script)
   --threads             Threads for ltrharvest4.py (default 20)
   --out_prefix          Output prefix (default ltrs)
-
+  --run-trf            Enable TRF instead of default --no-trf
 EOF
 }
 
@@ -94,6 +94,7 @@ while [[ $# -gt 0 ]]; do
     --script_path) SCRIPT_PATH="${2:-}"; shift 2;;
     --threads) THREADS="${2:-}"; shift 2;;
     --out_prefix) OUT_PREFIX="${2:-}"; shift 2;;
+    --run-trf) RUN_TRF=true; shift;;
     -h|--help) usage; exit 0;;
     *) die "Unknown argument: $1 (use --help)";;
   esac
@@ -152,7 +153,12 @@ LTRF_l=100
 LTRF_L=7000
 
 # Chunking / TE sorter / nesting params
-NO_TRF="--no-trf"
+# TRF behavior (default = no TRF)
+if [[ "$RUN_TRF" == true ]]; then
+  TRF_OPTS=(--trf --trf-args "-a 5 -b 30 -g 30 -G 1 -s 150 -p 10" --trf-min-copy 40)
+else
+  TRF_OPTS=(--no-trf)
+fi
 SIZE=500000
 TESORTER_RULE="75-80-80"
 TSD_PASS2="--tsd-pass2"
@@ -268,7 +274,7 @@ for (( round=1; round<=MAX_ROUNDS; round++ )); do
     --scn-max-int-len "$scn_max_int" \
     --ltrharvest-args "$ltrharvest_args" \
     --ltrfinder-args "$ltrfinder_args" \
-    $NO_TRF \
+    "${TRF_OPTS[@]}" \
     --size "$SIZE" \
     --overlap "$overlap" \
     --tesorter-rule "$TESORTER_RULE" \
@@ -327,3 +333,4 @@ done
 # Cleanup
 rm -f "$temp_lib" 2>/dev/null || true
 echo "Done."
+

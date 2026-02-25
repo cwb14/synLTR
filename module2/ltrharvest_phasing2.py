@@ -88,6 +88,8 @@ from sklearn.decomposition import PCA
 
 from statsmodels.stats.multitest import multipletests
 
+from pathlib import Path
+import json
 
 # -------------------------
 # FASTA parsing
@@ -887,7 +889,467 @@ def compute_window_enrichment(per_ltr_counts, ltrs, chrom_to_sg, n_sg,
 
     return window_rows
 
+# -------------------------
+# MMseqs cluster-based phasing (new)
+# -------------------------
 
+def run_mmseqs_easy_cluster(ltr_fasta, outdir_cluster, threads,
+                           min_seq_id=0.75, cov=0.8, cov_mode=1,
+                           cluster_reassign=1, seq_id_mode=1, cluster_mode=2,
+                           mmseqs_bin="mmseqs"):
+    """
+    Runs mmseqs easy-cluster and returns path to produced cluster.tsv.
+    Stores only the cluster TSV in outdir_cluster and deletes the large FASTAs.
+    """
+    outdir_cluster = Path(outdir_cluster)
+    outdir_cluster.mkdir(parents=True, exist_ok=True)
+
+    ltr_fasta = str(ltr_fasta)
+    base = Path(ltr_fasta).name
+    prefix = outdir_cluster / f"{base}_mmseqs"
+    tmpdir = outdir_cluster / f"{base}_mmseqs_tmp"
+
+    cmd = [
+        mmseqs_bin, "easy-cluster",
+        ltr_fasta,
+        str(prefix),
+        str(tmpdir),
+        "--min-seq-id", str(min_seq_id),
+        "-c", str(cov),
+        "--cov-mode", str(cov_mode),
+        "--cluster-reassign", str(cluster_reassign),
+        "--threads", str(threads),
+        "--seq-id-mode", str(seq_id_mode),
+        "--cluster-mode", str(cluster_mode),
+    ]
+    run(cmd)
+
+    # mmseqs output naming convention:
+    # {prefix}_cluster.tsv, {prefix}_all_seqs.fasta, {prefix}_rep_seq.fasta
+    cluster_tsv = str(prefix) + "_cluster.tsv"
+    all_fa = str(prefix) + "_all_seqs.fasta"
+    rep_fa = str(prefix) + "_rep_seq.fasta"
+
+    # delete big files if they exist
+    for p in (all_fa, rep_fa):
+        try:
+            os.remove(p)
+        except FileNotFoundError:
+            pass
+
+    if not os.path.exists(cluster_tsv):
+        raise RuntimeError(f"MMseqs finished but cluster TSV not found: {cluster_tsv}")
+
+    return cluster_tsv
+
+
+def parse_mmseqs_cluster_tsv(path):
+    """
+    Returns dict rep -> list(members). Includes rep itself if present.
+    """
+    clusters = defaultdict(list)
+    with open(path, "r", encoding="utf-8", errors="replace") as f:
+        for ln, raw in enumerate(f, 1):
+            line = raw.rstrip("\n")
+            if not line:
+                continue
+            parts = line.split("\t")
+            if len(parts) < 2:
+                parts = line.split()
+            if len(parts) < 2:
+                continue
+            rep, mem = parts[0], parts[1]
+            clusters[rep].append(mem)
+    return clusters
+
+
+def fisher_pair_enrichment_greater(a_count, b_count):
+    """
+    One-tailed Fisher exact (greater) on [[a, b], [0,0]] isn't valid.
+    For 2-chrom comparison inside a cluster, simplest robust test is:
+      table = [[a, b], [A_rest, B_rest]] requires a background.
+    But you explicitly want within-pair enrichment (a vs b) for the cluster.
+    For rock-solid and simple: use a binomial exact approximation is possible,
+    but we’ll stick to Fisher with a synthetic background derived from the same pair total:
+
+    table = [[a, b],
+             [b, a]]  (symmetric "null" baseline)
+    This is conservative for strong imbalances and avoids needing genome-wide background.
+    If you prefer a genome-wide background, tell me and I’ll swap it in.
+
+    Returns p-value.
+    """
+    # Symmetric table: if a >> b, OR>1 and p(greater) small.
+    return fisher_one_tailed_greater(a_count, b_count, b_count, a_count)
+
+
+def build_cluster_constraints(clusters, homoeolog_sets, allowed_chroms,
+                              q_thresh=0.01, min_cluster_size=5, min_pairs_per_cluster=2):
+    """
+    Assumes:
+      - N=2 subgenomes
+      - each homoeolog set is a pair (len==2)
+    For each cluster and each pair, call a significant "winner" via Fisher greater + BH,
+    then turn multi-pair clusters into parity constraints.
+
+    Returns:
+      edges: list of dicts {u,v,parity,weight,cluster,details}
+      stats: dict with counts
+    """
+    # enforce pairwise config
+    pairs = [tuple(s) for s in homoeolog_sets if len(s) == 2]
+    if not pairs:
+        raise RuntimeError("Cluster-phasing requires homoeolog_config pairs (2 columns per line).")
+
+    # cluster -> chrom counts
+    cluster_counts = {}
+    cluster_sizes = {}
+    for rep, members in clusters.items():
+        c = Counter()
+        n = 0
+        for mem in members:
+            meta = parse_ltr_header(mem)
+            chrom = meta["chrom"]
+            if chrom not in allowed_chroms:
+                continue
+            c[chrom] += 1
+            n += 1
+        cluster_counts[rep] = c
+        cluster_sizes[rep] = n
+
+    # collect pvals for all cluster×pair tests where there is an imbalance
+    tests = []  # (rep, a, b, winner, p)
+    for rep, c in cluster_counts.items():
+        n = cluster_sizes.get(rep, 0)
+        if n < min_cluster_size:
+            continue
+        for a, b in pairs:
+            ca = int(c.get(a, 0))
+            cb = int(c.get(b, 0))
+            if ca == cb:
+                continue
+            if ca > cb:
+                winner = a
+                p = fisher_pair_enrichment_greater(ca, cb)
+            else:
+                winner = b
+                p = fisher_pair_enrichment_greater(cb, ca)
+            tests.append((rep, a, b, winner, float(p)))
+
+    if not tests:
+        return [], {
+            "clusters_total": len(clusters),
+            "clusters_used": 0,
+            "tests": 0,
+            "significant_calls": 0,
+            "edges": 0,
+        }
+
+    pvals = np.array([t[4] for t in tests], dtype=np.float64)
+    _, qvals, _, _ = multipletests(pvals, alpha=q_thresh, method="fdr_bh")
+
+    # per cluster, collect significant winners by pair
+    sig_by_cluster = defaultdict(list)  # rep -> list of (a,b,winner,q,ca,cb)
+    for (rep, a, b, winner, p), q in zip(tests, qvals):
+        if q > q_thresh:
+            continue
+        c = cluster_counts[rep]
+        ca = int(c.get(a, 0))
+        cb = int(c.get(b, 0))
+        sig_by_cluster[rep].append((a, b, winner, float(q), ca, cb))
+
+    edges = []
+    for rep, calls in sig_by_cluster.items():
+        # require evidence across >=2 homoeolog pairs (your “useful cluster” definition)
+        if len(calls) < min_pairs_per_cluster:
+            continue
+
+        # winners should be same SG; encode constraints between winners as "same"
+        winners = [w for (_a, _b, w, _q, _ca, _cb) in calls]
+        # also add winner-opposite-loser constraints within each pair
+        for (a, b, winner, q, ca, cb) in calls:
+            loser = b if winner == a else a
+            # winner opposite loser => parity 1
+            edges.append({
+                "u": winner,
+                "v": loser,
+                "parity": 1,
+                "weight": -math.log10(max(q, 1e-300)),
+                "cluster": rep,
+                "details": {"pair": [a, b], "winner": winner, "q": q, "counts": [ca, cb]},
+            })
+
+        # connect all winners together as "same" (parity 0)
+        if len(winners) >= 2:
+            w0 = winners[0]
+            for wi in winners[1:]:
+                if wi == w0:
+                    continue
+                # parity 0
+                # weight = min support among the two calls involving each winner (conservative)
+                wq = []
+                for (a, b, winner, q, ca, cb) in calls:
+                    if winner == w0 or winner == wi:
+                        wq.append(q)
+                w = -math.log10(max(min(wq) if wq else 1e-2, 1e-300))
+                edges.append({
+                    "u": w0,
+                    "v": wi,
+                    "parity": 0,
+                    "weight": w,
+                    "cluster": rep,
+                    "details": {"type": "winner_same"},
+                })
+
+    stats = {
+        "clusters_total": len(clusters),
+        "clusters_used": sum(1 for rep, calls in sig_by_cluster.items() if len(calls) >= min_pairs_per_cluster),
+        "tests": len(tests),
+        "significant_calls": sum(len(v) for v in sig_by_cluster.values()),
+        "edges": len(edges),
+    }
+    return edges, stats
+
+
+def solve_parity_graph(chroms, edges):
+    """
+    2-coloring with parity constraints:
+      color[v] = color[u] XOR parity(u,v)
+    Returns:
+      color: dict chrom->0/1 (component-oriented)
+      comp_id: dict chrom->component int
+      conflicts: list of conflicting edges (dict)
+    """
+    adj = defaultdict(list)
+    for e in edges:
+        u, v, p = e["u"], e["v"], int(e["parity"])
+        adj[u].append((v, p, e))
+        adj[v].append((u, p, e))
+
+    color = {}
+    comp_id = {}
+    conflicts = []
+    cid = 0
+
+    for c in chroms:
+        if c in color:
+            continue
+        if c not in adj:
+            continue
+        color[c] = 0
+        comp_id[c] = cid
+        stack = [c]
+        while stack:
+            u = stack.pop()
+            for v, p, e in adj[u]:
+                want = color[u] ^ p
+                if v not in color:
+                    color[v] = want
+                    comp_id[v] = cid
+                    stack.append(v)
+                else:
+                    if color[v] != want:
+                        conflicts.append(e)
+        cid += 1
+
+    return color, comp_id, conflicts
+
+
+def write_cluster_phasing(outdir_cluster, chroms, color, comp_id, edges, conflicts):
+    """
+    Writes outdir_cluster/chromosome_phasing.tsv with support stats.
+    """
+    outdir_cluster = Path(outdir_cluster)
+    outdir_cluster.mkdir(parents=True, exist_ok=True)
+
+    # compute incident stats
+    incident = defaultdict(list)
+    for e in edges:
+        incident[e["u"]].append(e)
+        incident[e["v"]].append(e)
+
+    conflict_set = set(id(e) for e in conflicts)
+
+    rows = []
+    for c in chroms:
+        if c not in color:
+            rows.append({
+                "chromosome": c,
+                "subgenome": "NA",
+                "component_id": "NA",
+                "constraints_incident": 0,
+                "constraints_satisfied": 0,
+                "constraints_conflicting": 0,
+                "mean_support": "NA",
+            })
+            continue
+
+        inc = incident.get(c, [])
+        sat = 0
+        conf = 0
+        supports = []
+        for e in inc:
+            if id(e) in conflict_set:
+                conf += 1
+                continue
+            u, v, p = e["u"], e["v"], int(e["parity"])
+            if u in color and v in color and (color[u] ^ color[v]) == p:
+                sat += 1
+                supports.append(float(e.get("weight", 0.0)))
+
+        mean_support = (sum(supports) / len(supports)) if supports else float("nan")
+
+        rows.append({
+            "chromosome": c,
+            "subgenome": f"SG{color[c] + 1}",
+            "component_id": str(comp_id.get(c, "NA")),
+            "constraints_incident": len(inc),
+            "constraints_satisfied": sat,
+            "constraints_conflicting": conf,
+            "mean_support": (f"{mean_support:.3f}" if np.isfinite(mean_support) else "NA"),
+        })
+
+    out_path = outdir_cluster / "chromosome_phasing.tsv"
+    with open(out_path, "w", encoding="utf-8") as out:
+        out.write("chromosome\tsubgenome\tcomponent_id\tconstraints_incident\tconstraints_satisfied\tconstraints_conflicting\tmean_support\n")
+        for r in rows:
+            out.write(
+                f"{r['chromosome']}\t{r['subgenome']}\t{r['component_id']}\t"
+                f"{r['constraints_incident']}\t{r['constraints_satisfied']}\t{r['constraints_conflicting']}\t{r['mean_support']}\n"
+            )
+
+    # also write a small debug summary
+    dbg = outdir_cluster / "cluster_phasing_debug.json"
+    dbg_obj = {
+        "n_chromosomes": len(chroms),
+        "n_edges": len(edges),
+        "n_conflicts": len(conflicts),
+    }
+    with open(dbg, "w", encoding="utf-8") as out:
+        json.dump(dbg_obj, out, indent=2)
+
+    return str(out_path)
+
+def build_cluster_pair_constraints(clusters, homoeolog_sets, allowed_chroms,
+                                   q_thresh=0.001, min_cluster_size=10, min_pairs_per_cluster=2):
+    """
+    Build parity constraints on homoeolog PAIRS (variables), not chromosomes.
+
+    For each config pair i: (Ai, Bi), variable xi indicates which is SG1.
+      xi=0 => Ai SG1, Bi SG2
+      xi=1 => Ai SG2, Bi SG1
+
+    For a cluster with significant winner calls on >=2 pairs:
+      constraint between pair i and j:
+        xi XOR xj = wi XOR wj
+      where wi=0 if winner is Ai, wi=1 if winner is Bi
+    """
+    pairs = [tuple(s) for s in homoeolog_sets if len(s) == 2]
+    if not pairs:
+        raise RuntimeError("Cluster-phasing requires pairwise homoeolog_config (2 columns per line).")
+
+    # cluster -> chrom counts
+    cluster_counts = {}
+    cluster_sizes = {}
+    for rep, members in clusters.items():
+        c = Counter()
+        n = 0
+        for mem in members:
+            meta = parse_ltr_header(mem)
+            chrom = meta["chrom"]
+            if chrom not in allowed_chroms:
+                continue
+            c[chrom] += 1
+            n += 1
+        cluster_counts[rep] = c
+        cluster_sizes[rep] = n
+
+    # tests across all (cluster, pair)
+    tests = []  # (rep, pair_index, winner_side(0=A,1=B), p, ca, cb)
+    for rep, c in cluster_counts.items():
+        n = cluster_sizes.get(rep, 0)
+        if n < min_cluster_size:
+            continue
+
+        for i, (A, B) in enumerate(pairs):
+            ca = int(c.get(A, 0))
+            cb = int(c.get(B, 0))
+            if ca == cb:
+                continue
+            if ca > cb:
+                w = 0  # A winner
+                p = fisher_pair_enrichment_greater(ca, cb)
+            else:
+                w = 1  # B winner
+                p = fisher_pair_enrichment_greater(cb, ca)
+            tests.append((rep, i, w, float(p), ca, cb))
+
+    if not tests:
+        return [], {"clusters_total": len(clusters), "clusters_used": 0, "tests": 0, "sig_calls": 0, "edges": 0}
+
+    pvals = np.array([t[3] for t in tests], dtype=np.float64)
+    _, qvals, _, _ = multipletests(pvals, alpha=q_thresh, method="fdr_bh")
+
+    sig_by_cluster = defaultdict(list)  # rep -> list of (pair_i, w, q, ca, cb)
+    for (rep, i, w, p, ca, cb), q in zip(tests, qvals):
+        if q <= q_thresh:
+            sig_by_cluster[rep].append((i, w, float(q), int(ca), int(cb)))
+
+    edges = []
+    used = 0
+
+    for rep, calls in sig_by_cluster.items():
+        if len(calls) < min_pairs_per_cluster:
+            continue
+        used += 1
+
+        # pick a reference call (strongest q) to connect others to
+        calls_sorted = sorted(calls, key=lambda x: x[2])  # smaller q = stronger
+        i0, w0, q0, _, _ = calls_sorted[0]
+
+        for (ij, wj, qj, _, _) in calls_sorted[1:]:
+            parity = w0 ^ wj  # xi XOR xj
+            weight = -math.log10(max(min(q0, qj), 1e-300))
+            edges.append({
+                "u": i0,
+                "v": ij,
+                "parity": parity,
+                "weight": weight,
+                "cluster": rep,
+                "details": {"w0": w0, "wj": wj, "q0": q0, "qj": qj}
+            })
+
+    stats = {
+        "clusters_total": len(clusters),
+        "clusters_used": used,
+        "tests": len(tests),
+        "sig_calls": sum(len(v) for v in sig_by_cluster.values()),
+        "edges": len(edges),
+    }
+    return edges, stats
+
+
+def assign_chroms_from_pair_solution(hsets, pair_color):
+    """
+    pair_color[i] = xi in {0,1}
+    xi=0 => A SG1, B SG2
+    xi=1 => A SG2, B SG1
+    """
+    pairs = [tuple(s) for s in hsets if len(s) == 2]
+    chrom_to_sg = {}
+    for i, (A, B) in enumerate(pairs):
+        xi = pair_color.get(i, None)
+        if xi is None:
+            chrom_to_sg[A] = None
+            chrom_to_sg[B] = None
+            continue
+        if xi == 0:
+            chrom_to_sg[A] = 0
+            chrom_to_sg[B] = 1
+        else:
+            chrom_to_sg[A] = 1
+            chrom_to_sg[B] = 0
+    return chrom_to_sg  
 # -------------------------
 # Main
 # -------------------------
@@ -910,6 +1372,17 @@ def main():
     ap.add_argument("--exchange_q", type=float, default=0.05, help="BH q-value threshold for window exchange calls (default 0.05)")
     ap.add_argument("--min_ltrs_per_window", type=int, default=1, help="Min LTR count per window to report (default 1)")
 
+    # Cluster-based approach (MMseqs)
+    ap.add_argument("--run_cluster", action="store_true", help="Also run cluster-based phasing (mmseqs easy-cluster).")
+    ap.add_argument("--mmseqs_bin", default="mmseqs", help="mmseqs executable (default 'mmseqs')")
+    ap.add_argument("--cluster_min_seq_id", type=float, default=0.7)
+    ap.add_argument("--cluster_cov", type=float, default=0.3)
+    ap.add_argument("--cluster_q", type=float, default=0.01, help="BH q threshold for homoeolog-pair enrichment within clusters")
+    ap.add_argument("--cluster_min_size", type=int, default=5, help="Minimum cluster size to test")
+    ap.add_argument("--cluster_min_pairs", type=int, default=2, help="Minimum significant homoeolog pairs in a cluster to emit constraints")
+    ap.add_argument("--skip_kmer", action="store_true",
+                    help="Skip k-mer-based phasing and only run cluster-based approach.")
+
     ap.add_argument("-k", type=int, default=15, help="k-mer size (default 15)")
     ap.add_argument("--hash_size", default="100000000", help="jellyfish -s (default 100000000)")
     ap.add_argument("--dump_min", type=int, default=3, help="jellyfish dump -L (default 3)")
@@ -928,6 +1401,17 @@ def main():
     hsets = read_homoeolog_config(args.homoeolog_config)
     N = args.n_subgenomes if args.n_subgenomes > 0 else infer_n_subgenomes(hsets)
 
+    out_kmer = os.path.join(args.outdir, "kmer")
+    out_cluster = os.path.join(args.outdir, "cluster")
+    os.makedirs(out_kmer, exist_ok=True)
+    os.makedirs(out_cluster, exist_ok=True)
+
+    # Only process chromosomes that appear in the config file
+    allowed_chroms = set()
+    for s in hsets:
+        for c in s:
+            allowed_chroms.add(c)
+
     if args.window_step <= 0:
         args.window_step = args.window_size
     if args.window_step != args.window_size:
@@ -943,6 +1427,7 @@ def main():
         print(f"[INFO] Loaded K2P for {len(k2p_map)} LTRs from {args.k2p_file}", file=sys.stderr)
 
     tmp = tempfile.mkdtemp(prefix="ltr_subphaser_")
+    run_kmer = not args.skip_kmer
     try:
         chrom_fastas = {}
         chrom_to_handle = {}
@@ -956,16 +1441,23 @@ def main():
             return chrom_to_handle[chrom]
 
         ltrs = []  # (header, seq, meta)
+        skipped_ltrs = 0
         for header, seq in fasta_iter(args.ltr_fasta):
             meta = parse_ltr_header(header)
             chrom = meta["chrom"]
+
+            # Skip chromosomes/scaffolds/contigs not present in config
+            if chrom not in allowed_chroms:
+                skipped_ltrs += 1
+                continue
+
             h = get_handle(chrom)
             h.write(f">{header}\n")
             for i in range(0, len(seq), 80):
                 h.write(seq[i:i + 80] + "\n")
             chrom_seen.add(chrom)
             ltrs.append((header, seq, meta))
-
+            
         for h in chrom_to_handle.values():
             h.close()
 
@@ -974,296 +1466,378 @@ def main():
             raise RuntimeError("Need >=2 chromosomes (from headers) to phase.")
 
         # Jellyfish per chromosome (parallel)
-        kmer_counts_by_chrom = {}
-        col_totals = {}
+        if run_kmer:
+            kmer_counts_by_chrom = {}
+            col_totals = {}
 
-        def do_one(chrom):
-            fa = chrom_fastas[chrom]
-            out_prefix = os.path.join(tmp, f"{chrom}.k{args.k}")
-            dump = jellyfish_count_and_dump(
-                fasta_path=fa,
-                out_prefix=out_prefix,
-                k=args.k,
-                hash_size=args.hash_size,
-                dump_min=args.dump_min,
-                canonical=True,
+            def do_one(chrom):
+                fa = chrom_fastas[chrom]
+                out_prefix = os.path.join(tmp, f"{chrom}.k{args.k}")
+                dump = jellyfish_count_and_dump(
+                    fasta_path=fa,
+                    out_prefix=out_prefix,
+                    k=args.k,
+                    hash_size=args.hash_size,
+                    dump_min=args.dump_min,
+                    canonical=True,
+                )
+                d, total = parse_jellyfish_dump(dump)
+                return chrom, d, total
+
+            with ThreadPoolExecutor(max_workers=max(1, args.threads)) as ex:
+                futs = [ex.submit(do_one, c) for c in chroms]
+                for fu in as_completed(futs):
+                    chrom, d, total = fu.result()
+                    kmer_counts_by_chrom[chrom] = d
+                    col_totals[chrom] = total
+
+            # Build count matrix, M0 ratios
+            counts, kmer_list, col_sums, row_sums = build_sparse_count_matrix(kmer_counts_by_chrom, chroms)
+            M0 = compute_ratio_matrix(counts, col_sums)
+
+            # Differential kmers
+            mask = differential_kmer_mask(M0, row_sums, chroms, hsets, ratio_f=args.ratio_f, q_min=args.q_min)
+            diff_idx = np.where(mask)[0].astype(np.int64)
+            if diff_idx.size == 0:
+                raise RuntimeError(
+                    "No differential k-mers found. Consider lowering --q_min or --ratio_f, or --dump_min."
+                )
+
+            diff_kmers_path = os.path.join(args.outdir, "differential_kmers.txt")
+            with open(diff_kmers_path, "w", encoding="utf-8") as out:
+                for i in diff_idx:
+                    out.write(kmer_list[int(i)] + "\n")
+
+            # M1 (Z-scaled) on differential kmers only
+            M0_diff = M0[diff_idx, :].toarray().astype(np.float32)
+            M1 = zscale_rows_dense(M0_diff).astype(np.float32)
+
+            # KMeans + bootstrap
+            labels, stability = kmeans_with_bootstrap(
+                M1, n_clusters=N, seed=args.seed, boot_frac=args.boot_frac, boot_reps=args.boot_reps
             )
-            d, total = parse_jellyfish_dump(dump)
-            return chrom, d, total
 
-        with ThreadPoolExecutor(max_workers=max(1, args.threads)) as ex:
-            futs = [ex.submit(do_one, c) for c in chroms]
-            for fu in as_completed(futs):
-                chrom, d, total = fu.result()
-                kmer_counts_by_chrom[chrom] = d
-                col_totals[chrom] = total
+            # Outputs: chromosome phasing
+            chrom_tsv = os.path.join(args.outdir, "chromosome_phasing.tsv")
+            with open(chrom_tsv, "w", encoding="utf-8") as out:
+                out.write("chromosome\tsubgenome\tbootstrap_percent\tltr_kmer_total\n")
+                for j, c in enumerate(chroms):
+                    out.write(f"{c}\tSG{int(labels[j])+1}\t{stability[j]:.2f}\t{int(col_sums[j])}\n")
 
-        # Build count matrix, M0 ratios
-        counts, kmer_list, col_sums, row_sums = build_sparse_count_matrix(kmer_counts_by_chrom, chroms)
-        M0 = compute_ratio_matrix(counts, col_sums)
+            # PCA + heatmap
+            save_pca_pdf(M1, chroms, labels, os.path.join(args.outdir, "pca_chromosomes.pdf"))
+            save_heatmap_pdf(M1, chroms, os.path.join(args.outdir, "heatmap_differential_kmers.pdf"), seed=args.seed)
 
-        # Differential kmers
-        mask = differential_kmer_mask(M0, row_sums, chroms, hsets, ratio_f=args.ratio_f, q_min=args.q_min)
-        diff_idx = np.where(mask)[0].astype(np.int64)
-        if diff_idx.size == 0:
-            raise RuntimeError(
-                "No differential k-mers found. Consider lowering --q_min or --ratio_f, or --dump_min."
+            # Subgenome-specific kmers
+            sg_specific_idx = call_subgenome_specific_kmers(
+                M0_csc=M0,
+                diff_idx=diff_idx,
+                chroms=chroms,
+                chrom_labels=labels,
+                p_thresh=args.specific_p,
+                test="ttest",
             )
 
-        diff_kmers_path = os.path.join(args.outdir, "differential_kmers.txt")
-        with open(diff_kmers_path, "w", encoding="utf-8") as out:
-            for i in diff_idx:
-                out.write(kmer_list[int(i)] + "\n")
-
-        # M1 (Z-scaled) on differential kmers only
-        M0_diff = M0[diff_idx, :].toarray().astype(np.float32)
-        M1 = zscale_rows_dense(M0_diff).astype(np.float32)
-
-        # KMeans + bootstrap
-        labels, stability = kmeans_with_bootstrap(
-            M1, n_clusters=N, seed=args.seed, boot_frac=args.boot_frac, boot_reps=args.boot_reps
-        )
-
-        # Outputs: chromosome phasing
-        chrom_tsv = os.path.join(args.outdir, "chromosome_phasing.tsv")
-        with open(chrom_tsv, "w", encoding="utf-8") as out:
-            out.write("chromosome\tsubgenome\tbootstrap_percent\tltr_kmer_total\n")
-            for j, c in enumerate(chroms):
-                out.write(f"{c}\tSG{int(labels[j])+1}\t{stability[j]:.2f}\t{int(col_sums[j])}\n")
-
-        # PCA + heatmap
-        save_pca_pdf(M1, chroms, labels, os.path.join(args.outdir, "pca_chromosomes.pdf"))
-        save_heatmap_pdf(M1, chroms, os.path.join(args.outdir, "heatmap_differential_kmers.pdf"), seed=args.seed)
-
-        # Subgenome-specific kmers
-        sg_specific_idx = call_subgenome_specific_kmers(
-            M0_csc=M0,
-            diff_idx=diff_idx,
-            chroms=chroms,
-            chrom_labels=labels,
-            p_thresh=args.specific_p,
-            test="ttest",
-        )
-
-        sg_kmer_sets = []
-        for sg in range(N):
-            kmers = set(kmer_list[i] for i in sg_specific_idx.get(sg, set()))
-            sg_kmer_sets.append(kmers)
-            outp = os.path.join(args.outdir, f"subgenome_specific_kmers.SG{sg+1}.txt")
-            with open(outp, "w", encoding="utf-8") as out:
-                for kmer in sorted(kmers):
-                    out.write(kmer + "\n")
-
-        # Enrichment per LTR (Fisher one-tailed + BH)
-        chrom_to_sg = {c: int(labels[i]) for i, c in enumerate(chroms)}
-
-        all_tests = []          # (ltr_i, sg, pval)
-        per_ltr_counts = []     # (hits_by_sg, total_k)
-        for i, (header, seq, meta) in enumerate(ltrs):
-            hits, total_k = ltr_kmer_hits(seq, args.k, sg_kmer_sets)
-            per_ltr_counts.append((hits, total_k))
-
-        bg_hits_by_sg = np.zeros(N, dtype=np.int64)
-        bg_total = 0
-        for hits, total_k in per_ltr_counts:
-            bg_total += total_k
+            sg_kmer_sets = []
             for sg in range(N):
-                bg_hits_by_sg[sg] += hits[sg]
+                kmers = set(kmer_list[i] for i in sg_specific_idx.get(sg, set()))
+                sg_kmer_sets.append(kmers)
+                outp = os.path.join(args.outdir, f"subgenome_specific_kmers.SG{sg+1}.txt")
+                with open(outp, "w", encoding="utf-8") as out:
+                    for kmer in sorted(kmers):
+                        out.write(kmer + "\n")
 
-        for i, (hits, total_k) in enumerate(per_ltr_counts):
-            for sg in range(N):
-                c00 = hits[sg]
-                c01 = total_k - hits[sg]
-                c10 = int(bg_hits_by_sg[sg] - hits[sg])
-                c11 = int((bg_total - total_k) - (bg_hits_by_sg[sg] - hits[sg]))
-                if total_k == 0 or (c00 + c01 + c10 + c11) <= 0:
-                    p = 1.0
-                else:
-                    p = fisher_one_tailed_greater(c00, c01, c10, c11)
-                all_tests.append((i, sg, p))
+            # Enrichment per LTR (Fisher one-tailed + BH)
+            chrom_to_sg = {c: int(labels[i]) for i, c in enumerate(chroms)}
 
-        pvals = np.array([x[2] for x in all_tests], dtype=np.float64)
-        _, qvals, _, _ = multipletests(pvals, alpha=args.enrich_p, method="fdr_bh")
-
-        # Collate per LTR results (+K2P)
-        ltr_out = os.path.join(args.outdir, "ltr_enrichment_and_age.tsv")
-        with open(ltr_out, "w", encoding="utf-8") as out:
-            out.write(
-                "ltr_id\tchrom\tstart\tend\tclass\tsuperfamily\tfamily\tchrom_subgenome\t"
-                "enriched_subgenomes\tbest_enriched_subgenome\tbest_q\t"
-                "hits_by_sg\ttotal_kmers\tcategory\tk2p\n"
-            )
-
-            q_by = defaultdict(dict)
-            for (i, sg, _p), q in zip(all_tests, qvals):
-                q_by[i][sg] = q
-
-            # We'll also collect K2P values for density plot
-            k2p_pre = []
-            k2p_post = []
-
+            all_tests = []          # (ltr_i, sg, pval)
+            per_ltr_counts = []     # (hits_by_sg, total_k)
             for i, (header, seq, meta) in enumerate(ltrs):
-                chrom = meta["chrom"]
-                chrom_sg = chrom_to_sg.get(chrom, None)
-                chrom_sg_str = f"SG{chrom_sg+1}" if chrom_sg is not None else "NA"
+                hits, total_k = ltr_kmer_hits(seq, args.k, sg_kmer_sets)
+                per_ltr_counts.append((hits, total_k))
 
-                hits, total_k = per_ltr_counts[i]
-                qs = [q_by[i].get(sg, 1.0) for sg in range(N)]
-                enriched = [sg for sg in range(N) if qs[sg] <= args.enrich_p]
+            bg_hits_by_sg = np.zeros(N, dtype=np.int64)
+            bg_total = 0
+            for hits, total_k in per_ltr_counts:
+                bg_total += total_k
+                for sg in range(N):
+                    bg_hits_by_sg[sg] += hits[sg]
 
-                best_sg = None
-                best_q = 1.0
-                if enriched:
-                    best_sg = min(enriched, key=lambda sg: (qs[sg], -hits[sg]))
-                    best_q = qs[best_sg]
-
-                enriched_str = ",".join([f"SG{sg+1}" for sg in enriched]) if enriched else ""
-                best_str = f"SG{best_sg+1}" if best_sg is not None else ""
-
-                if chrom_sg is None:
-                    if len(enriched) == 1:
-                        category = "ambiguous"
+            for i, (hits, total_k) in enumerate(per_ltr_counts):
+                for sg in range(N):
+                    c00 = hits[sg]
+                    c01 = total_k - hits[sg]
+                    c10 = int(bg_hits_by_sg[sg] - hits[sg])
+                    c11 = int((bg_total - total_k) - (bg_hits_by_sg[sg] - hits[sg]))
+                    if total_k == 0 or (c00 + c01 + c10 + c11) <= 0:
+                        p = 1.0
                     else:
-                        category = "post_polyploid"
+                        p = fisher_one_tailed_greater(c00, c01, c10, c11)
+                    all_tests.append((i, sg, p))
+
+            pvals = np.array([x[2] for x in all_tests], dtype=np.float64)
+            _, qvals, _, _ = multipletests(pvals, alpha=args.enrich_p, method="fdr_bh")
+
+            # Collate per LTR results (+K2P)
+            ltr_out = os.path.join(args.outdir, "ltr_enrichment_and_age.tsv")
+            with open(ltr_out, "w", encoding="utf-8") as out:
+                out.write(
+                    "ltr_id\tchrom\tstart\tend\tclass\tsuperfamily\tfamily\tchrom_subgenome\t"
+                    "enriched_subgenomes\tbest_enriched_subgenome\tbest_q\t"
+                    "hits_by_sg\ttotal_kmers\tcategory\tk2p\n"
+                )
+
+                q_by = defaultdict(dict)
+                for (i, sg, _p), q in zip(all_tests, qvals):
+                    q_by[i][sg] = q
+
+                # We'll also collect K2P values for density plot
+                k2p_pre = []
+                k2p_post = []
+
+                for i, (header, seq, meta) in enumerate(ltrs):
+                    chrom = meta["chrom"]
+                    chrom_sg = chrom_to_sg.get(chrom, None)
+                    chrom_sg_str = f"SG{chrom_sg+1}" if chrom_sg is not None else "NA"
+
+                    hits, total_k = per_ltr_counts[i]
+                    qs = [q_by[i].get(sg, 1.0) for sg in range(N)]
+                    enriched = [sg for sg in range(N) if qs[sg] <= args.enrich_p]
+
+                    best_sg = None
+                    best_q = 1.0
+                    if enriched:
+                        best_sg = min(enriched, key=lambda sg: (qs[sg], -hits[sg]))
+                        best_q = qs[best_sg]
+
+                    enriched_str = ",".join([f"SG{sg+1}" for sg in enriched]) if enriched else ""
+                    best_str = f"SG{best_sg+1}" if best_sg is not None else ""
+
+                    if chrom_sg is None:
+                        if len(enriched) == 1:
+                            category = "ambiguous"
+                        else:
+                            category = "post_polyploid"
+                    else:
+                        if len(enriched) == 1 and best_sg == chrom_sg:
+                            category = "pre_polyploid"
+                        else:
+                            category = "post_polyploid"
+
+                    k2p = k2p_map.get(header, float("nan"))
+
+                    # collect for density plot (only pre vs post, ignore ambiguous)
+                    if np.isfinite(k2p):
+                        if category == "pre_polyploid":
+                            k2p_pre.append(k2p)
+                        elif category == "post_polyploid":
+                            k2p_post.append(k2p)
+
+                    out.write(
+                        f"{header}\t{chrom}\t{meta['start']}\t{meta['end']}\t{meta['klass']}\t{meta['superfamily']}\t{meta['family']}\t"
+                        f"{chrom_sg_str}\t{enriched_str}\t{best_str}\t{best_q:.3g}\t"
+                        f"{','.join(str(x) for x in hits)}\t{total_k}\t{category}\t"
+                        f"{k2p if np.isfinite(k2p) else 'NA'}\n"
+                    )
+
+            # Density bins PDF (pre vs post) if we have a K2P file
+            if args.k2p_file:
+                pdf_out = os.path.join(args.outdir, "k2p_density_pre_vs_post.pdf")
+                save_k2p_binned_density_pdf(
+                    k2p_pre=k2p_pre,
+                    k2p_post=k2p_post,
+                    out_pdf=pdf_out,
+                    bin_size=args.k2p_bin,
+                    title=f"K2P binned density (bin={args.k2p_bin})",
+                )
+
+            # -------------------------
+            # Window exchange scan (new)
+            # -------------------------
+            window_rows = compute_window_enrichment(
+                per_ltr_counts=per_ltr_counts,
+                ltrs=ltrs,
+                chrom_to_sg=chrom_to_sg,
+                n_sg=N,
+                window_size=args.window_size,
+                enrich_q=args.exchange_q,
+            )
+
+            # Write window_enrichment.tsv
+            win_out = os.path.join(args.outdir, "window_enrichment.tsv")
+            with open(win_out, "w", encoding="utf-8") as out:
+                out.write(
+                    "chrom\twindow_start\twindow_end\tchrom_subgenome\tltr_count\t"
+                    "total_kmers\thits_by_sg\tenriched_subgenomes\tbest_enriched_subgenome\tbest_q\t"
+                    "significant\tmismatch\n"
+                )
+                for w in window_rows:
+                    if w["ltr_count"] < args.min_ltrs_per_window:
+                        continue
+                    chrom_sg = w["chrom_sg"]
+                    chrom_sg_str = f"SG{chrom_sg+1}" if chrom_sg is not None else "NA"
+                    enriched_str = ",".join([f"SG{sg+1}" for sg in w["enriched_sgs"]]) if w["enriched_sgs"] else ""
+                    best_str = f"SG{w['best_sg']+1}" if w["best_sg"] is not None else ""
+                    hits_str = ",".join(str(int(w["hits_by_sg"][sg])) for sg in range(N))
+                    out.write(
+                        f"{w['chrom']}\t{w['start']}\t{w['end']}\t{chrom_sg_str}\t{w['ltr_count']}\t"
+                        f"{w['total_kmers']}\t{hits_str}\t{enriched_str}\t{best_str}\t{w['best_q']:.3g}\t"
+                        f"{1 if w['significant'] else 0}\t{1 if w['mismatch'] else 0}\n"
+                    )
+
+            # Write window_exchange_candidates.tsv
+            exch_out = os.path.join(args.outdir, "window_exchange_candidates.tsv")
+            n_exch = 0
+            with open(exch_out, "w", encoding="utf-8") as out:
+                out.write(
+                    "chrom\twindow_start\twindow_end\tchrom_subgenome\tbest_enriched_subgenome\tbest_q\t"
+                    "ltr_count\ttotal_kmers\thits_by_sg\tenriched_subgenomes\n"
+                )
+                for w in window_rows:
+                    if w["ltr_count"] < args.min_ltrs_per_window:
+                        continue
+                    if not (w["significant"] and w["mismatch"]):
+                        continue
+                    chrom_sg = w["chrom_sg"]
+                    chrom_sg_str = f"SG{chrom_sg+1}" if chrom_sg is not None else "NA"
+                    best_str = f"SG{w['best_sg']+1}" if w["best_sg"] is not None else ""
+                    enriched_str = ",".join([f"SG{sg+1}" for sg in w["enriched_sgs"]]) if w["enriched_sgs"] else ""
+                    hits_str = ",".join(str(int(w["hits_by_sg"][sg])) for sg in range(N))
+                    out.write(
+                        f"{w['chrom']}\t{w['start']}\t{w['end']}\t{chrom_sg_str}\t{best_str}\t{w['best_q']:.3g}\t"
+                        f"{w['ltr_count']}\t{w['total_kmers']}\t{hits_str}\t{enriched_str}\n"
+                    )
+                    n_exch += 1
+
+            # -------------------------
+            # Optional chromosome painting (new)
+            # -------------------------
+            if args.genome_fai:
+                chrom_lengths = read_fai_lengths(args.genome_fai)
+                if not chrom_lengths:
+                    print(f"[WARN] genome_fai provided but no lengths parsed: {args.genome_fai}", file=sys.stderr)
                 else:
-                    if len(enriched) == 1 and best_sg == chrom_sg:
-                        category = "pre_polyploid"
-                    else:
-                        category = "post_polyploid"
+                    # Prefer plotting in the same chrom order as phasing output, but keep only those present in FAI.
+                    chrom_order = [c for c in chroms if c in chrom_lengths]
+                    # include other FAI chroms that have any window rows
+                    w_chroms = sorted({w["chrom"] for w in window_rows if w["chrom"] in chrom_lengths})
+                    for c in w_chroms:
+                        if c not in chrom_order:
+                            chrom_order.append(c)
 
-                k2p = k2p_map.get(header, float("nan"))
-
-                # collect for density plot (only pre vs post, ignore ambiguous)
-                if np.isfinite(k2p):
-                    if category == "pre_polyploid":
-                        k2p_pre.append(k2p)
-                    elif category == "post_polyploid":
-                        k2p_post.append(k2p)
-
-                out.write(
-                    f"{header}\t{chrom}\t{meta['start']}\t{meta['end']}\t{meta['klass']}\t{meta['superfamily']}\t{meta['family']}\t"
-                    f"{chrom_sg_str}\t{enriched_str}\t{best_str}\t{best_q:.3g}\t"
-                    f"{','.join(str(x) for x in hits)}\t{total_k}\t{category}\t"
-                    f"{k2p if np.isfinite(k2p) else 'NA'}\n"
-                )
-
-        # Density bins PDF (pre vs post) if we have a K2P file
-        if args.k2p_file:
-            pdf_out = os.path.join(args.outdir, "k2p_density_pre_vs_post.pdf")
-            save_k2p_binned_density_pdf(
-                k2p_pre=k2p_pre,
-                k2p_post=k2p_post,
-                out_pdf=pdf_out,
-                bin_size=args.k2p_bin,
-                title=f"K2P binned density (bin={args.k2p_bin})",
-            )
-
-        # -------------------------
-        # Window exchange scan (new)
-        # -------------------------
-        window_rows = compute_window_enrichment(
-            per_ltr_counts=per_ltr_counts,
-            ltrs=ltrs,
-            chrom_to_sg=chrom_to_sg,
-            n_sg=N,
-            window_size=args.window_size,
-            enrich_q=args.exchange_q,
-        )
-
-        # Write window_enrichment.tsv
-        win_out = os.path.join(args.outdir, "window_enrichment.tsv")
-        with open(win_out, "w", encoding="utf-8") as out:
-            out.write(
-                "chrom\twindow_start\twindow_end\tchrom_subgenome\tltr_count\t"
-                "total_kmers\thits_by_sg\tenriched_subgenomes\tbest_enriched_subgenome\tbest_q\t"
-                "significant\tmismatch\n"
-            )
-            for w in window_rows:
-                if w["ltr_count"] < args.min_ltrs_per_window:
-                    continue
-                chrom_sg = w["chrom_sg"]
-                chrom_sg_str = f"SG{chrom_sg+1}" if chrom_sg is not None else "NA"
-                enriched_str = ",".join([f"SG{sg+1}" for sg in w["enriched_sgs"]]) if w["enriched_sgs"] else ""
-                best_str = f"SG{w['best_sg']+1}" if w["best_sg"] is not None else ""
-                hits_str = ",".join(str(int(w["hits_by_sg"][sg])) for sg in range(N))
-                out.write(
-                    f"{w['chrom']}\t{w['start']}\t{w['end']}\t{chrom_sg_str}\t{w['ltr_count']}\t"
-                    f"{w['total_kmers']}\t{hits_str}\t{enriched_str}\t{best_str}\t{w['best_q']:.3g}\t"
-                    f"{1 if w['significant'] else 0}\t{1 if w['mismatch'] else 0}\n"
-                )
-
-        # Write window_exchange_candidates.tsv
-        exch_out = os.path.join(args.outdir, "window_exchange_candidates.tsv")
-        n_exch = 0
-        with open(exch_out, "w", encoding="utf-8") as out:
-            out.write(
-                "chrom\twindow_start\twindow_end\tchrom_subgenome\tbest_enriched_subgenome\tbest_q\t"
-                "ltr_count\ttotal_kmers\thits_by_sg\tenriched_subgenomes\n"
-            )
-            for w in window_rows:
-                if w["ltr_count"] < args.min_ltrs_per_window:
-                    continue
-                if not (w["significant"] and w["mismatch"]):
-                    continue
-                chrom_sg = w["chrom_sg"]
-                chrom_sg_str = f"SG{chrom_sg+1}" if chrom_sg is not None else "NA"
-                best_str = f"SG{w['best_sg']+1}" if w["best_sg"] is not None else ""
-                enriched_str = ",".join([f"SG{sg+1}" for sg in w["enriched_sgs"]]) if w["enriched_sgs"] else ""
-                hits_str = ",".join(str(int(w["hits_by_sg"][sg])) for sg in range(N))
-                out.write(
-                    f"{w['chrom']}\t{w['start']}\t{w['end']}\t{chrom_sg_str}\t{best_str}\t{w['best_q']:.3g}\t"
-                    f"{w['ltr_count']}\t{w['total_kmers']}\t{hits_str}\t{enriched_str}\n"
-                )
-                n_exch += 1
-
-        # -------------------------
-        # Optional chromosome painting (new)
-        # -------------------------
-        if args.genome_fai:
-            chrom_lengths = read_fai_lengths(args.genome_fai)
-            if not chrom_lengths:
-                print(f"[WARN] genome_fai provided but no lengths parsed: {args.genome_fai}", file=sys.stderr)
+                    paint_name = args.paint_pdf.strip() if args.paint_pdf.strip() else "chromosome_painting_exchanges.pdf"
+                    paint_pdf = os.path.join(args.outdir, paint_name)
+                    save_chromosome_painting_pdf(
+                        chrom_lengths=chrom_lengths,
+                        chrom_order=chrom_order,
+                        chrom_sg_map=chrom_to_sg,
+                        windows=window_rows,
+                        n_sg=N,
+                        out_pdf=paint_pdf,
+                        window_size=args.window_size,
+                        title="Chromosome painting: SG assignment + exchange candidate windows",
+                    )
             else:
-                # Prefer plotting in the same chrom order as phasing output, but keep only those present in FAI.
-                chrom_order = [c for c in chroms if c in chrom_lengths]
-                # include other FAI chroms that have any window rows
-                w_chroms = sorted({w["chrom"] for w in window_rows if w["chrom"] in chrom_lengths})
-                for c in w_chroms:
-                    if c not in chrom_order:
-                        chrom_order.append(c)
+                # If no FAI, we still can infer lengths (useful for sanity), but we won't plot.
+                _ = infer_chrom_lengths_from_ltrs(ltrs)
 
-                paint_name = args.paint_pdf.strip() if args.paint_pdf.strip() else "chromosome_painting_exchanges.pdf"
-                paint_pdf = os.path.join(args.outdir, paint_name)
-                save_chromosome_painting_pdf(
-                    chrom_lengths=chrom_lengths,
-                    chrom_order=chrom_order,
-                    chrom_sg_map=chrom_to_sg,
-                    windows=window_rows,
-                    n_sg=N,
-                    out_pdf=paint_pdf,
-                    window_size=args.window_size,
-                    title="Chromosome painting: SG assignment + exchange candidate windows",
+
+
+
+
+
+        # -------------------------
+        # Cluster-based phasing (new, optional)
+        # -------------------------
+        if args.run_cluster:
+            # NOTE: cluster logic currently assumes N=2 and pairwise homoeolog sets.
+            if N != 2:
+                print(f"[WARN] Cluster-based phasing currently implemented for N=2; inferred N={N}. Skipping.",
+                      file=sys.stderr)
+            else:
+                print("[INFO] Running MMseqs easy-cluster for cluster-based phasing...", file=sys.stderr)
+
+                cluster_tsv = run_mmseqs_easy_cluster(
+                    ltr_fasta=args.ltr_fasta,
+                    outdir_cluster=out_cluster,
+                    threads=args.threads,
+                    min_seq_id=args.cluster_min_seq_id,
+                    cov=args.cluster_cov,
+                    mmseqs_bin=args.mmseqs_bin,
                 )
-        else:
-            # If no FAI, we still can infer lengths (useful for sanity), but we won't plot.
-            _ = infer_chrom_lengths_from_ltrs(ltrs)
+
+                # parse clusters
+                clusters = parse_mmseqs_cluster_tsv(cluster_tsv)
+
+                pair_edges, stats = build_cluster_pair_constraints(
+                    clusters=clusters,
+                    homoeolog_sets=hsets,
+                    allowed_chroms=allowed_chroms,
+                    q_thresh=args.cluster_q,
+                    min_cluster_size=args.cluster_min_size,
+                    min_pairs_per_cluster=args.cluster_min_pairs,
+                )
+
+                # Solve on pair indices (0..num_pairs-1)
+                pairs = [tuple(s) for s in hsets if len(s) == 2]
+                pair_nodes = list(range(len(pairs)))
+
+                pair_color, pair_comp, conflicts = solve_parity_graph(pair_nodes, pair_edges)
+
+                chrom_to_sg = assign_chroms_from_pair_solution(hsets, pair_color)
+
+                # write chromosome_phasing.tsv in cluster/
+                out_path = os.path.join(out_cluster, "chromosome_phasing.tsv")
+                with open(out_path, "w", encoding="utf-8") as out:
+                    out.write("chromosome\tsubgenome\tpair_id\tcomponent_id\tconstraints_conflicting\n")
+                    for i, (A, B) in enumerate(pairs):
+                        xi = pair_color.get(i, None)
+                        cid = pair_comp.get(i, "NA")
+                        conf_n = sum(1 for e in conflicts if (e["u"] == i or e["v"] == i))
+                        if xi is None:
+                            out.write(f"{A}\tNA\t{i}\t{cid}\t{conf_n}\n")
+                            out.write(f"{B}\tNA\t{i}\t{cid}\t{conf_n}\n")
+                        else:
+                            sgA = "SG1" if chrom_to_sg[A] == 0 else "SG2"
+                            sgB = "SG1" if chrom_to_sg[B] == 0 else "SG2"
+                            out.write(f"{A}\t{sgA}\t{i}\t{cid}\t{conf_n}\n")
+                            out.write(f"{B}\t{sgB}\t{i}\t{cid}\t{conf_n}\n")
+            
+                # Write a concise run summary
+                with open(os.path.join(out_cluster, "run_summary.txt"), "w", encoding="utf-8") as out:
+                    out.write("Cluster-based phasing summary\n")
+                    for k, v in stats.items():
+                        out.write(f"{k}\t{v}\n")
+                    out.write(f"conflicts\t{len(conflicts)}\n")
+                    cluster_phase_tsv = out_path
+                    out.write(f"chromosome_phasing.tsv\t{cluster_phase_tsv}\n")
+
+                print(f"[INFO] Cluster-based phasing done: {cluster_phase_tsv}", file=sys.stderr)
 
         # Final prints
         print("DONE")
         print(f"Outdir: {args.outdir}")
-        print(f"Differential kmers: {diff_kmers_path}")
-        print(f"Chromosome phasing: {chrom_tsv}")
-        print(f"PCA: {os.path.join(args.outdir, 'pca_chromosomes.pdf')}")
-        print(f"Heatmap: {os.path.join(args.outdir, 'heatmap_differential_kmers.pdf')}")
-        print(f"LTR enrichment & age TSV (+K2P): {ltr_out}")
-        if args.k2p_file:
-            print(f"K2P binned density PDF: {os.path.join(args.outdir, 'k2p_density_pre_vs_post.pdf')}")
-        print(f"Window enrichment TSV: {win_out}")
-        print(f"Exchange candidate windows TSV: {exch_out} (n={n_exch})")
-        if args.genome_fai:
-            paint_name = args.paint_pdf.strip() if args.paint_pdf.strip() else "chromosome_painting_exchanges.pdf"
-            print(f"Chromosome painting PDF: {os.path.join(args.outdir, paint_name)}")
 
+        if run_kmer:
+            print(f"[KMER] Outdir: {out_kmer}")
+            print(f"[KMER] Differential kmers: {diff_kmers_path}")
+            print(f"[KMER] Chromosome phasing: {chrom_tsv}")
+            print(f"[KMER] PCA: {os.path.join(out_kmer, 'pca_chromosomes.pdf')}")
+            print(f"[KMER] Heatmap: {os.path.join(out_kmer, 'heatmap_differential_kmers.pdf')}")
+            print(f"[KMER] LTR enrichment & age TSV (+K2P): {ltr_out}")
+            if args.k2p_file:
+                print(f"[KMER] K2P binned density PDF: {os.path.join(out_kmer, 'k2p_density_pre_vs_post.pdf')}")
+            print(f"[KMER] Window enrichment TSV: {win_out}")
+            print(f"[KMER] Exchange candidate windows TSV: {exch_out} (n={n_exch})")
+            if args.genome_fai:
+                paint_name = args.paint_pdf.strip() if args.paint_pdf.strip() else "chromosome_painting_exchanges.pdf"
+                print(f"[KMER] Chromosome painting PDF: {os.path.join(out_kmer, paint_name)}")
+
+        if args.run_cluster and N == 2:
+            print(f"[CLUSTER] Outdir: {out_cluster}")
+            print(f"[CLUSTER] Chromosome phasing: {os.path.join(out_cluster, 'chromosome_phasing.tsv')}")
+            print(f"[CLUSTER] Summary: {os.path.join(out_cluster, 'run_summary.txt')}")
+                        
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 

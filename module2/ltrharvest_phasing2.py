@@ -1376,9 +1376,9 @@ def main():
     ap.add_argument("--run_cluster", action="store_true", help="Also run cluster-based phasing (mmseqs easy-cluster).")
     ap.add_argument("--mmseqs_bin", default="mmseqs", help="mmseqs executable (default 'mmseqs')")
     ap.add_argument("--cluster_min_seq_id", type=float, default=0.7)
-    ap.add_argument("--cluster_cov", type=float, default=0.3)
+    ap.add_argument("--cluster_cov", type=float, default=0.25)
     ap.add_argument("--cluster_q", type=float, default=0.01, help="BH q threshold for homoeolog-pair enrichment within clusters")
-    ap.add_argument("--cluster_min_size", type=int, default=5, help="Minimum cluster size to test")
+    ap.add_argument("--cluster_min_size", type=int, default=2, help="Minimum cluster size to test")
     ap.add_argument("--cluster_min_pairs", type=int, default=2, help="Minimum significant homoeolog pairs in a cluster to emit constraints")
     ap.add_argument("--skip_kmer", action="store_true",
                     help="Skip k-mer-based phasing and only run cluster-based approach.")

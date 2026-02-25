@@ -313,15 +313,23 @@ for (( round=1; round<=MAX_ROUNDS; round++ )); do
   masked_out="${orig_genome}_r${round}.fa"
 
   echo "Masking original genome for next round: feature-character=${next_feature_char} -> ${masked_out}"
+
+  # If we have prior libraries (r1..r{round-1}), feed them to mask_ltr.py as extra features.
+  extra_mask_opts=()
+  if (( ${#libs[@]} > 0 )); then
+    extra_mask_opts+=( --extra-features-fasta <(cat "${libs[@]}") )
+  fi
+
   set -x
   python "$MASKLTR" \
     --features-fasta "$lib" \
     --genome "$orig_genome" \
     --feature-character "$next_feature_char" \
     --far-character "$FAR_CHARACTER" \
-    --distance "$MASK_DISTANCE" > "$masked_out"
+    --distance "$MASK_DISTANCE" \
+    "${extra_mask_opts[@]}" > "$masked_out"
   set +x
-
+  
   [[ -s "$masked_out" ]] || die "Masked genome output is empty: $masked_out"
 
   # 2) Append library to list and rebuild temp_ltr_2pass_lib.fa for next round (concat ALL libs so far)
@@ -333,4 +341,5 @@ done
 # Cleanup
 rm -f "$temp_lib" 2>/dev/null || true
 echo "Done."
+
 

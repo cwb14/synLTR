@@ -314,10 +314,22 @@ for (( round=1; round<=MAX_ROUNDS; round++ )); do
 
   echo "Masking original genome for next round: feature-character=${next_feature_char} -> ${masked_out}"
 
-  # If we have prior libraries (r1..r{round-1}), feed them to mask_ltr.py as extra features.
+  # If we have previous libraries (r1..r{round-1}), feed them to --extra-features-fasta
   extra_mask_opts=()
+  extra_features_tmp=""
+
   if (( ${#libs[@]} > 0 )); then
-    extra_mask_opts+=( --extra-features-fasta <(cat "${libs[@]}") )
+#    extra_features_tmp="$(mktemp --tmpdir "${OUT_PREFIX}.extra_features.XXXXXX.fa")"
+    extra_features_tmp="$(mktemp "./${OUT_PREFIX}.extra_features.XXXXXX.fa")"
+    cat "${libs[@]}" > "$extra_features_tmp"
+    extra_mask_opts+=( --extra-features-fasta "$extra_features_tmp" )
+  fi
+
+  echo "Masking original genome for next round: feature-character=${next_feature_char} -> ${masked_out}"
+  if (( ${#libs[@]} > 0 )); then
+    echo "  extra-features-fasta: r1..r$((round-1)) (${#libs[@]} libs) => $extra_features_tmp"
+  else
+    echo "  extra-features-fasta: (none; round 1 special-case)"
   fi
 
   set -x
@@ -329,6 +341,9 @@ for (( round=1; round<=MAX_ROUNDS; round++ )); do
     --distance "$MASK_DISTANCE" \
     "${extra_mask_opts[@]}" > "$masked_out"
   set +x
+
+
+  rm -f "$extra_features_tmp" 2>/dev/null || true
   
   [[ -s "$masked_out" ]] || die "Masked genome output is empty: $masked_out"
 
@@ -341,5 +356,4 @@ done
 # Cleanup
 rm -f "$temp_lib" 2>/dev/null || true
 echo "Done."
-
 

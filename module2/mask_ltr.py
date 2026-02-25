@@ -43,7 +43,6 @@ from typing import Dict, List, Tuple, Iterator, Optional
 
 COORD_RE = re.compile(r"^([^:]+):(\d+)-(\d+)(?:#.*)?$")
 
-
 def fasta_iter(fp) -> Iterator[Tuple[str, str]]:
     """Yield (header, sequence) from a FASTA file handle."""
     header = None
@@ -61,7 +60,6 @@ def fasta_iter(fp) -> Iterator[Tuple[str, str]]:
             seq_chunks.append(line.strip())
     if header is not None:
         yield header, "".join(seq_chunks)
-
 
 def parse_tsv_features(tsv_path: str) -> Dict[str, List[Tuple[int, int]]]:
     """
@@ -98,6 +96,28 @@ def parse_tsv_features(tsv_path: str) -> Dict[str, List[Tuple[int, int]]]:
 
     return feats
 
+def parse_features_fasta_headers_only(features_fa: str) -> Dict[str, List[Tuple[int, int]]]:
+    """
+    Return dict: contig -> list of feature intervals as 0-based, half-open [start0, end0)
+    Parsed from FASTA headers like: contig:start-end#...
+    Sequences are ignored.
+    """
+    feats: Dict[str, List[Tuple[int, int]]] = {}
+    with open(features_fa, "r", encoding="utf-8") as f:
+        for header, _seq in fasta_iter(f):
+            m = COORD_RE.match(header)
+            if not m:
+                continue
+            contig, s_str, e_str = m.group(1), m.group(2), m.group(3)
+            s = int(s_str)
+            e = int(e_str)
+            if e < s:
+                s, e = e, s
+            start0 = s - 1
+            end0 = e
+            feats.setdefault(contig, []).append((start0, end0))
+    return feats
+    
 
 def parse_features_fasta_with_overrides(features_fa: str) -> Tuple[
     Dict[str, List[Tuple[int, int]]],
@@ -189,48 +209,60 @@ def clip_intervals(intervals: List[Tuple[int, int]], n: int) -> List[Tuple[int, 
             out.append((s, e))
     return out
 
-
 def build_keep_flanks_truncated(
     feats_merged: List[Tuple[int, int]],
+    blockers_merged: List[Tuple[int, int]],
     n: int,
     dist: int
 ) -> List[Tuple[int, int]]:
     """
-    Build keep-intervals = left/right flanks around each feature, truncated so they
-    never enter any feature interval.
+    Build keep-intervals = left/right flanks around EACH PRIMARY feature, truncated so they
+    never enter ANY blocker interval.
 
-    Given merged, sorted feature intervals feats_merged:
-      left flank of feature i: [max(prev_end, s - dist), s)
-      right flank of feature i: [e, min(next_start, e + dist))
+    - feats_merged: merged PRIMARY features (the ones that are masked)
+    - blockers_merged: merged PRIMARY + EXTRA features (only used to stop flanks early)
 
-    This ensures:
-    - feature masking always wins
-    - flanks stop early at neighboring features
+    For each primary feature [s,e):
+      left flank:  [max(prev_blocker_end, s - dist), s)
+      right flank: [e, min(next_blocker_start, e + dist))
     """
     if dist <= 0 or not feats_merged:
         return []
+    if not blockers_merged:
+        blockers_merged = feats_merged
 
     keep: List[Tuple[int, int]] = []
-    k = len(feats_merged)
 
-    for idx, (s, e) in enumerate(feats_merged):
-        prev_end = feats_merged[idx - 1][1] if idx > 0 else 0
-        next_start = feats_merged[idx + 1][0] if idx + 1 < k else n
+    # Pointer into blockers to locate where each primary feature falls
+    b = 0
+    for (s, e) in feats_merged:
+        # advance until blocker end > s
+        while b < len(blockers_merged) and blockers_merged[b][1] <= s:
+            b += 1
 
-        # left flank, truncated by previous feature end
+        # Determine which blocker contains s (it should, because primary is included in blockers)
+        if b < len(blockers_merged) and blockers_merged[b][0] <= s < blockers_merged[b][1]:
+            idx = b
+        else:
+            # Fallback (should be rare): treat as its own blocker context
+            idx = b
+
+        prev_end = blockers_merged[idx - 1][1] if idx > 0 else 0
+        next_start = blockers_merged[idx + 1][0] if idx + 1 < len(blockers_merged) else n
+
+        # left flank (stop at prev blocker)
         ls = max(0, s - dist, prev_end)
         le = s
         if le > ls:
             keep.append((ls, le))
 
-        # right flank, truncated by next feature start
+        # right flank (stop at next blocker)
         rs = e
         re = min(n, e + dist, next_start)
         if re > rs:
             keep.append((rs, re))
 
     return merge_intervals(keep)
-
 
 def mask_contig(
     seq: str,
@@ -239,6 +271,7 @@ def mask_contig(
     far_char: str,
     dist: int,
     override_map: Optional[Dict[int, str]] = None,
+    flank_blockers: Optional[List[Tuple[int, int]]] = None,
 ) -> str:
     """
     Mask with two characters:
@@ -252,15 +285,22 @@ def mask_contig(
     if n == 0:
         return seq
 
-    # Clip + merge feature intervals
+
+    # Clip + merge PRIMARY feature intervals (these define masking)
     feats = merge_intervals(clip_intervals(features, n))
 
     # If no features: everything is "far"
     if not feats:
         return far_char * n
 
-    # Keep intervals are truncated flanks that never enter any feature interval
-    keep = build_keep_flanks_truncated(feats, n, dist)
+    # Clip + merge blockers used ONLY for truncating flanks
+    if flank_blockers is None:
+        blockers = feats
+    else:
+        blockers = merge_intervals(clip_intervals(flank_blockers, n))
+
+    # Keep intervals are truncated flanks that never enter any blocker interval
+    keep = build_keep_flanks_truncated(feats, blockers, n, dist)
 
     out_chunks: List[str] = []
 
@@ -336,7 +376,6 @@ def mask_contig(
 
     return "".join(out_chunks)
 
-
 def main():
     ap = argparse.ArgumentParser(
         description="Hardmask genome based on TSV/FASTA coordinates; keep only flanks within distance."
@@ -345,8 +384,18 @@ def main():
     src.add_argument("--tsv", help="TSV file with col1 like contig:start-end#...")
     src.add_argument(
         "--features-fasta",
-        help="Multi-FASTA where each header is contig:start-end#... (sequences used to preserve prior non-ATCG masks)",
+        help="Multi-FASTA where each header is contig:start-end#... "
+             "(sequences used to preserve prior non-ATCG masks)",
     )
+
+    # NEW: extra features used ONLY to stop/truncate flanks early (no masking, no overrides)
+    ap.add_argument(
+        "--extra-features-fasta",
+        default=None,
+        help="Optional FASTA of additional feature intervals (headers contig:start-end#...) "
+             "used ONLY to stop flanks early; does NOT contribute to masking; sequences ignored.",
+    )
+
     ap.add_argument("--genome", required=True, help="Genome FASTA")
     ap.add_argument(
         "--feature-character",
@@ -374,26 +423,37 @@ def main():
 
     overrides_by_contig: Dict[str, Dict[int, str]] = {}
 
+    # Primary features (the ones that WILL be masked)
     if args.tsv:
         feats_by_contig = parse_tsv_features(args.tsv)
     else:
         feats_by_contig, overrides_by_contig = parse_features_fasta_with_overrides(args.features_fasta)
 
+    # Extra features (used ONLY as flank blockers)
+    extra_by_contig: Dict[str, List[Tuple[int, int]]] = {}
+    if args.extra_features_fasta:
+        extra_by_contig = parse_features_fasta_headers_only(args.extra_features_fasta)
+
     with open(args.genome, "r", encoding="utf-8") as gf:
         for header, seq in fasta_iter(gf):
             feats = feats_by_contig.get(header, [])
             ov = overrides_by_contig.get(header, None)
+
+            # Blockers = primary masked features + extra features (truncate flanks only)
+            blockers = feats + extra_by_contig.get(header, [])
+
             masked = mask_contig(
                 seq=seq,
-                features=feats,
+                features=feats,  # masking only
                 feature_char=args.feature_character,
                 far_char=args.far_character,
                 dist=args.distance,
                 override_map=ov,
+                flank_blockers=blockers,  # truncation walls
             )
+
             sys.stdout.write(f">{header}\n")
             sys.stdout.write(wrap_fasta(masked, args.wrap))
-
 
 if __name__ == "__main__":
     main()

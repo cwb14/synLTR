@@ -7,6 +7,7 @@
 (5) Purges duplicate LTR-RTs based on kmer2ltr LTR divergence.
 NOTE: "--tesorter-tree" currently broken. To fix, we'd simply re-run TEsorter on the remaining deduped full length LTR-RTs.
 
+
 # I could consider adding DeepTE or CREATE as an alternative to TEsorter although I need to check their speed and efficiency feasiblility. 
 # This script differs from 'ltrharvest3.py' in that it performs TSD searching before TEsorter, then feeds those TSD-containing LTR-RTs into TEsorter for detection durring 2-pass. thus improving annotation of unknown TEs. 
 
@@ -1630,7 +1631,7 @@ def run_tesorter(stitched_fa: str, tesorter_py_path: str, outdir: Path,
         "-p", str(threads),
         "-cov", str(cov),
         "-eval", str(evalue),
-#        "--no-cleanup",
+        "--no-cleanup",
         "-rule", str(rule),
     ]
 
@@ -2270,6 +2271,12 @@ def main():
         help="Skip TEsorter entirely; build intact FASTA from SCN and feed directly to Kmer2LTR."
     )
 
+    ap.add_argument(
+        "--tesorter-use-ret",
+        action="store_true",
+        help="For the FASTA fed into TEsorter, extract full-length LTR-RT using s(ret)/e(ret) instead of internal (default: internal)."
+    )
+
     ap.add_argument("--tesorter-db", default="rexdb-plant",
                     help="TEsorter HMM database (-db)")
     ap.add_argument("--tesorter-cov", type=int, default=20,
@@ -2636,20 +2643,43 @@ def main():
     if args.require_run_chars:
         req_chars = [x.strip() for x in args.require_run_chars.split(",") if x.strip()]
 
+
+    # Step 7 outputs used as TEsorter input if enabled
+    internals_fa = str(workdir / f"{out_prefix}.ltrtools.internals.fa")
+    intact_for_tesorter_fa = str(workdir / f"{out_prefix}.ltrtools.intact_for_tesorter.fa")
+    intact_fa = f"{out_prefix}.ltrtools.intact.fa"  # for the --no-tesorter path (in ./)
+
+    # ---- DEFINE require-run-chars ONCE HERE ----
+    req_chars = None
+    if args.require_run_chars:
+        req_chars = [x.strip() for x in args.require_run_chars.split(",") if x.strip()]
+
     if args.use_tesorter:
-        print(f"[Step7] building INTERNALS FASTA from SCN -> {internals_fa}")
-
-        scn_to_internal_fasta(
-            merged_scn,
-            args.genome,
-            internals_fa,
-            require_run_chars=req_chars,
-            base_min=args.nested_base_min,
-            flank_min=args.nested_flank_min,
-        )
+        if args.tesorter_use_ret:
+            tesorter_in_fa = intact_for_tesorter_fa
+            print(f"[Step7] building FULL-LENGTH FASTA (sret/eret) for TEsorter -> {tesorter_in_fa}")
+            scn_to_intact_fasta(
+                merged_scn,
+                args.genome,
+                tesorter_in_fa,
+                require_run_chars=req_chars,
+                base_min=args.nested_base_min,
+                flank_min=args.nested_flank_min,
+            )
+        else:
+            tesorter_in_fa = internals_fa
+            print(f"[Step7] building INTERNALS FASTA (elLTR/srLTR) for TEsorter -> {tesorter_in_fa}")
+            scn_to_internal_fasta(
+                merged_scn,
+                args.genome,
+                tesorter_in_fa,
+                require_run_chars=req_chars,
+                base_min=args.nested_base_min,
+                flank_min=args.nested_flank_min,
+            )
     else:
+        tesorter_in_fa = None
         print(f"[Step7] building INTACT FASTA from SCN -> {intact_fa}")
-
         scn_to_intact_fasta(
             merged_scn,
             args.genome,
@@ -2691,7 +2721,7 @@ def main():
         print(f"[Step9] running TEsorter on stitched FASTA (outputs -> {tesorter_outdir})")
 
         cls_lib_path, cls_pep_path, cls_tsv_path = run_tesorter(
-            stitched_fa=internals_fa,
+            stitched_fa=tesorter_in_fa,
             tesorter_py_path=tesorter_py_path,
             outdir=tesorter_outdir,
             db=args.tesorter_db,
@@ -2764,7 +2794,7 @@ def main():
             raise RuntimeError(f"LTR_tree.R not found at: {args.ltr_tree_r}")
 
         build_ltr_rt_tree_from_tesorter(
-            stitched_fa=internals_fa,
+            stitched_fa=tesorter_in_fa,
             tesorter_py_path=tesorter_py_path,
             outdir=tesorter_outdir,
             db=args.tesorter_db,
@@ -2790,8 +2820,7 @@ def main():
 
     if args.tesorter_tree:
         # NOTE: your current code also references stitched_fa here; fix that too (below)
-        print(f"  TEsorter tree PDF (in workdir): {Path(internals_fa).stem}.TEsorter_tree.pdf")
-
+        print(f"  TEsorter tree PDF (in workdir): {Path(tesorter_in_fa).stem}.TEsorter_tree.pdf")
     # (1) cleaning: remove {prefix}.work entirely
     if args.clean:
         print(f"[CLEAN] removing workdir: {workdir}")
@@ -2799,4 +2828,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-    

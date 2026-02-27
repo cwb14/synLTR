@@ -1,104 +1,35 @@
 #!/usr/bin/env python3
 """
-(1) Masks genes and non-LTR TEs
+(1) Masks genes and non-LTR TEs.
 (2) Runs ltrharvest and ltr_finder and merges results.
-(3) Feeds LTR-RT internal sequence to TEsorter to filter out false positives (plus some true positives).
-(4) Runs kmer2ltr on remaining pool.
+(3) Identify those with TSD, those with LTR-RT protein, and those with homology to those with either TSD or protein. 
+(4) Runs kmer2ltr on the short-list of candidates. 
 (5) Purges duplicate LTR-RTs based on kmer2ltr LTR divergence.
 NOTE: "--tesorter-tree" currently broken. To fix, we'd simply re-run TEsorter on the remaining deduped full length LTR-RTs.
-
 
 # I could consider adding DeepTE or CREATE as an alternative to TEsorter although I need to check their speed and efficiency feasiblility. 
 # This script differs from 'ltrharvest3.py' in that it performs TSD searching before TEsorter, then feeds those TSD-containing LTR-RTs into TEsorter for detection durring 2-pass. thus improving annotation of unknown TEs. 
 
-# Adds TRF-mod for hardmasking low-complexity sequence. 
-# LTR-RTs and their flanking sequence contain low-complexity sequence, thus masking will impact the result. 
-# Be conservative and only hardmask those with a high copy number. These are the ones that mostly bog down ltrharvest and can bottleneck the run. 
-# I recommend (--trf-min-copy 15) but could play with 5, 10, 20, 25, 30:
-python ltrharvest3.py --genome Athal.fa --proteins Athal.pep --threads 200 --out-prefix r1_ltr3 --scn-min-ltr-len 100 --scn-min-ret-len 800 --scn-max-ret-len 15000 --scn-min-int-len 500 --scn-max-int-len 14000 --tsd-rescue --trf --trf-args '-p 100 -s 30' --trf-min-copy 15
+# The bash below runs this script:
+bash synLTR/module2/ltrharvest_wrapper.sh --genome burnin.fasta --proteins ../PrinTE/data/TAIR10.pep.fa.gz --threads 20 --out_prefix burnin_ltr
+# It runs in 5:17.57 minutes with 20 threads.
+python ../PrinTE/util/bedtools.py -pass_scn <( awk 'BEGIN{OFS="\t"} { sub(/#.*/, "", $1); print }' burnin_ltr_r1_kmer2ltr_dedup) -bed <(grep LTR  burnin.bed | grep -v _FRAG) -r 0.9
+   Overlapping entries: 4328 (4328 unique) = 4328/4468 = 0.96866 = true positives.
+   Entries unique to SCN/PASS file: 170 = 170/4468 = 0.038 = false positive.
+   Entries unique to BED file: 140 = 140/4468 = 0.03133 = false negative.
+grep LTR  burnin.bed | grep -v _FRAG | wc -l
+   4468
+   F1 = 0.966
 
-Benchmarking suggests including the gene protein file is a good idea while non-LTR TEs is optional: 
-| Approach              | TP       | FP     | FN      | Precision | Recall    | F1        |
-| --------------------- | -------- | ------ | ------- | --------- | --------- | --------- |
-| (1) NO prot file      | 3079     | 145    | 692     | 0.955     | 0.816     | 0.880     |
-| **(2) NO TE file**    | **3268** | 101    | **503** | 0.970     | **0.867** | **0.915** |
-| (3) NO prot / NO TE   | 3179     | 210    | 592     | 0.938     | 0.843     | 0.888     |
-| (4) prot + TE file    | 3160     | **49** | 611     | **0.985** | 0.838     | 0.905     |
-| (5) EDTA pass + trunc | 2813     | 124    | 958     | 0.958     | 0.746     | 0.839     |
-**** This is a friendlier simulation. Durring burn-in, non-LTR-RTs are all fragmented and LTR-RTs are all intact. Durring simulation, only LTR-RTs are mobile ****
-
-
-| Approach                                | TP       | FP       | FN     | Precision | Recall    | F1        |
-| --------------------------------------- | -------- | -------- | ------ | --------- | --------- | --------- |
-| (6) EDTA pass + trunc                   | 1255     | **73**   | 806    | **0.945** | 0.609     | 0.741     |
-| (7) NO TEsorter                         | **1968** | 1527     | **93** | 0.563     | **0.955** | 0.709     |
-| (8) NO TEsorter + SCN filters           | 1928     | 565      | 133    | 0.773     | 0.935     | **0.846** |
-| (9) TEsorter                            | 1689     | 405      | 372    | 0.807     | 0.820     | 0.813     |
-| **(10) TEsorter + SCN filters**         | 1684     | 285      | 377    | 0.855     | 0.817     | 0.836     |
-**** SCN filters are: --scn-min-ltr-len 100 --scn-min-ret-len 800 --scn-max-ret-len 15000 --scn-min-int-len 500 --scn-max-int-len 12000 ****
-**** This is a more complicated simulation.  Durring burn-in, all TEs (LTR and non-LTR) are both fragmented and intact. Durring simulation, all TEs (LTR and non-LTR) are mobile ****
-
-# Suggested run:
-# Combine #2 and #10. 
-# With real data, I suspect TEsorter is required since ltrharvest and ltrfinder parameters are selected to optimize specificity.
-# My PriNTE simulations do not test the impact of low-complexity repeats. 
-python ltrharvest.py --genome Athal.fa --proteins TAIR10.pep.fa.gz --threads 20 --out-prefix Athal_ltr --tsd-rescue --scn-min-ltr-len 100 --scn-min-ret-len 800 --scn-max-ret-len 15000 --scn-min-int-len 500 --scn-max-int-len 12000
-# Probably speed it up with a very conservative trf masking (strictly mono-, bi-, and tri- nucleotide repeats longer than some strict cutoffoff
- 
-# Goldstandard
-perl EDTA/EDTA_raw.pl --genome Athal_chr1.fa --type ltr --threads 10
-# Finished in 23min.
-# Identifes 39 LTR-RTs.
-    DB="repbase_RM.nucl"
-    Q="Athal.fa.mod.EDTA.raw/LTR/Athal.fa.mod.pass.list.fa"
-    PFX="Athal_vs_repbase"
-    blastn -task blastn -query "$Q" -db "$DB" -evalue 1e-10 -max_target_seqs 50 -max_hsps 1 -outfmt '6 qseqid sseqid pident length mismatch gapopen qstart qend qlen sstart send slen evalue bitscore qcovhsp' -num_threads 16 > "${PFX}.raw.tsv"
-    LC_ALL=C sort -k1,1 -k14,14gr -k13,13g "${PFX}.raw.tsv" | awk 'BEGIN{FS=OFS="\t"} !seen[$1]++' > "${PFX}.best.tsv"
-    awk 'BEGIN{FS=OFS="\t"}{qcov=100.0*$4/$9; scov=100.0*$4/$12; print $0, sprintf("%.2f",qcov), sprintf("%.2f",scov)}' "${PFX}.best.tsv" > "${PFX}.best.with_cov.tsv"
-    { echo -e "qseqid\tsseqid\tpident\taln_len\tmismatch\tgapopen\tqstart\tqend\tqlen\tsstart\tsend\tslen\tevalue\tbitscore\tqcovhsp\tqcov_pct\tscov_pct"; cat "${PFX}.best.with_cov.tsv"; } > "${PFX}.best.with_cov.header.tsv"
-    awk 'BEGIN{FS=OFS="\t"} NR==1 || $2 !~ /LTR/ {print}' "${PFX}.best.with_cov.header.tsv" > "${PFX}.no_LTR_hits.tsv"
-    awk 'BEGIN{FS="\t"} NR>1 && $2 !~ /LTR/ {n++} END{print n}' "${PFX}.best.with_cov.header.tsv"
-# 37 of the 39 have an LTR-RT best-hit in the repbase lib. 2 are LINE.
-
-# This pipeline.
-python ltrharvest.py --genome Athal_chr1.fa --proteins ../PrinTE/data/TAIR10.pep.fa.gz --threads 10 --out-prefix ltrharvest --scn-min-ltr-len 100 --scn-min-ret-len 800 --scn-max-ret-len 15000 --scn-min-int-len 500 --scn-max-int-len 12000 --size 500000
-# Finished in 30min.
-# Identifes 170 LTR-RTs.
-# 146 of the 170 have an LTR-RT best-hit in the repbase lib.
-# Most of the non LTR-RT alignments are identified using TEsorter 2-pass (LTR/Gypsy/unknown) and very poorly aligned (1-6% query cov). 
-# Previous benchmarking suggest TEsorter 2-pass 80-80-80 was useful for detecting real LTR-RTs and lowering 80-80-80 generated artifacts
-
-### DEVELOPING ###
-# Nest inserion discovery.
-# Round1: Non-nest.
-python ltrharvest.py --genome Osati.fa --proteins Osati.pep --threads 100 --out-prefix Osati_r1 --tsd-rescue --scn-min-ltr-len 100 --scn-min-ret-len 800 --scn-max-ret-len 15000 --scn-min-int-len 500 --scn-max-int-len 12000 --size 500000
-# Discovers 4919 LTR-RTs.
-# Mask LTR-RTs with N. Only flanking sequence is unmasked. 
-python mask_ltr.py --features-fasta Osati_r1.ltrharvest.full_length.dedup.fa.rexdb-plant.cls.lib.fa --genome Osati.fa --feature-character N --far-character V --distance 15000 > Osati_r1.fa
-
-
-# Round2: 1-level nesting.
-# Require LTR-RTs to contain runs of N (ie a nested LTR-RT)
-# Expand exceptable max LTR-RT lengths since theyre now nested. 
-python ltrharvest.py --require-run-chars N --genome Osati_r1.fa --proteins Osati.pep --threads 100 --out-prefix Osati_r2 --tsd-rescue --scn-min-ltr-len 100 --scn-min-ret-len 1000 --scn-max-ret-len 30000 --scn-min-int-len 500 --scn-max-int-len 28000 --ltrharvest-args '-mindistltr 100 -minlenltr 100 -maxlenltr 7000 -mintsd 0 -maxtsd 0 -similar 70 -vic 60 -seed 15 -seqids yes -xdrop 10 -maxdistltr 30000' --ltrfinder-args '-w 2 -C -D 30000 -d 100 -L 7000 -l 100 -p 20 -M 0.00 -S 0.0'
-# Discovers 441 1-level nested LTR-RTs. 
-# 1-level LTR-RTs masked with N; 2-level LTR-RTs masked with R. Flanking sequence unmasked.
-python mask_ltr.py --features-fasta Osati_r2.ltrharvest.full_length.dedup.fa.rexdb-plant.cls.lib.fa --genome Osati.fa --feature-character R --far-character V --distance 15000 > Osati_r2.fa
-
-# Expand exceptable max LTR-RT lengths since theyre now double 2-level nested. 
-# Require LTR-RTs to contain runs of N and R (ie 2-level nesting)
-python ltrharvest.py --require-run-chars N,R --genome Osati_r2.fa --proteins Osati.pep --threads 100 --out-prefix Osati_r3 --tsd-rescue --scn-min-ltr-len 100 --scn-min-ret-len 1000 --scn-max-ret-len 45000 --scn-min-int-len 500 --scn-max-int-len 43000 --ltrharvest-args '-mindistltr 100 -minlenltr 100 -maxlenltr 7000 -mintsd 0 -maxtsd 0 -similar 70 -vic 60 -seed 15 -seqids yes -xdrop 10 -maxdistltr 45000' --ltrfinder-args '-w 2 -C -D 45000 -d 100 -L 7000 -l 100 -p 20 -M 0.00 -S 0.0'
-# Discovers 75  2-level nested LTR-RTs. 
-# 1-level LTR-RTs masked with N; 2-level LTR-RTs masked with R. 3-level LTR-RTs masked with D. Flanking sequence unmasked.
-python mask_ltr.py --features-fasta Osati_r2.ltrharvest.full_length.dedup.fa.rexdb-plant.cls.lib.fa --genome Osati.fa --feature-character D --far-character V --distance 15000 > Osati_r3.fa
-
-python ltrharvest.py --require-run-chars N,R,D --genome Osati_r3.fa --proteins Osati.pep --threads 100 --out-prefix Osati_r3 --tsd-rescue --scn-min-ltr-len 100 --scn-min-ret-len 1000 --scn-max-ret-len 55000 --scn-min-int-len 500 --scn-max-int-len 54000 --ltrharvest-args '-mindistltr 100 -minlenltr 100 -maxlenltr 7000 -mintsd 0 -maxtsd 0 -similar 70 -vic 60 -seed 15 -seqids yes -xdrop 10 -maxdistltr 55000' --ltrfinder-args '-w 2 -C -D 55000 -d 100 -L 7000 -l 100 -p 20 -M 0.00 -S 0.0'
-
-Needs benchmarked. It may be too strict to expect TEsoerter proteins on higher nesting orders, but this is an outline. 
- Non-nest K2P    :	0.021463
- 1-level nest K2P:	0.031816
- 2-level nest K2P:	0.060179
- """
+# Compare to LTR_retriever gold-standard.
+perl EDTA/EDTA_raw.pl --genome burnin.fasta --type ltr --threads 20
+# It runs in 20:28.15 minutes with 20 threads.
+python ../PrinTE/util/bedtools.py -pass_scn burnin.fasta.mod.EDTA.raw/LTR/burnin.fasta.mod.pass.list -bed <(grep LTR  burnin.bed | grep -v _FRAG) -r 0.9
+   Overlapping entries: 2085 (2085 unique) = 2085/4468 = 0.46665 = true positives.
+   Entries unique to SCN/PASS file: 0 = 0/4468 = 0.0 = false positive.
+   Entries unique to BED file: 2383 = 2383/4468 = 0.533348 = false negative.
+   F1 = 0.64
+"""
 
 import argparse
 import os

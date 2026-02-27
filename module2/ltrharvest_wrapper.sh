@@ -130,9 +130,9 @@ MAX_ROUNDS="${#IUPAC_SEQ[@]}"     # 10
 # ----------------------------
 # Static args (per your pipeline)
 # ----------------------------
-SCN_MIN_LTR_LEN=100
-SCN_MIN_RET_LEN=1000
-SCN_MIN_INT_LEN=500
+SCN_MIN_LTR_LEN=10
+SCN_MIN_RET_LEN=80
+SCN_MIN_INT_LEN=0
 LTR_MAXLENLTR=7000
 LTR_MINDISTLTR=100
 LTR_MINLENLTR=100
@@ -160,7 +160,7 @@ else
   TRF_OPTS=(--no-trf)
 fi
 SIZE=500000
-TESORTER_RULE="75-80-80"
+TESORTER_RULE="70-70-80"
 TSD_PASS2="--tsd-pass2"
 TESORTER_COV=20
 TESORTER_EVAL="1e-2"
@@ -173,8 +173,8 @@ MASK_DISTANCE=15000
 # Derived per-round increments
 # Round 1 base values (from your commands)
 # ----------------------------
-base_scn_max_ret=15000
-base_scn_max_int=14000
+base_scn_max_ret=150000
+base_scn_max_int=140000
 base_maxdistltr=15000
 base_LTRF_D=15000
 
@@ -277,6 +277,7 @@ for (( round=1; round<=MAX_ROUNDS; round++ )); do
     "${TRF_OPTS[@]}" \
     --size "$SIZE" \
     --overlap "$overlap" \
+    --tesorter-use-ret \
     --tesorter-rule "$TESORTER_RULE" \
     $TSD_PASS2 \
     --tesorter-cov "$TESORTER_COV" \
@@ -356,4 +357,3 @@ done
 # Cleanup
 rm -f "$temp_lib" 2>/dev/null || true
 echo "Done."
-

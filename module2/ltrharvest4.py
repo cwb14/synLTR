@@ -1338,30 +1338,57 @@ def tool_usable_minimap2(bin_path: Path) -> bool:
 def ensure_tools(tools_dir: Path) -> Tuple[str, str]:
     tools_dir = mkdirp(tools_dir)
     mm2_dir = tools_dir / "minimap2"
-    mp_dir = tools_dir / "miniprot"
+    mp_dir  = tools_dir / "miniprot"
 
     mm2_bin = mm2_dir / "minimap2"
-    mp_bin = mp_dir / "miniprot"
+    mp_bin  = mp_dir  / "miniprot"
 
-    need_mm2 = not tool_usable_minimap2(mm2_bin)
-    need_mp  = not tool_usable_miniprot(mp_bin)
-
-    if need_mm2:
+    # ---- minimap2 ----
+    if not tool_usable_minimap2(mm2_bin):
         if not mm2_dir.exists():
             run(["git", "clone", "https://github.com/lh3/minimap2", str(mm2_dir)], check=True)
-        run(["make"], cwd=str(mm2_dir), check=True)
-        if not tool_usable_minimap2(mm2_bin):
-            raise RuntimeError(f"minimap2 build failed or binary unusable at: {mm2_bin}")
 
-    if need_mp:
+        built = False
+        for make_cmd in (["make"], ["make", "CC=gcc"]):
+            r = run(make_cmd, cwd=str(mm2_dir))
+            if r.returncode == 0 and tool_usable_minimap2(mm2_bin):
+                built = True
+                break
+
+        if not built:
+            sys_mm2 = shutil.which("minimap2")
+            if sys_mm2 and tool_usable_minimap2(Path(sys_mm2)):
+                mm2_bin = Path(sys_mm2)
+            else:
+                raise RuntimeError(
+                    f"minimap2 build failed and no system minimap2 found on PATH.\n"
+                    f"Try: conda install -c bioconda minimap2"
+                )
+
+    # ---- miniprot ----
+    if not tool_usable_miniprot(mp_bin):
         if not mp_dir.exists():
             run(["git", "clone", "https://github.com/lh3/miniprot", str(mp_dir)], check=True)
-        run(["make"], cwd=str(mp_dir), check=True)
-        if not tool_usable_miniprot(mp_bin):
-            raise RuntimeError(f"miniprot build failed or binary unusable at: {mp_bin}")
+
+        built = False
+        for make_cmd in (["make"], ["make", "CC=gcc"]):
+            r = run(make_cmd, cwd=str(mp_dir))
+            if r.returncode == 0 and tool_usable_miniprot(mp_bin):
+                built = True
+                break
+
+        if not built:
+            sys_mp = shutil.which("miniprot")
+            if sys_mp and tool_usable_miniprot(Path(sys_mp)):
+                mp_bin = Path(sys_mp)
+            else:
+                raise RuntimeError(
+                    f"miniprot build failed and no system miniprot found on PATH.\n"
+                    f"Try: conda install -c bioconda miniprot"
+                )
 
     return str(mm2_bin), str(mp_bin)
-
+    
 # -----------------------------
 # Step 9: TEsorter
 # -----------------------------

@@ -4,17 +4,36 @@
 #
 # Usage:
 #   bash nest_ltr_detector.sh --genome genome.fa [--proteins prot.fa] [--terminate_count 100]
-#       [--script_path ./synLTR/module2/] [--threads 20] [--out_prefix ltrs]
+#       [--max-rounds N] [--script_path ./synLTR/module2/] [--threads 20] [--out_prefix ltrs]
+#       [--ltrharvest4-args "KEY=VALUE ..."] [--ltrharvest4-args-from-round N "KEY=VALUE ..."]
 #
 # Notes:
 # - Runs Round 1 on the original genome, then masks the ORIGINAL genome each round to build genome_r{N}.fa for next round.
-# - Stops after finishing a ltrharvest4.py round if detected LTR-RTs < terminate_count (default 100), or when max rounds reached.
+# - Stops when: detected LTR-RTs < terminate_count, max-rounds reached, or ltrharvest4.py exits early
+#   (e.g. no LTR-RT candidates found) -- early exits are handled gracefully.
 # - Uses IUPAC ambiguity codes for masking letters; excludes 'V' because far-character uses V.
 # - At each next round:
 #     scn-max-ret-len, -maxdistltr, -D  += 15000
 #     scn-max-int-len                  += 14000
 # - Builds temp_ltr_2pass_lib.fa by concatenating *all prior* libraries (r1..rK) and cleaning to A/T/C/G only.
 # - Deletes temp_ltr_2pass_lib.fa at end.
+# - Rounds 2+ automatically add --exclude-run-char V.
+#
+# Extra ltrharvest4.py args:
+#   --ltrharvest4-args "KEY=VALUE [KEY2=VALUE2 ...]"
+#       Applied to ALL rounds. Boolean flags: KEY=true (e.g. clean=true).
+#       Can be specified multiple times.
+#
+#   --ltrharvest4-args-from-round N "KEY=VALUE [...]"
+#       Applied starting from round N onward. For the same KEY, later from-round
+#       values override earlier ones (last-wins per key, per round).
+#       Can be specified multiple times.
+#
+#   Examples:
+#     --ltrharvest4-args "clean=true verbose=true"
+#     --ltrharvest4-args-from-round 2 "clean=true"
+#     --ltrharvest4-args-from-round 1 "tesorter-rule=70-70-80"
+#     --ltrharvest4-args-from-round 3 "tesorter-rule=70-40-80"
 
 set -euo pipefail
 
@@ -24,20 +43,27 @@ set -euo pipefail
 GENOME=""
 PROTEINS=""
 TERMINATE_COUNT=100
+MAX_ROUNDS_OVERRIDE=""   # empty = use IUPAC_SEQ length (10)
 SCRIPT_PATH=""
 THREADS=20
 OUT_PREFIX="ltrs"
 RUN_TRF=false
+
+# Storage for extra ltrharvest4.py arg directives
+# Each entry is tab-separated: "FROMROUND\tKEY\tVALUE\tIS_BOOL"
+declare -a EXTRA_ARG_DIRECTIVES=()
+
 # ----------------------------
 # Helpers
 # ----------------------------
 die() { echo "ERROR: $*" >&2; exit 1; }
 
 usage() {
-  cat >&2 <<'EOF'
+  cat >&2 <<'USAGE_EOF'
 Usage:
   bash nest_ltr_detector.sh --genome genome.fa [--proteins prot.fa] [--terminate_count 100]
-      [--script_path ./synLTR/module2/] [--threads 20] [--out_prefix ltrs]
+      [--max-rounds N] [--script_path ./synLTR/module2/] [--threads 20] [--out_prefix ltrs]
+      [--ltrharvest4-args "KEY=VALUE ..."] [--ltrharvest4-args-from-round N "KEY=VALUE ..."]
 
 Required:
   --genome              Genome FASTA (.fa/.fasta)
@@ -45,15 +71,44 @@ Required:
 Optional:
   --proteins            Protein FASTA for ltrharvest4.py
   --terminate_count     Stop if detected LTR-RTs in latest library < this count (default 100)
+  --max-rounds          Maximum number of rounds to run (default: up to 10, limited by IUPAC codes).
+                        Use 1 for non-nested only, 2 for single-level nesting, etc.
   --script_path         Path containing ltrharvest4.py and mask_ltr.py (default: same dir as this script)
   --threads             Threads for ltrharvest4.py (default 20)
   --out_prefix          Output prefix (default ltrs)
-  --run-trf            Enable TRF instead of default --no-trf
-EOF
+  --run-trf             Enable TRF instead of default --no-trf
+
+Extra ltrharvest4.py options:
+  --ltrharvest4-args "KEY=VALUE [KEY2=VALUE2 ...]"
+      Pass additional options to ltrharvest4.py for ALL rounds.
+      KEY is the option name without leading '--'. Use '=' to separate key and value.
+      Boolean flags (no value): KEY=true  (e.g. clean=true, verbose=true)
+      Can be specified multiple times.
+
+  --ltrharvest4-args-from-round N "KEY=VALUE [...]"
+      Pass additional options to ltrharvest4.py starting from round N onward.
+      For the same KEY, the directive with the highest applicable from-round wins.
+      Can be specified multiple times.
+
+  Examples:
+      # Always clean workdirs and be verbose
+      --ltrharvest4-args "clean=true verbose=true"
+
+      # Clean only from round 2 onward
+      --ltrharvest4-args-from-round 2 "clean=true"
+
+      # Use a relaxed tesorter-rule for rounds 1-2, stricter from round 3
+      --ltrharvest4-args-from-round 1 "tesorter-rule=70-70-80"
+      --ltrharvest4-args-from-round 3 "tesorter-rule=70-40-80"
+
+Notes:
+  - Rounds 2+ automatically receive --exclude-run-char V (no need to specify manually).
+  - If ltrharvest4.py exits with an error (e.g. no LTR-RT candidates / Kmer2LTR failure),
+    the run stops gracefully rather than crashing the whole pipeline.
+USAGE_EOF
 }
 
 abspath_dir() {
-  # portable-ish dirname->abs
   local d
   d="$(cd "$(dirname "$1")" && pwd)"
   echo "$d"
@@ -65,20 +120,83 @@ count_fasta_headers() {
     echo 0
     return
   fi
-  # count '>' at line start
   grep -c '^>' "$fa" || true
 }
 
 clean_and_concat_libs() {
-  # args: output_file, lib1 lib2 ...
   local out="$1"; shift
   local tmpcat
   tmpcat="$(mktemp)"
   cat "$@" > "$tmpcat"
-  # single-line sequences and strip non-ATCG from sequence lines
   awk '/^>/ {printf("\n%s\n",$0);next;} {printf("%s",$0);} END {printf("\n");}' "$tmpcat" \
     | sed '/^>/! s/[^ATCGatcg]//g' > "$out"
   rm -f "$tmpcat"
+}
+
+# Parse a space-separated "KEY=VALUE ..." string and append directives for from_round.
+parse_kv_string() {
+  local from_round="$1"
+  local kv_str="$2"
+  local pair key val is_bool
+
+  for pair in $kv_str; do
+    if [[ "$pair" != *"="* ]]; then
+      die "Bad key-value entry '${pair}': must be KEY=VALUE or KEY=true (use --help)"
+    fi
+    key="${pair%%=*}"
+    val="${pair#*=}"
+    is_bool=0
+    if [[ "$val" == "true" ]]; then
+      is_bool=1
+      val=""
+    fi
+    # Tab-separated: FROMROUND TAB KEY TAB VALUE TAB IS_BOOL
+    EXTRA_ARG_DIRECTIVES+=( "$(printf '%s\t%s\t%s\t%s' "$from_round" "$key" "$val" "$is_bool")" )
+  done
+}
+
+# Build the extra ltrharvest4.py args for a given round.
+# Reads EXTRA_ARG_DIRECTIVES; writes result into the array named by $2 (nameref).
+# For the same KEY, the directive with the highest from_round that is <= round wins.
+build_extra_args_for_round() {
+  local round="$1"
+  local -n _out_arr="$2"
+  _out_arr=()
+
+  # For each key, track best (highest applicable from_round) val and is_bool
+  declare -A best_from=()
+  declare -A best_val=()
+  declare -A best_bool=()
+  declare -a key_order=()
+
+  local from_round key val is_bool
+  for directive in "${EXTRA_ARG_DIRECTIVES[@]}"; do
+    from_round="$(printf '%s' "$directive" | cut -f1)"
+    key="$(printf '%s' "$directive" | cut -f2)"
+    val="$(printf '%s' "$directive" | cut -f3)"
+    is_bool="$(printf '%s' "$directive" | cut -f4)"
+
+    if [[ "$round" -ge "$from_round" ]]; then
+      if [[ -z "${best_from[$key]+_}" ]]; then
+        key_order+=("$key")
+        best_from["$key"]="$from_round"
+        best_val["$key"]="$val"
+        best_bool["$key"]="$is_bool"
+      elif [[ "$from_round" -ge "${best_from[$key]}" ]]; then
+        best_from["$key"]="$from_round"
+        best_val["$key"]="$val"
+        best_bool["$key"]="$is_bool"
+      fi
+    fi
+  done
+
+  for key in "${key_order[@]}"; do
+    if [[ "${best_bool[$key]}" == "1" ]]; then
+      _out_arr+=( "--${key}" )
+    else
+      _out_arr+=( "--${key}" "${best_val[$key]}" )
+    fi
+  done
 }
 
 # ----------------------------
@@ -91,10 +209,20 @@ while [[ $# -gt 0 ]]; do
     --genome) GENOME="${2:-}"; shift 2;;
     --proteins) PROTEINS="${2:-}"; shift 2;;
     --terminate_count) TERMINATE_COUNT="${2:-}"; shift 2;;
+    --max-rounds) MAX_ROUNDS_OVERRIDE="${2:-}"; shift 2;;
     --script_path) SCRIPT_PATH="${2:-}"; shift 2;;
     --threads) THREADS="${2:-}"; shift 2;;
     --out_prefix) OUT_PREFIX="${2:-}"; shift 2;;
     --run-trf) RUN_TRF=true; shift;;
+    --ltrharvest4-args)
+      parse_kv_string 1 "${2:-}"
+      shift 2;;
+    --ltrharvest4-args-from-round)
+      _from="${2:-}"
+      _kv="${3:-}"
+      [[ "$_from" =~ ^[1-9][0-9]*$ ]] || die "--ltrharvest4-args-from-round requires a positive integer round number as the next argument"
+      parse_kv_string "$_from" "$_kv"
+      shift 3;;
     -h|--help) usage; exit 0;;
     *) die "Unknown argument: $1 (use --help)";;
   esac
@@ -106,11 +234,9 @@ if [[ -n "$PROTEINS" ]]; then
   [[ -f "$PROTEINS" ]] || die "Proteins not found: $PROTEINS"
 fi
 
-# Resolve SCRIPT_PATH default: same directory as this wrapper
 if [[ -z "$SCRIPT_PATH" ]]; then
   SCRIPT_PATH="$(abspath_dir "${BASH_SOURCE[0]}")"
 else
-  # allow trailing slash
   SCRIPT_PATH="${SCRIPT_PATH%/}"
 fi
 
@@ -121,14 +247,26 @@ MASKLTR="${SCRIPT_PATH}/mask_ltr.py"
 
 # ----------------------------
 # Config: IUPAC codes to use for successive rounds (exclude V)
-# We start masking with N for round1->round2, then add R, D, Y, S, W, K, M, B, H ...
-# N already included first; require-run-chars accumulates.
 # ----------------------------
-IUPAC_SEQ=(N R D Y S W K M B H)  # 10 codes => up to 10 rounds (r1..r10); nesting levels = rounds+1
-MAX_ROUNDS="${#IUPAC_SEQ[@]}"     # 10
+IUPAC_SEQ=(N R D Y S W K M B H)   # 10 codes => up to 10 rounds
+IUPAC_MAX="${#IUPAC_SEQ[@]}"       # 10
+
+if [[ -n "$MAX_ROUNDS_OVERRIDE" ]]; then
+  [[ "$MAX_ROUNDS_OVERRIDE" =~ ^[1-9][0-9]*$ ]] || die "--max-rounds must be a positive integer"
+  if [[ "$MAX_ROUNDS_OVERRIDE" -gt "$IUPAC_MAX" ]]; then
+    echo "WARNING: --max-rounds ${MAX_ROUNDS_OVERRIDE} exceeds IUPAC code limit (${IUPAC_MAX}); capping at ${IUPAC_MAX}." >&2
+    MAX_ROUNDS="$IUPAC_MAX"
+  else
+    MAX_ROUNDS="$MAX_ROUNDS_OVERRIDE"
+  fi
+else
+  MAX_ROUNDS="$IUPAC_MAX"
+fi
+
+echo "Max rounds set to: ${MAX_ROUNDS}"
 
 # ----------------------------
-# Static args (per your pipeline)
+# Static args
 # ----------------------------
 SCN_MIN_LTR_LEN=10
 SCN_MIN_RET_LEN=80
@@ -152,13 +290,12 @@ LTRF_d=100
 LTRF_l=100
 LTRF_L=7000
 
-# Chunking / TE sorter / nesting params
-# TRF behavior (default = no TRF)
 if [[ "$RUN_TRF" == true ]]; then
   TRF_OPTS=(--trf --trf-args "-a 5 -b 30 -g 30 -G 1 -s 150 -p 10" --trf-min-copy 40)
 else
   TRF_OPTS=(--no-trf)
 fi
+
 SIZE=500000
 TESORTER_RULE="70-70-80"
 TSD_PASS2="--tsd-pass2"
@@ -169,39 +306,28 @@ NESTED_BASE_MIN=800
 FAR_CHARACTER="V"
 MASK_DISTANCE=15000
 
-# ----------------------------
-# Derived per-round increments
-# Round 1 base values (from your commands)
-# ----------------------------
 base_scn_max_ret=150000
 base_scn_max_int=140000
 base_maxdistltr=15000
 base_LTRF_D=15000
 
-# Overlap schedule (from your examples; after that, use a simple increasing rule)
-# r1: 25000, r2: 40000, r3: 55000, r4: 70000  => +15000 each round starting at r1
 overlap_for_round() {
   local r="$1"
   echo $((25000 + (r-1)*15000))
 }
 
-# Genome masked file naming: genome_r1.fa used for round2 input, genome_r2.fa for round3, etc.
-# We keep the ORIGINAL genome path for masking each time.
 orig_genome="$GENOME"
-
 temp_lib="temp_ltr_2pass_lib.fa"
 
 # ----------------------------
 # Main loop
 # ----------------------------
-libs=()   # collected library paths for concatenation
-prev_masked_genome=""  # genome used as input to current round
+libs=()
 
 for (( round=1; round<=MAX_ROUNDS; round++ )); do
   round_tag="r${round}"
   out_prefix_round="${OUT_PREFIX}_${round_tag}"
 
-  # Genome input: round1 uses original genome; others use genome_r{round-1}.fa
   if [[ "$round" -eq 1 ]]; then
     genome_in="$orig_genome"
   else
@@ -209,45 +335,40 @@ for (( round=1; round<=MAX_ROUNDS; round++ )); do
     [[ -f "$genome_in" ]] || die "Expected masked genome not found for round ${round}: $genome_in"
   fi
 
-  # Per-round increasing parameters
   scn_max_ret=$((base_scn_max_ret + (round-1)*15000))
   maxdistltr=$((base_maxdistltr + (round-1)*15000))
   ltrf_D=$((base_LTRF_D + (round-1)*15000))
-  # round1 scn-max-int-len is 14000; round2 is 28000; etc (+14000 each round)
   scn_max_int=$((base_scn_max_int * round))
-
   overlap="$(overlap_for_round "$round")"
 
-  # Build ltrharvest args strings
   ltrharvest_args="-mindistltr ${LTR_MINDISTLTR} -minlenltr ${LTR_MINLENLTR} -maxlenltr ${LTR_MAXLENLTR} -mintsd ${LTR_MINTSD} -maxtsd ${LTR_MAXTSD} -similar ${LTR_SIMILAR} -vic ${LTR_VIC} -seed ${LTR_SEED} -seqids yes -xdrop ${LTR_XDROP} -maxdistltr ${maxdistltr}"
   ltrfinder_args="-w ${LTRF_W} ${LTRF_C} -D ${ltrf_D} -d ${LTRF_d} -L ${LTRF_L} -l ${LTRF_l} -p ${LTRF_p} -M ${LTRF_M} -S ${LTRF_S}"
 
-  # pass2 options for nested rounds
   pass2_opts=()
   if [[ "$round" -ge 2 ]]; then
-    # require-run-chars: accumulated IUPAC letters used so far (up to round-1 masks, but we include current set too)
-    # In your examples:
-    #   round2 require N
-    #   round3 require N,R
-    #   round4 require N,R,D
-    # So for round >=2, require chars = IUPAC_SEQ[0..round-2]
     req=""
     for ((i=0; i<=round-2; i++)); do
       req+="${IUPAC_SEQ[$i]},"
     done
-    req="${req%,}"  # trim trailing comma
-
-    pass2_opts+=( --pass2-classified-fasta "$temp_lib" --require-run-chars "$req" )
+    req="${req%,}"
+    pass2_opts+=(
+      --pass2-classified-fasta "$temp_lib"
+      --require-run-chars "$req"
+      --exclude-run-char "$FAR_CHARACTER"   # Edit (4): always exclude V from round 2+
+    )
   fi
 
-  # proteins option
   protein_opts=()
   if [[ -n "$PROTEINS" ]]; then
     protein_opts+=( --proteins "$PROTEINS" )
   fi
 
+  # Edit (3): Build per-round extra args
+  declare -a extra_round_args=()
+  build_extra_args_for_round "$round" extra_round_args
+
   echo "============================================================"
-  echo "Round ${round} (${round_tag})"
+  echo "Round ${round} / ${MAX_ROUNDS} (${round_tag})"
   echo "  genome_in:          $genome_in"
   echo "  out_prefix:         $out_prefix_round"
   echo "  scn-max-ret-len:    $scn_max_ret"
@@ -257,10 +378,15 @@ for (( round=1; round<=MAX_ROUNDS; round++ )); do
   echo "  overlap:            $overlap"
   if [[ "$round" -ge 2 ]]; then
     echo "  pass2 lib:          $temp_lib"
-    echo "  require-run-chars:  ${pass2_opts[*]##*--require-run-chars }"
+    echo "  require-run-chars:  $req"
+    echo "  exclude-run-char:   $FAR_CHARACTER"
+  fi
+  if [[ "${#extra_round_args[@]}" -gt 0 ]]; then
+    echo "  extra ltrharvest4:  ${extra_round_args[*]}"
   fi
 
-  # Run ltrharvest4.py (terminate after this step if needed)
+  # Edit (2): Run ltrharvest4.py, catching non-zero exit gracefully
+  ltrharvest_exit=0
   set -x
   python "$LTRHARVEST" \
     --genome "$genome_in" \
@@ -284,43 +410,53 @@ for (( round=1; round<=MAX_ROUNDS; round++ )); do
     --tesorter-eval "$TESORTER_EVAL" \
     --nested-flank-min "$NESTED_FLANK_MIN" \
     --nested-base-min "$NESTED_BASE_MIN" \
-    "${pass2_opts[@]}"
+    "${pass2_opts[@]}" \
+    "${extra_round_args[@]}" \
+    || ltrharvest_exit=$?
   set +x
 
-  # Latest library produced this round
+  # Edit (2): Graceful handling of early ltrharvest4.py failure
+  if [[ "$ltrharvest_exit" -ne 0 ]]; then
+    echo "" >&2
+    echo "============================================================" >&2
+    echo "WARNING: ltrharvest4.py exited with code ${ltrharvest_exit} on round ${round}." >&2
+    echo "This typically means no LTR-RT candidates were found (e.g. Kmer2LTR" >&2
+    echo "reported no usable data). Stopping gracefully after ${round} round(s)." >&2
+    echo "============================================================" >&2
+    break
+  fi
+
   lib="${out_prefix_round}.ltrharvest.full_length.dedup.fa.rexdb-plant.cls.lib.fa"
   if [[ ! -s "$lib" ]]; then
-    die "Expected library not found or empty: $lib"
+    echo "" >&2
+    echo "============================================================" >&2
+    echo "WARNING: Expected library not found or empty: $lib" >&2
+    echo "Stopping gracefully after round ${round}." >&2
+    echo "============================================================" >&2
+    break
   fi
 
   n_hits="$(count_fasta_headers "$lib")"
   echo "Round ${round}: detected ${n_hits} LTR-RTs in ${lib}"
 
-  # Decide whether to terminate (terminate AFTER ltrharvest4.py)
   if [[ "$n_hits" -lt "$TERMINATE_COUNT" ]]; then
     echo "Terminate: ${n_hits} < ${TERMINATE_COUNT}. No further rounds will be run."
     break
   fi
 
-  # If next round would exceed max rounds, stop (can't add more IUPAC letters)
   if [[ "$round" -eq "$MAX_ROUNDS" ]]; then
     echo "Reached MAX_ROUNDS=${MAX_ROUNDS}. Stopping."
     break
   fi
 
-  # Prepare for next round:
-  # 1) Mask ORIGINAL genome using this round's features-fasta (the library) with next IUPAC letter as feature-character
-  next_feature_char="${IUPAC_SEQ[$((round-1))]}"   # r1 masks with N, r2 masks with R, r3 masks with D, ...
+  # Prepare for next round: mask original genome
+  next_feature_char="${IUPAC_SEQ[$((round-1))]}"
   masked_out="${orig_genome}_r${round}.fa"
 
-  echo "Masking original genome for next round: feature-character=${next_feature_char} -> ${masked_out}"
-
-  # If we have previous libraries (r1..r{round-1}), feed them to --extra-features-fasta
   extra_mask_opts=()
   extra_features_tmp=""
 
   if (( ${#libs[@]} > 0 )); then
-#    extra_features_tmp="$(mktemp --tmpdir "${OUT_PREFIX}.extra_features.XXXXXX.fa")"
     extra_features_tmp="$(mktemp "./${OUT_PREFIX}.extra_features.XXXXXX.fa")"
     cat "${libs[@]}" > "$extra_features_tmp"
     extra_mask_opts+=( --extra-features-fasta "$extra_features_tmp" )
@@ -343,12 +479,10 @@ for (( round=1; round<=MAX_ROUNDS; round++ )); do
     "${extra_mask_opts[@]}" > "$masked_out"
   set +x
 
-
   rm -f "$extra_features_tmp" 2>/dev/null || true
-  
+
   [[ -s "$masked_out" ]] || die "Masked genome output is empty: $masked_out"
 
-  # 2) Append library to list and rebuild temp_ltr_2pass_lib.fa for next round (concat ALL libs so far)
   libs+=( "$lib" )
   echo "Rebuilding ${temp_lib} from ${#libs[@]} libraries..."
   clean_and_concat_libs "$temp_lib" "${libs[@]}"

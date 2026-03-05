@@ -3,15 +3,21 @@
 te_viewer.py — Interactive nested TE + gene genome browser
 Generates a self-contained HTML file with D3.js visualization.
 
+Now supports --bam and --bam-labels to add per-sample:
+  • Coverage barplots over exon/TE positions
+  • Collapsed transcript tracks (spliced alignments shown as exon boxes + intron lines)
+
 Usage:
     python TEGV.py \
         --gff3 genes.gff3 \
         --te-fastas level0.fa level1.fa level2.fa \
         --ltr-divergence level0.div level1.div level2.div \
         --domains level0.domains level1.domains level2.domains \
+        --bam wt.bam met1.bam ddm1.bam \
+        --bam-labels wt met1 ddm1 \
         --output viewer.html
 
-python TEGV.py --gff3 cotton_ltr_r1.work/cotton_ltr_r1.genic.gff  --te-fastas cotton_ltr_r1.ltrharvest.full_length.dedup.fa.rexdb-plant.cls.lib.fa cotton_ltr_r2.ltrharvest.full_length.dedup.fa.rexdb-plant.cls.lib.fa cotton_ltr_r3.ltrharvest.full_length.dedup.fa.rexdb-plant.cls.lib.fa cotton_ltr_r4.ltrharvest.full_length.dedup.fa.rexdb-plant.cls.lib.fa cotton_ltr_r5.ltrharvest.full_length.dedup.fa.rexdb-plant.cls.lib.fa --ltr-divergence cotton_ltr_r1_kmer2ltr_dedup cotton_ltr_r2_kmer2ltr_dedup  cotton_ltr_r3_kmer2ltr_dedup cotton_ltr_r4_kmer2ltr_dedup cotton_ltr_r5_kmer2ltr_dedup --domains cotton_ltr_r1.work/cotton_ltr_r1.ltrtools.intact_for_tesorter.fa.rexdb-plant.dom.gff3 cotton_ltr_r2.work/cotton_ltr_r2.ltrtools.intact_for_tesorter.fa.rexdb-plant.dom.gff3 cotton_ltr_r3.work/cotton_ltr_r3.ltrtools.intact_for_tesorter.fa.rexdb-plant.dom.gff3 cotton_ltr_r4.work/cotton_ltr_r4.ltrtools.intact_for_tesorter.fa.rexdb-plant.dom.gff3 cotton_ltr_r5.work/cotton_ltr_r5.ltrtools.intact_for_tesorter.fa.rexdb-plant.dom.gff3
+python TEGV.py --gff3 Col0_ltr_r1.work/Col0_ltr_r1.genic.gff  --te-fastas Col0_ltr_r1.ltrharvest.full_length.dedup.fa.rexdb-plant.cls.lib.fa Col0_ltr_r2.ltrharvest.full_length.dedup.fa.rexdb-plant.cls.lib.fa Col0_ltr_r3.ltrharvest.full_length.dedup.fa.rexdb-plant.cls.lib.fa --ltr-divergence Col0_ltr_r1_kmer2ltr_dedup Col0_ltr_r2_kmer2ltr_dedup  Col0_ltr_r3_kmer2ltr_dedup --domains  Col0_ltr_r1.work/Col0_ltr_r1.ltrtools.intact_for_tesorter.fa.rexdb-plant.dom.gff3 Col0_ltr_r2.work/Col0_ltr_r2.ltrtools.intact_for_tesorter.fa.rexdb-plant.dom.gff3 Col0_ltr_r3.work/Col0_ltr_r3.ltrtools.intact_for_tesorter.fa.rexdb-plant.dom.gff3 --bam ltr_rt_validation/bam/wt.bam ltr_rt_validation/bam/met1.bam ltr_rt_validation/bam/ddm1.bam --bam-labels wt met1 ddm1 --output Col0_viewer_new.html --bin-size 200 --threads 200
 """
 
 import argparse
@@ -43,17 +49,17 @@ class TEElement:
     chrom: str
     start: int
     end: int
-    family: str        # e.g. "Ivana"
-    superfamily: str   # e.g. "LTR/Copia"
-    te_class: str      # e.g. "LTR"
-    level: int         # 0=innermost
+    family: str
+    superfamily: str
+    te_class: str
+    level: int
     ltr_len: int = 0
     k2p_dist: float = 0.0
     k2p_time: float = 0.0
-    has_divergence: bool = False   # True if a divergence row was matched
+    has_divergence: bool = False
     domains: list = field(default_factory=list)
     children: list = field(default_factory=list)
-    visible_frags: list = field(default_factory=list)  # [(start,end),...]
+    visible_frags: list = field(default_factory=list)
 
     @property
     def key(self):
@@ -68,7 +74,7 @@ class TEElement:
 class Exon:
     start: int
     end: int
-    feature_type: str  # exon / CDS / UTR
+    feature_type: str
 
 
 @dataclass
@@ -80,7 +86,7 @@ class Gene:
     strand: str
     gene_id: str
     exons: list = field(default_factory=list)
-    targets: list = field(default_factory=list)  # all Target= IDs merged into this gene
+    targets: list = field(default_factory=list)
 
 
 # ─────────────────────────────────────────────
@@ -88,19 +94,16 @@ class Gene:
 # ─────────────────────────────────────────────
 
 def parse_fasta_headers(fasta_path, level):
-    """Parse TE elements from FASTA headers like >Nem_chr1:4000-5000#LTR/Copia/Ivana"""
     elements = []
     with open(fasta_path, buffering=1 << 20) as f:
         for line in f:
             if not line or line[0] != '>':
                 continue
             header = line[1:].rstrip().split()[0]
-            # split coord part and classification
             if '#' not in header:
                 print(f"Warning: skipping malformed header: {header}", file=sys.stderr)
                 continue
             coord_part, classif = header.split('#', 1)
-            # parse chrom:start-end
             m = re.match(r'^(.+):(\d+)-(\d+)$', coord_part)
             if not m:
                 print(f"Warning: cannot parse coords in: {header}", file=sys.stderr)
@@ -108,7 +111,6 @@ def parse_fasta_headers(fasta_path, level):
             chrom = m.group(1)
             start = int(m.group(2))
             end = int(m.group(3))
-            # parse classification e.g. LTR/Copia/Ivana or DNA/TIR/Helitron
             parts = classif.split('/')
             te_class = parts[0] if len(parts) > 0 else 'Unknown'
             superfamily_parts = parts[:2] if len(parts) >= 2 else parts
@@ -123,20 +125,12 @@ def parse_fasta_headers(fasta_path, level):
 
 
 def parse_ltr_divergence(div_path, te_map):
-    """
-    Parse LTR divergence file and attach ltr_len + k2p stats to matching elements.
-    Key format: Nem_chr1:4000-5000#LTR/Copia/Ivana
-    Columns: LTR-RT  LTR_LEN  ALN_LEN  subs  transitions  transversions
-             p-dist  p-time  JC69-dist  JC69-time  K2P-dist  K2P-time
-    """
     with open(div_path, buffering=1 << 20) as f:
         for line in f:
             if not line or line[0] == '#':
                 continue
             cols = line.split()
-            if not cols:
-                continue
-            if len(cols) < 12:
+            if not cols or len(cols) < 12:
                 continue
             key = cols[0]
             try:
@@ -153,15 +147,7 @@ def parse_ltr_divergence(div_path, te_map):
 
 
 def parse_domains(domain_path, te_map):
-    """
-    Parse TEsorter-style domain GFF.
-    Uses (chrom, start, end) index for O(1) TE lookup; pre-compiled
-    regexes; buffered I/O; fast attr splitting. Previously O(N) per line.
-    """
-    # O(1) lookup index: (chrom, start, end) -> TEElement
     coord_index = {(te.chrom, te.start, te.end): te for te in te_map.values()}
-
-    # Compile patterns once
     _id_re   = re.compile(r'ID=([^;\t]+)')
     _gene_re = re.compile(r'gene=([^;\t]+)')
     _name_re = re.compile(r'Name=([^;\t]+)')
@@ -216,15 +202,8 @@ def parse_domains(domain_path, te_map):
 
 
 def parse_gff3(gff3_path):
-    """Parse GFF3 for genes/mRNAs, exons, CDSs, UTRs.
-    Handles both standard GFF3 (with gene features) and miniprot-style
-    GFF3 where mRNA is the top-level feature (no parent gene line).
-    Gene label priority: Target= > Name= > ID=
-    After parsing, overlapping genes on the same chrom+strand are collapsed
-    into a single representative gene; all Target IDs are preserved in .targets.
-    """
-    genes = {}         # gene_id -> Gene
-    mrna_to_gene = {}  # mRNA_id -> gene_id
+    genes = {}
+    mrna_to_gene = {}
 
     with open(gff3_path, buffering=1 << 20) as f:
         for line in f:
@@ -235,7 +214,6 @@ def parse_gff3(gff3_path):
                 continue
             chrom, source, feature, start, end, score, strand, phase, attrs = cols
             start, end = int(start), int(end)
-            # Fast attr parse: find '=' index directly, no strip needed for well-formed GFF3
             attr_dict = {}
             for attr in attrs.split(';'):
                 eq = attr.find('=')
@@ -244,8 +222,6 @@ def parse_gff3(gff3_path):
 
             gid    = attr_dict.get('ID', '')
             parent = attr_dict.get('Parent', '')
-
-            # Determine display name: prefer Target (first token), then Name, then ID
             target_raw  = attr_dict.get('Target', '')
             target_name = target_raw.split()[0] if target_raw else ''
             name = target_name or attr_dict.get('Name', '') or gid
@@ -256,7 +232,6 @@ def parse_gff3(gff3_path):
                 if target_name:
                     g.targets = [target_name]
                 genes[gid] = g
-
             elif feature == 'mRNA':
                 if parent and parent in genes:
                     mrna_to_gene[gid] = parent
@@ -271,13 +246,11 @@ def parse_gff3(gff3_path):
                     g.targets = [target_name] if target_name else []
                     genes[parent] = g
                 else:
-                    # miniprot: mRNA is top-level, no parent gene line
                     mrna_to_gene[gid] = gid
                     g = Gene(chrom=chrom, start=start, end=end,
                              name=name, strand=strand, gene_id=gid)
                     g.targets = [target_name] if target_name else []
                     genes[gid] = g
-
             elif feature in ('exon', 'CDS', 'five_prime_UTR', 'three_prime_UTR',
                               '5UTR', '3UTR', 'UTR', 'stop_codon'):
                 target_gene = mrna_to_gene.get(parent, parent)
@@ -291,24 +264,14 @@ def parse_gff3(gff3_path):
 
 
 def _collapse_overlapping_genes(genes):
-    """
-    Merge genes that overlap on the same chrom+strand into one representative.
-    The merged gene spans the union of all overlapping genes.
-    Its exons are the union of all CDS/exon blocks (deduplicated).
-    All Target IDs are pooled into .targets; .name = first target ID.
-    """
     from collections import defaultdict
-
-    # group by (chrom, strand)
     buckets = defaultdict(list)
     for g in genes:
         buckets[(g.chrom, g.strand)].append(g)
 
     merged = []
     for (chrom, strand), group in buckets.items():
-        # sort by start
         group.sort(key=lambda g: g.start)
-        # Sweep line: O(N log N) — track running max-end of current cluster
         clusters = []
         cur_cluster = []
         cur_end = -1
@@ -359,18 +322,12 @@ def _collapse_overlapping_genes(genes):
 # ─────────────────────────────────────────────
 
 def build_nesting(all_elements):
-    """
-    Assign children and compute visible_frags for each element.
-    Children of level-N elements are level-(N-1) elements whose coords
-    fall entirely within the parent on the same chromosome.
-    """
     by_level = defaultdict(list)
     for el in all_elements:
         by_level[el.level].append(el)
 
     max_level = max(by_level.keys()) if by_level else 0
 
-    # Index children by (level, chrom) to skip cross-chromosome comparisons
     children_by_chrom = defaultdict(lambda: defaultdict(list))
     for level, elems in by_level.items():
         for el in elems:
@@ -383,7 +340,6 @@ def build_nesting(all_elements):
                 if child.start >= parent.start and child.end <= parent.end:
                     parent.children.append(child)
 
-    # compute visible fragments for each element
     for el in all_elements:
         compute_visible_frags(el)
 
@@ -391,14 +347,9 @@ def build_nesting(all_elements):
 
 
 def compute_visible_frags(el):
-    """
-    Visible fragments = el's span minus its direct children's spans.
-    """
     if not el.children:
         el.visible_frags = [(el.start, el.end)]
         return
-
-    # sort children by start
     children_sorted = sorted(el.children, key=lambda c: c.start)
     frags = []
     cursor = el.start
@@ -409,6 +360,281 @@ def compute_visible_frags(el):
     if cursor < el.end:
         frags.append((cursor, el.end))
     el.visible_frags = frags if frags else []
+
+
+# ─────────────────────────────────────────────
+#  BAM processing  (fast, parallel)
+# ─────────────────────────────────────────────
+
+def _merge_regions(regions_by_chrom):
+    """Merge overlapping / nearby regions per chromosome."""
+    merged = {}
+    for chrom, regs in regions_by_chrom.items():
+        regs.sort()
+        m = []
+        for s, e in regs:
+            if m and s <= m[-1][1] + 1000:
+                m[-1] = (m[-1][0], max(m[-1][1], e))
+            else:
+                m.append((s, e))
+        merged[chrom] = m
+    return merged
+
+
+def _process_bam_chrom(bam_path, chrom, regions, bin_size):
+    """
+    Worker function: process one (BAM, chrom) pair.
+    Each worker opens its own file handle (required for multiprocessing).
+
+    Returns (chrom, cov_bins, tx_clusters).
+
+    FAST coverage strategy:
+      • One count_coverage() call per merged region (can span 100 kb+).
+      • numpy sums four base-count arrays → per-base depth vector.
+      • reshape/mean gives binned depth in one vectorised step.
+
+    FAST transcript strategy:
+      • read.get_blocks() (C-level) instead of Python CIGAR walk.
+      • Tuples instead of dicts for intermediate storage.
+    """
+    import pysam
+    import numpy as np
+
+    try:
+        bam = pysam.AlignmentFile(bam_path, "rb")
+    except Exception:
+        return (chrom, [], [])
+
+    if chrom not in set(bam.references):
+        bam.close()
+        return (chrom, [], [])
+
+    chrom_bins = []
+    all_raw_reads = []   # list of (start, end, strand, blocks_tuple)
+
+    for reg_start, reg_end in regions:
+        reg_len = reg_end - reg_start
+
+        # ── Coverage: single call, numpy binning ──
+        try:
+            counts = bam.count_coverage(
+                chrom, reg_start, reg_end, read_callback='all'
+            )
+            # counts is a tuple of 4 array.array objects (A, C, G, T)
+            # array.array typecode varies by platform ('L' = 4 or 8 bytes)
+            # so use np.array() which handles any type correctly
+            depth = np.zeros(reg_len, dtype=np.float64)
+            for arr in counts:
+                depth += np.array(arr, dtype=np.float64)
+
+            # Bin: trim to multiple of bin_size, reshape, mean
+            n_full_bins = reg_len // bin_size
+            if n_full_bins > 0:
+                trimmed = depth[:n_full_bins * bin_size]
+                binned = trimmed.reshape(n_full_bins, bin_size).mean(axis=1)
+                for i in range(n_full_bins):
+                    d = float(binned[i])
+                    if d > 0.01:
+                        chrom_bins.append({
+                            "s": reg_start + i * bin_size,
+                            "e": reg_start + (i + 1) * bin_size,
+                            "d": round(d, 2)
+                        })
+            # Remainder bin
+            remainder = reg_len - n_full_bins * bin_size
+            if remainder > 0:
+                d = float(depth[n_full_bins * bin_size:].mean())
+                if d > 0.01:
+                    chrom_bins.append({
+                        "s": reg_start + n_full_bins * bin_size,
+                        "e": reg_end,
+                        "d": round(d, 2)
+                    })
+        except Exception:
+            pass
+
+        # ── Transcripts: extract spliced reads ──
+        try:
+            for read in bam.fetch(chrom, reg_start, reg_end):
+                if read.flag & 0x904:          # unmapped | secondary | supplementary
+                    continue
+                if read.mapping_quality < 5:
+                    continue
+                blocks = read.get_blocks()     # C-level, returns list of (start, end)
+                if not blocks:
+                    continue
+                strand = '-' if read.is_reverse else '+'
+                all_raw_reads.append((blocks[0][0], blocks[-1][1], strand, blocks))
+        except Exception:
+            pass
+
+    bam.close()
+
+    # ── Collapse transcripts ──
+    tx_clusters = _collapse_transcripts_fast(all_raw_reads, chrom)
+
+    return (chrom, chrom_bins, tx_clusters)
+
+
+def _collapse_transcripts_fast(raw_reads, chrom):
+    """
+    Collapse overlapping spliced reads into representative transcript clusters.
+    Input: list of (start, end, strand, blocks) tuples.
+    Returns: list of dicts ready for JSON serialisation.
+    """
+    if not raw_reads:
+        return []
+
+    # Group by strand
+    by_strand = defaultdict(list)
+    for start, end, strand, blocks in raw_reads:
+        by_strand[strand].append((start, end, blocks))
+
+    results = []
+    for strand, reads in by_strand.items():
+        reads.sort()  # by (start, end, ...)
+        # Sweep-line clustering
+        clusters = []
+        cur_reads = []
+        cur_end = -1
+        for start, end, blocks in reads:
+            if cur_reads and start > cur_end:
+                clusters.append(cur_reads)
+                cur_reads = []
+                cur_end = -1
+            cur_reads.append(blocks)
+            if end > cur_end:
+                cur_end = end
+        if cur_reads:
+            clusters.append(cur_reads)
+
+        for cluster in clusters:
+            depth = len(cluster)
+            # Merge all exon blocks
+            all_blocks = []
+            for blocks in cluster:
+                all_blocks.extend(blocks)
+            all_blocks.sort()
+            merged = []
+            for s, e in all_blocks:
+                if merged and s <= merged[-1][1]:
+                    merged[-1] = (merged[-1][0], max(merged[-1][1], e))
+                else:
+                    merged.append((s, e))
+            results.append({
+                "c": chrom,
+                "s": merged[0][0],
+                "e": merged[-1][1],
+                "st": strand,
+                "b": [[s, e] for s, e in merged],
+                "d": depth
+            })
+
+    return results
+
+
+def compute_coverage_and_transcripts(bam_paths, bam_labels, genes, all_elements,
+                                     bin_size=50, threads=1):
+    """
+    Parallel BAM processing.  Each (BAM, chrom) pair is dispatched as an
+    independent job to a ProcessPoolExecutor.
+
+    Returns:
+      coverage_data:   { label: { chrom: [ {s, e, d}, ... ] } }
+      transcript_data: { label: [ {c, s, e, st, b, d}, ... ] }
+    """
+    from concurrent.futures import ProcessPoolExecutor, as_completed
+    import time
+
+    # Collect regions of interest per chrom
+    regions_by_chrom = defaultdict(list)
+    for g in genes:
+        regions_by_chrom[g.chrom].append((g.start, g.end))
+    for te in all_elements:
+        regions_by_chrom[te.chrom].append((te.start, te.end))
+
+    merged_regions = _merge_regions(regions_by_chrom)
+
+    total_region_bp = sum(
+        sum(e - s for s, e in regs) for regs in merged_regions.values()
+    )
+    print(f"  Regions of interest: {len(merged_regions)} chroms, "
+          f"{sum(len(r) for r in merged_regions.values())} regions, "
+          f"{total_region_bp/1e6:.1f} Mb total",
+          file=sys.stderr)
+
+    coverage_data = {}
+    transcript_data = {}
+
+    # Build job list: (bam_path, label, chrom, regions)
+    jobs = []
+    for bam_path, label in zip(bam_paths, bam_labels):
+        for chrom, regions in merged_regions.items():
+            jobs.append((bam_path, label, chrom, regions))
+
+    print(f"  Dispatching {len(jobs)} jobs across {threads} workers",
+          file=sys.stderr)
+
+    # Initialise result containers
+    for label in bam_labels:
+        coverage_data[label] = {}
+        transcript_data[label] = []
+
+    t0 = time.time()
+    completed = 0
+
+    if threads <= 1:
+        # Sequential — avoids pickling overhead for single-thread
+        for bam_path, label, chrom, regions in jobs:
+            ch, cov_bins, tx_clusters = _process_bam_chrom(
+                bam_path, chrom, regions, bin_size
+            )
+            if cov_bins:
+                coverage_data[label][ch] = cov_bins
+            if tx_clusters:
+                transcript_data[label].extend(tx_clusters)
+            completed += 1
+            elapsed = time.time() - t0
+            print(f"\r  [{completed}/{len(jobs)}] {label} {chrom} "
+                  f"({len(cov_bins)} cov bins, {len(tx_clusters)} tx) "
+                  f"[{elapsed:.0f}s]",
+                  end='', file=sys.stderr)
+        print(file=sys.stderr)
+    else:
+        with ProcessPoolExecutor(max_workers=threads) as pool:
+            future_map = {}
+            for bam_path, label, chrom, regions in jobs:
+                fut = pool.submit(
+                    _process_bam_chrom, bam_path, chrom, regions, bin_size
+                )
+                future_map[fut] = (label, chrom)
+
+            for fut in as_completed(future_map):
+                label, chrom = future_map[fut]
+                try:
+                    ch, cov_bins, tx_clusters = fut.result()
+                except Exception as ex:
+                    print(f"\n  ERROR {label}/{chrom}: {ex}", file=sys.stderr)
+                    continue
+                if cov_bins:
+                    coverage_data[label][ch] = cov_bins
+                if tx_clusters:
+                    transcript_data[label].extend(tx_clusters)
+                completed += 1
+                elapsed = time.time() - t0
+                print(f"\r  [{completed}/{len(jobs)}] {label} {chrom} "
+                      f"({len(cov_bins)} cov bins, {len(tx_clusters)} tx) "
+                      f"[{elapsed:.0f}s]",
+                      end='', file=sys.stderr)
+            print(file=sys.stderr)
+
+    for label in bam_labels:
+        n_cov = sum(len(v) for v in coverage_data[label].values())
+        n_tx = len(transcript_data[label])
+        print(f"  {label}: {n_cov} coverage bins, {n_tx} transcript clusters",
+              file=sys.stderr)
+
+    return coverage_data, transcript_data
 
 
 # ─────────────────────────────────────────────
@@ -497,7 +723,6 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     overflow: hidden;
   }
 
-  /* ── Header ── */
   header {
     background: var(--surface);
     border-bottom: 1px solid var(--border);
@@ -539,7 +764,6 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     transition: border-color 0.15s;
   }
   select:focus, input:focus { border-color: var(--accent); }
-
   input[type=number] { width: 100px; }
 
   button {
@@ -559,35 +783,23 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
   .sep { width: 1px; height: 24px; background: var(--border); }
 
-  /* ── Minimap ── */
   #minimap-container {
     background: var(--surface);
     border-bottom: 1px solid var(--border);
     padding: 6px 20px;
     flex-shrink: 0;
   }
+  #minimap { width: 100%; height: 28px; cursor: crosshair; }
 
-  #minimap {
-    width: 100%;
-    height: 28px;
-    cursor: crosshair;
-  }
-
-  /* ── Main canvas area ── */
   #viewer-wrap {
     flex: 1;
     overflow: hidden;
     position: relative;
   }
 
-  #viewer-svg {
-    width: 100%;
-    height: 100%;
-    cursor: grab;
-  }
+  #viewer-svg { width: 100%; height: 100%; cursor: grab; }
   #viewer-svg:active { cursor: grabbing; }
 
-  /* ── Tooltip ── */
   #tooltip {
     position: fixed;
     background: var(--surface2);
@@ -602,7 +814,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     opacity: 0;
     transition: opacity 0.1s;
     z-index: 1000;
-    max-width: 340px;
+    max-width: 380px;
     line-height: 1.7;
   }
   #tooltip.visible { opacity: 1; }
@@ -610,7 +822,6 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   #tooltip .tt-row { display: flex; gap: 12px; }
   #tooltip .tt-label { color: var(--text-dim); min-width: 70px; }
 
-  /* ── Legend ── */
   #legend {
     background: var(--surface);
     border-top: 1px solid var(--border);
@@ -627,19 +838,13 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   .legend-swatch { width: 14px; height: 10px; border-radius: 2px; flex-shrink: 0; }
   .legend-label { color: var(--text); font-family: 'IBM Plex Mono', monospace; }
 
-  /* ── Scale bar ── */
   .scale-bar text { fill: var(--text-dim); font-family: 'IBM Plex Mono', monospace; font-size: 10px; }
   .scale-bar line { stroke: var(--text-dim); }
-
-  /* ── Track labels ── */
   .track-label { fill: var(--text-dim); font-family: 'IBM Plex Mono', monospace; font-size: 10px; text-transform: uppercase; letter-spacing: 0.06em; }
-
-  /* ── Coord ruler ── */
   .ruler text { fill: var(--text-dim); font-family: 'IBM Plex Mono', monospace; font-size: 10px; }
   .ruler line { stroke: var(--border); }
   .ruler .major { stroke: var(--text-dim); }
 
-  /* ── Status bar ── */
   #statusbar {
     position: absolute;
     bottom: 8px;
@@ -705,22 +910,37 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 // ═══════════════════════════════════════════════════════
 const RAW_TES  = __TE_DATA__;
 const RAW_GENES = __GENE_DATA__;
+const RAW_COVERAGE = __COVERAGE_DATA__;
+const RAW_TRANSCRIPTS = __TRANSCRIPT_DATA__;
+const BAM_LABELS = __BAM_LABELS__;
 
 // ═══════════════════════════════════════════════════════
 //  CONSTANTS & CONFIG
 // ═══════════════════════════════════════════════════════
-const RULER_H     = 28;
-const GENE_H      = 18;
-const GENE_ROW_H  = 26;
-const TE_ROW_H    = 22;
-const TE_BAR_H    = 14;
-const LTR_SHADE   = 0.6;   // darken factor for LTR ends
-const DOMAIN_H    = 8;
-const PAD_LEFT    = 70;
-const PAD_RIGHT   = 20;
-const PAD_TOP     = 14;
+const RULER_H       = 28;
+const GENE_H        = 18;
+const GENE_ROW_H    = 26;
+const TE_ROW_H      = 22;
+const TE_BAR_H      = 14;
+const LTR_SHADE     = 0.6;
+const DOMAIN_H      = 8;
+const PAD_LEFT      = 70;
+const PAD_RIGHT     = 20;
+const PAD_TOP       = 14;
 
-// Family → color palette (qualitative, colorblind-friendly extended)
+// BAM track dimensions
+const COV_TRACK_H   = 50;   // height of each coverage barplot
+const COV_GAP       = 4;
+const TX_ROW_H      = 16;   // height of each transcript row
+const TX_BAR_H      = 10;
+const TX_TRACK_PAD  = 6;
+
+// Colors for BAM samples
+const BAM_COLORS = [
+  "#e06c75", "#61afef", "#98c379", "#d19a66", "#c678dd",
+  "#56b6c2", "#e5c07b", "#ff6b81"
+];
+
 const FAMILY_PALETTE = [
   "#4a9eff","#ff6b6b","#51cf66","#ffd43b","#cc5de8",
   "#ff922b","#20c997","#f06595","#74c0fc","#a9e34b",
@@ -742,14 +962,8 @@ function ltrColor(family) {
   if (c) { c.opacity = 1; return c.darker(0.9).formatHex(); }
   return "#555";
 }
+function internalColor(family) { return familyColor.get(family) || "#888"; }
 
-function internalColor(family) {
-  return familyColor.get(family) || "#888";
-}
-
-function domainColor() { return "#fff"; }
-
-// Gene colors
 const GENE_BODY_COLOR  = "#3a6a9a";
 const GENE_EXON_COLOR  = "#7bb8f0";
 const GENE_CDS_COLOR   = "#9acfff";
@@ -768,6 +982,7 @@ let currentChrom = chroms[0] || '';
 let viewStart = 0;
 let viewEnd = 1;
 let hiddenFamilies = new Set();
+let hiddenSamples = new Set();
 
 // ═══════════════════════════════════════════════════════
 //  CHROM DATA
@@ -793,27 +1008,36 @@ function setChrom(chrom) {
 // ═══════════════════════════════════════════════════════
 function computeLayout(chrom, vStart, vEnd) {
   const tes = RAW_TES.filter(d =>
-    d.chrom === chrom &&
-    d.end > vStart && d.start < vEnd &&
-    !hiddenFamilies.has(d.family)
+    d.chrom === chrom && d.end > vStart && d.start < vEnd && !hiddenFamilies.has(d.family)
   );
   const genes = RAW_GENES.filter(d =>
     d.chrom === chrom && d.end > vStart && d.start < vEnd
   );
 
-  // max nesting level present
   const maxLevel = tes.length ? Math.max(...tes.map(d => d.level)) : 0;
-
-  // Build rows: we lay out interleaved genes and TE stacks
-  // TE rows: one row per nesting level (level 0 at top, maxLevel at bottom)
-  // Genes: placed in their own rows using a greedy non-overlapping packer
-
   const teRowCount = maxLevel + 1;
-
-  // Pack genes into non-overlapping rows
   const geneRows = packRows(genes);
 
-  return { tes, genes, geneRows, teRowCount, maxLevel };
+  // Compute visible BAM labels (not hidden)
+  const visibleLabels = BAM_LABELS.filter(l => !hiddenSamples.has(l));
+
+  // Coverage bins per visible label
+  const covByLabel = {};
+  for (const label of visibleLabels) {
+    const chromCov = (RAW_COVERAGE[label] || {})[chrom] || [];
+    covByLabel[label] = chromCov.filter(b => b.e > vStart && b.s < vEnd);
+  }
+
+  // Transcripts per visible label
+  const txByLabel = {};
+  for (const label of visibleLabels) {
+    const allTx = (RAW_TRANSCRIPTS[label] || []).filter(t =>
+      t.c === chrom && t.e > vStart && t.s < vEnd
+    );
+    txByLabel[label] = packRows(allTx.map(t => ({start: t.s, end: t.e, ...t})));
+  }
+
+  return { tes, genes, geneRows, teRowCount, maxLevel, visibleLabels, covByLabel, txByLabel };
 }
 
 function packRows(features) {
@@ -840,7 +1064,6 @@ function svgDims() {
   const wrap = document.getElementById('viewer-wrap');
   return { W: wrap.clientWidth, H: wrap.clientHeight };
 }
-
 function trackWidth(W) { return W - PAD_LEFT - PAD_RIGHT; }
 
 // ═══════════════════════════════════════════════════════
@@ -851,7 +1074,7 @@ function renderAll() {
   const TW = trackWidth(W);
 
   const layout = computeLayout(currentChrom, viewStart, viewEnd);
-  const { tes, genes, geneRows, teRowCount } = layout;
+  const { tes, genes, geneRows, teRowCount, visibleLabels, covByLabel, txByLabel } = layout;
 
   const xScale = d3.scaleLinear()
     .domain([viewStart, viewEnd])
@@ -860,7 +1083,17 @@ function renderAll() {
   // compute total height
   const geneBlockH = geneRows.length * GENE_ROW_H;
   const teBlockH   = teRowCount * TE_ROW_H;
-  const totalContentH = PAD_TOP + RULER_H + geneBlockH + 10 + teBlockH + 40;
+
+  // BAM tracks height
+  let bamBlockH = 0;
+  for (const label of visibleLabels) {
+    bamBlockH += COV_TRACK_H + COV_GAP;  // coverage
+    const txRows = txByLabel[label] || [];
+    const txH = Math.max(0, txRows.length) * TX_ROW_H + TX_TRACK_PAD;
+    bamBlockH += txH + 8;  // transcripts + gap
+  }
+
+  const totalContentH = PAD_TOP + RULER_H + geneBlockH + 10 + teBlockH + 20 + bamBlockH + 40;
   const svgH = Math.max(H, totalContentH);
 
   const svg = d3.select('#viewer-svg');
@@ -882,28 +1115,63 @@ function renderAll() {
     yOffset += geneBlockH + 10;
   }
 
-  // ── TE track label ──
+  // ── TE track ──
   svg.append('text').attr('class','track-label')
     .attr('x', 4).attr('y', yOffset + 12).text('TEs');
 
-  // ── TE rows: innermost (level 0) at top ──
   for (let lvl = 0; lvl <= layout.maxLevel; lvl++) {
     const rowTEs = tes.filter(d => d.level === lvl);
     const rowY = yOffset + lvl * TE_ROW_H;
     drawTERow(svg, rowTEs, xScale, rowY, lvl);
   }
-
-  // ── Nesting connectors ──
   drawNestingConnectors(svg, tes, xScale, yOffset);
+  yOffset += teBlockH + 20;
 
-  // ── Viewport pan/zoom ──
+  // ── BAM tracks (coverage + transcripts per sample) ──
+  for (let si = 0; si < visibleLabels.length; si++) {
+    const label = visibleLabels[si];
+    const color = BAM_COLORS[si % BAM_COLORS.length];
+
+    // Separator line
+    svg.append('line')
+      .attr('x1', PAD_LEFT).attr('x2', PAD_LEFT + TW)
+      .attr('y1', yOffset - 2).attr('y2', yOffset - 2)
+      .attr('stroke', 'var(--border)').attr('stroke-width', 0.5);
+
+    // ── Coverage barplot ──
+    svg.append('text').attr('class','track-label')
+      .attr('x', 4).attr('y', yOffset + 10)
+      .text(label.toUpperCase());
+    svg.append('text')
+      .attr('x', 4).attr('y', yOffset + 20)
+      .attr('fill','var(--text-dim)')
+      .attr('font-family','IBM Plex Mono,monospace')
+      .attr('font-size','8px')
+      .text('coverage');
+
+    drawCoverageTrack(svg, covByLabel[label] || [], xScale, yOffset, TW, color);
+    yOffset += COV_TRACK_H + COV_GAP;
+
+    // ── Transcript track ──
+    svg.append('text')
+      .attr('x', 4).attr('y', yOffset + 9)
+      .attr('fill','var(--text-dim)')
+      .attr('font-family','IBM Plex Mono,monospace')
+      .attr('font-size','8px')
+      .text('transcripts');
+
+    const txRows = txByLabel[label] || [];
+    drawTranscriptTrack(svg, txRows, xScale, yOffset, color);
+    const txH = Math.max(0, txRows.length) * TX_ROW_H + TX_TRACK_PAD;
+    yOffset += txH + 8;
+  }
+
+  // ── Interaction ──
   setupInteraction(svg, xScale, W, TW, svgH);
 
-  // ── Status bar ──
   document.getElementById('statusbar').textContent =
     `${currentChrom}  ${fmt(viewStart)}–${fmt(viewEnd)}  (${fmt(viewEnd - viewStart)} bp)`;
 
-  // ── Minimap ──
   renderMinimap(tes, genes);
 }
 
@@ -921,9 +1189,7 @@ function drawRuler(svg, xScale, y, W, TW) {
     .attr('stroke','var(--border)').attr('stroke-width',1);
 
   const ticks = d3.range(
-    Math.ceil(viewStart / step) * step,
-    viewEnd,
-    step
+    Math.ceil(viewStart / step) * step, viewEnd, step
   );
   ticks.forEach(t => {
     const x = xScale(t);
@@ -962,13 +1228,11 @@ function drawGenes(svg, geneRows, xScale, yOffset) {
       const gw = Math.max(2, xScale(gene.end) - xScale(gene.start));
       const gg = g.append('g').attr('class','gene-feat');
 
-      // intron line (gene body)
       gg.append('line')
         .attr('x1', gx).attr('x2', gx + gw)
         .attr('y1', ry + GENE_H / 2).attr('y2', ry + GENE_H / 2)
         .attr('stroke', GENE_BODY_COLOR).attr('stroke-width', 1.5);
 
-      // direction arrows along body
       const arrowSpacing = 40;
       const arrowN = Math.floor(gw / arrowSpacing);
       for (let i = 0; i <= arrowN; i++) {
@@ -981,7 +1245,6 @@ function drawGenes(svg, geneRows, xScale, yOffset) {
           .attr('stroke-width',1).attr('opacity',0.5);
       }
 
-      // exons / CDS / UTR
       gene.exons.forEach(ex => {
         const ex_x = xScale(ex.start);
         const ex_w = Math.max(1, xScale(ex.end) - xScale(ex.start));
@@ -996,7 +1259,6 @@ function drawGenes(svg, geneRows, xScale, yOffset) {
           .attr('fill', color).attr('rx', 1);
       });
 
-      // gene body outline (if no exons, draw a box)
       if (gene.exons.length === 0) {
         gg.append('rect')
           .attr('x', gx).attr('y', ry)
@@ -1004,7 +1266,6 @@ function drawGenes(svg, geneRows, xScale, yOffset) {
           .attr('fill', GENE_EXON_COLOR).attr('rx', 2);
       }
 
-      // gene label
       if (gw > 30) {
         gg.append('text')
           .attr('x', gx + gw / 2).attr('y', ry - 2)
@@ -1015,7 +1276,6 @@ function drawGenes(svg, geneRows, xScale, yOffset) {
           .text(gene.name.length > 16 ? gene.name.slice(0,14)+'…' : gene.name);
       }
 
-      // tooltip interaction
       gg.selectAll('rect,line').on('mousemove', (event) => {
         showTooltip(event, buildGeneTooltip(gene));
       }).on('mouseleave', hideTooltip);
@@ -1030,7 +1290,6 @@ function drawTERow(svg, rowTEs, xScale, rowY, level) {
   const g = svg.append('g').attr('class', `te-row te-level-${level}`);
   const barY = rowY + (TE_ROW_H - TE_BAR_H) / 2;
 
-  // level indicator
   svg.append('text')
     .attr('x', PAD_LEFT - 4)
     .attr('y', rowY + TE_ROW_H / 2 + 4)
@@ -1049,14 +1308,10 @@ function drawTERow(svg, rowTEs, xScale, rowY, level) {
       const fw = Math.max(1, xScale(fe) - xScale(fs));
 
       if (isLTR && te.ltr_len > 0) {
-        // determine which part of the element this fragment covers
         const ltrLeft  = { s: te.start, e: te.start + te.ltr_len };
         const ltrRight = { s: te.end - te.ltr_len, e: te.end };
-
-        // draw sub-segments of this fragment
         drawLTRFragment(fragG, fs, fe, te, ltrLeft, ltrRight, xScale, barY);
       } else {
-        // plain bar
         fragG.append('rect')
           .attr('x', fx).attr('y', barY)
           .attr('width', fw).attr('height', TE_BAR_H)
@@ -1065,7 +1320,6 @@ function drawTERow(svg, rowTEs, xScale, rowY, level) {
       }
     });
 
-    // protein domains (drawn on innermost fragments at level 0)
     if (te.domains && te.domains.length > 0) {
       te.domains.forEach(dom => {
         if (dom.start >= te.start && dom.end <= te.end) {
@@ -1090,7 +1344,6 @@ function drawTERow(svg, rowTEs, xScale, rowY, level) {
       });
     }
 
-    // K2P label if visible
     const teX = xScale(te.start);
     const teW = xScale(te.end) - xScale(te.start);
     if (te.k2p_dist > 0 && teW > 40 && te.visible_frags.length > 0) {
@@ -1104,7 +1357,6 @@ function drawTERow(svg, rowTEs, xScale, rowY, level) {
         .text(`K2P:${te.k2p_dist.toFixed(3)}`);
     }
 
-    // invisible hit target for tooltip
     if (te.visible_frags.length > 0) {
       const allFragsX1 = xScale(Math.min(...te.visible_frags.map(f=>f[0])));
       const allFragsX2 = xScale(Math.max(...te.visible_frags.map(f=>f[1])));
@@ -1120,23 +1372,18 @@ function drawTERow(svg, rowTEs, xScale, rowY, level) {
 }
 
 function drawLTRFragment(g, fs, fe, te, ltrLeft, ltrRight, xScale, barY) {
-  // Split fragment into up to 3 segments: ltr_left_part | internal | ltr_right_part
   const segments = [];
-  // left LTR overlap
   const ll_s = Math.max(fs, ltrLeft.s);
   const ll_e = Math.min(fe, ltrLeft.e);
   if (ll_e > ll_s) segments.push({ s: ll_s, e: ll_e, type: 'ltr' });
-  // internal
   const int_s = Math.max(fs, ltrLeft.e);
   const int_e = Math.min(fe, ltrRight.s);
   if (int_e > int_s) segments.push({ s: int_s, e: int_e, type: 'internal' });
-  // right LTR overlap
   const rl_s = Math.max(fs, ltrRight.s);
   const rl_e = Math.min(fe, ltrRight.e);
   if (rl_e > rl_s) segments.push({ s: rl_s, e: rl_e, type: 'ltr' });
 
   if (segments.length === 0) {
-    // fallback: plain bar
     g.append('rect')
       .attr('x', xScale(fs)).attr('y', barY)
       .attr('width', Math.max(1, xScale(fe) - xScale(fs)))
@@ -1146,21 +1393,17 @@ function drawLTRFragment(g, fs, fe, te, ltrLeft, ltrRight, xScale, barY) {
     return;
   }
 
-  const isFirstSeg = idx => idx === 0;
-  const isLastSeg  = (idx, arr) => idx === arr.length - 1;
-
   segments.forEach((seg, idx) => {
     const sx = xScale(seg.s);
     const sw = Math.max(1, xScale(seg.e) - xScale(seg.s));
     const color = seg.type === 'ltr' ? ltrColor(te.family) : internalColor(te.family);
     const h = seg.type === 'ltr' ? TE_BAR_H : TE_BAR_H - 2;
     const dy = seg.type === 'ltr' ? 0 : 1;
-    // rounded corners only on outer ends
     g.append('rect')
       .attr('x', sx).attr('y', barY + dy)
       .attr('width', sw).attr('height', h)
       .attr('fill', color)
-      .attr('rx', (isFirstSeg(idx) || isLastSeg(idx, segments)) ? 2 : 0)
+      .attr('rx', (idx === 0 || idx === segments.length - 1) ? 2 : 0)
       .attr('opacity', 0.9);
   });
 }
@@ -1169,9 +1412,7 @@ function drawLTRFragment(g, fs, fe, te, ltrLeft, ltrRight, xScale, barY) {
 //  NESTING CONNECTORS
 // ═══════════════════════════════════════════════════════
 function drawNestingConnectors(svg, tes, xScale, teTrackY) {
-  // Draw subtle vertical lines connecting parent fragments to child elements
   const g = svg.append('g').attr('class','connectors').attr('opacity',0.25);
-
   tes.forEach(parent => {
     if (parent.level === 0) return;
     const childLevel = parent.level - 1;
@@ -1181,7 +1422,6 @@ function drawNestingConnectors(svg, tes, xScale, teTrackY) {
       c.start >= parent.start && c.end <= parent.end
     );
     children.forEach(child => {
-      // connect left edge of child to parent
       const cy_child  = teTrackY + childLevel  * TE_ROW_H + (TE_ROW_H - TE_BAR_H) / 2;
       const cy_parent = teTrackY + parent.level * TE_ROW_H + (TE_ROW_H - TE_BAR_H) / 2;
       const cx = xScale((child.start + child.end) / 2);
@@ -1190,6 +1430,166 @@ function drawNestingConnectors(svg, tes, xScale, teTrackY) {
         .attr('x2', cx).attr('y2', cy_parent)
         .attr('stroke','var(--text-dim)').attr('stroke-width',0.5)
         .attr('stroke-dasharray','2,2');
+    });
+  });
+}
+
+// ═══════════════════════════════════════════════════════
+//  COVERAGE BARPLOT
+// ═══════════════════════════════════════════════════════
+function drawCoverageTrack(svg, bins, xScale, yOffset, TW, color) {
+  const g = svg.append('g').attr('class','cov-track');
+
+  if (!bins.length) {
+    g.append('text')
+      .attr('x', PAD_LEFT + TW / 2).attr('y', yOffset + COV_TRACK_H / 2)
+      .attr('text-anchor','middle')
+      .attr('fill','var(--text-dim)')
+      .attr('font-size','10px')
+      .text('no coverage in view');
+    return;
+  }
+
+  const maxDepth = Math.max(...bins.map(b => b.d), 1);
+  const yScale = d3.scaleLinear()
+    .domain([0, maxDepth])
+    .range([yOffset + COV_TRACK_H, yOffset + 4]);
+
+  // Draw axis ticks (max value)
+  g.append('text')
+    .attr('x', PAD_LEFT - 4).attr('y', yOffset + 8)
+    .attr('text-anchor','end')
+    .attr('fill','var(--text-dim)')
+    .attr('font-family','IBM Plex Mono,monospace')
+    .attr('font-size','8px')
+    .text(maxDepth >= 1000 ? (maxDepth/1000).toFixed(1)+'k' : Math.round(maxDepth));
+
+  g.append('text')
+    .attr('x', PAD_LEFT - 4).attr('y', yOffset + COV_TRACK_H)
+    .attr('text-anchor','end')
+    .attr('fill','var(--text-dim)')
+    .attr('font-family','IBM Plex Mono,monospace')
+    .attr('font-size','8px')
+    .text('0');
+
+  // Baseline
+  g.append('line')
+    .attr('x1', PAD_LEFT).attr('x2', PAD_LEFT + TW)
+    .attr('y1', yOffset + COV_TRACK_H).attr('y2', yOffset + COV_TRACK_H)
+    .attr('stroke','var(--border)').attr('stroke-width', 0.5);
+
+  // Draw bars
+  bins.forEach(bin => {
+    const bx = xScale(bin.s);
+    const bw = Math.max(1, xScale(bin.e) - xScale(bin.s));
+    const by = yScale(bin.d);
+    const bh = yOffset + COV_TRACK_H - by;
+    g.append('rect')
+      .attr('x', bx).attr('y', by)
+      .attr('width', bw).attr('height', Math.max(0.5, bh))
+      .attr('fill', color).attr('opacity', 0.7);
+  });
+
+  // Tooltip on the coverage region
+  g.append('rect')
+    .attr('x', PAD_LEFT).attr('y', yOffset)
+    .attr('width', TW).attr('height', COV_TRACK_H)
+    .attr('fill', 'transparent')
+    .on('mousemove', (event) => {
+      const [mx] = d3.pointer(event);
+      const genomicPos = xScale.invert(mx);
+      // Find closest bin
+      let closest = null;
+      let minDist = Infinity;
+      for (const bin of bins) {
+        const mid = (bin.s + bin.e) / 2;
+        const dist = Math.abs(mid - genomicPos);
+        if (dist < minDist) { minDist = dist; closest = bin; }
+      }
+      if (closest) {
+        showTooltip(event,
+          `<div class="tt-title">Coverage</div>
+           <div class="tt-row"><span class="tt-label">Position</span><span>${fmt(closest.s)}-${fmt(closest.e)}</span></div>
+           <div class="tt-row"><span class="tt-label">Depth</span><span>${closest.d.toFixed(1)}×</span></div>`
+        );
+      }
+    })
+    .on('mouseleave', hideTooltip);
+}
+
+// ═══════════════════════════════════════════════════════
+//  TRANSCRIPT TRACK
+// ═══════════════════════════════════════════════════════
+function drawTranscriptTrack(svg, txRows, xScale, yOffset, color) {
+  const g = svg.append('g').attr('class','tx-track');
+
+  txRows.forEach((row, ri) => {
+    const ry = yOffset + ri * TX_ROW_H + (TX_ROW_H - TX_BAR_H) / 2;
+    row.forEach(tx => {
+      const txG = g.append('g');
+
+      // Intron line spanning full extent
+      const tx_x1 = xScale(tx.s);
+      const tx_x2 = xScale(tx.e);
+      txG.append('line')
+        .attr('x1', tx_x1).attr('x2', tx_x2)
+        .attr('y1', ry + TX_BAR_H / 2).attr('y2', ry + TX_BAR_H / 2)
+        .attr('stroke', color).attr('stroke-width', 1).attr('opacity', 0.5);
+
+      // Strand arrows
+      const dir = tx.st === '-' ? -1 : 1;
+      const gw = tx_x2 - tx_x1;
+      const arrowN = Math.max(1, Math.floor(gw / 50));
+      for (let i = 0; i <= arrowN; i++) {
+        const ax = tx_x1 + (i / Math.max(arrowN, 1)) * gw;
+        const aw = 4;
+        txG.append('path')
+          .attr('d', `M${ax},${ry + TX_BAR_H/2 - 2} L${ax + dir*aw},${ry + TX_BAR_H/2} L${ax},${ry + TX_BAR_H/2 + 2}`)
+          .attr('fill','none').attr('stroke', color)
+          .attr('stroke-width', 0.8).attr('opacity', 0.4);
+      }
+
+      // Exon blocks
+      (tx.b || []).forEach(block => {
+        const bs = block[0], be = block[1];
+        const bx = xScale(bs);
+        const bw = Math.max(1, xScale(be) - xScale(bs));
+        txG.append('rect')
+          .attr('x', bx).attr('y', ry)
+          .attr('width', bw).attr('height', TX_BAR_H)
+          .attr('fill', color).attr('opacity', 0.75).attr('rx', 1);
+      });
+
+      // Depth label if space
+      if (gw > 30 && tx.d > 1) {
+        txG.append('text')
+          .attr('x', tx_x1 + gw / 2).attr('y', ry - 1)
+          .attr('text-anchor','middle')
+          .attr('fill','var(--text-dim)')
+          .attr('font-family','IBM Plex Mono,monospace')
+          .attr('font-size','7px')
+          .text(`${tx.d}×`);
+      }
+
+      // Tooltip hit area
+      txG.append('rect')
+        .attr('x', tx_x1).attr('y', ry - 2)
+        .attr('width', Math.max(1, tx_x2 - tx_x1))
+        .attr('height', TX_BAR_H + 4)
+        .attr('fill','transparent')
+        .on('mousemove', (event) => {
+          const nBlocks = (tx.b || []).length;
+          const totalExon = (tx.b || []).reduce((a, b) => a + (b[1] - b[0]), 0);
+          showTooltip(event,
+            `<div class="tt-title">Transcript cluster</div>
+             <div class="tt-row"><span class="tt-label">Span</span><span>${fmt(tx.s)}-${fmt(tx.e)}</span></div>
+             <div class="tt-row"><span class="tt-label">Strand</span><span>${tx.st}</span></div>
+             <div class="tt-row"><span class="tt-label">Exon blocks</span><span>${nBlocks}</span></div>
+             <div class="tt-row"><span class="tt-label">Exon bp</span><span>${fmt(totalExon)}</span></div>
+             <div class="tt-row"><span class="tt-label">Read depth</span><span>${tx.d} reads</span></div>`
+          );
+        })
+        .on('mouseleave', hideTooltip);
     });
   });
 }
@@ -1210,11 +1610,9 @@ function renderMinimap(tes, genes) {
 
   const mx = d3.scaleLinear().domain([0, chromLen]).range([PAD_LEFT, PAD_LEFT + W - PAD_LEFT]);
 
-  // background
   svg.append('rect').attr('x',PAD_LEFT).attr('y',4).attr('width',W-PAD_LEFT).attr('height',H-8)
      .attr('fill','var(--surface2)').attr('rx',2);
 
-  // TE density blobs
   const allChromTEs = RAW_TES.filter(d => d.chrom === currentChrom && !hiddenFamilies.has(d.family));
   allChromTEs.forEach(te => {
     const tx = mx(te.start);
@@ -1224,7 +1622,6 @@ function renderMinimap(tes, genes) {
        .attr('fill', internalColor(te.family)).attr('opacity', 0.4);
   });
 
-  // gene marks
   const allChromGenes = RAW_GENES.filter(d => d.chrom === currentChrom);
   allChromGenes.forEach(g => {
     const gx = mx(g.start);
@@ -1232,7 +1629,6 @@ function renderMinimap(tes, genes) {
        .attr('stroke', GENE_ARROW_COLOR).attr('stroke-width',1).attr('opacity',0.6);
   });
 
-  // viewport highlight
   const vx = mx(viewStart);
   const vw = Math.max(4, mx(viewEnd) - mx(viewStart));
   const vp = svg.append('rect')
@@ -1242,7 +1638,6 @@ function renderMinimap(tes, genes) {
     .attr('stroke','var(--accent)').attr('stroke-width',1)
     .attr('rx',2).attr('cursor','ew-resize');
 
-  // drag viewport on minimap
   const drag = d3.drag().on('drag', (event) => {
     const clickX = Math.max(PAD_LEFT, Math.min(PAD_LEFT + W - PAD_LEFT, event.x));
     const genomicPos = mx.invert(clickX);
@@ -1253,7 +1648,6 @@ function renderMinimap(tes, genes) {
   });
   vp.call(drag);
 
-  // click to jump
   svg.on('click', (event) => {
     const [px] = d3.pointer(event);
     const genomicPos = mx.invert(px);
@@ -1268,14 +1662,10 @@ function renderMinimap(tes, genes) {
 //  PAN / ZOOM INTERACTION
 // ═══════════════════════════════════════════════════════
 function setupInteraction(svg, xScale, W, TW, svgH) {
-  // Drag state lives outside all event handlers so it survives
-  // cursor moving over child elements (TE bars, gene rects, etc.)
-  // which previously fired mouseout and killed the drag.
   let dragStartX   = null;
   let dragStartView = null;
   let isDragging   = false;
 
-  // Mousedown on the SVG starts a potential drag
   svg.on('mousedown', (event) => {
     if (event.button !== 0) return;
     dragStartX    = event.clientX;
@@ -1284,8 +1674,6 @@ function setupInteraction(svg, xScale, W, TW, svgH) {
     event.preventDefault();
   });
 
-  // Mousemove and mouseup are on window so they fire even when the
-  // cursor slides over child SVG elements or leaves the SVG entirely.
   window.addEventListener('mousemove', (event) => {
     if (dragStartX === null) return;
     const dx = event.clientX - dragStartX;
@@ -1311,7 +1699,6 @@ function setupInteraction(svg, xScale, W, TW, svgH) {
     event.preventDefault();
     const factor = event.deltaY > 0 ? 1.25 : 0.8;
     const span = viewEnd - viewStart;
-    // zoom toward the mouse position on the genome
     const mx = event.offsetX;
     const genomicMx = xScale.invert(mx);
     const ratio = (genomicMx - viewStart) / span;
@@ -1379,13 +1766,11 @@ function buildLegend() {
   const container = document.getElementById('legend');
   container.innerHTML = '';
 
-  // gene item
   const geneItem = document.createElement('div');
   geneItem.className = 'legend-item';
   geneItem.innerHTML = `<div class="legend-swatch" style="background:${GENE_EXON_COLOR}"></div><span class="legend-label">Gene</span>`;
   container.appendChild(geneItem);
 
-  // TE families
   allFamilies.forEach(family => {
     const item = document.createElement('div');
     item.className = 'legend-item' + (hiddenFamilies.has(family) ? ' hidden' : '');
@@ -1399,7 +1784,6 @@ function buildLegend() {
     container.appendChild(item);
   });
 
-  // LTR indicator
   const ltrItem = document.createElement('div');
   ltrItem.className = 'legend-item';
   ltrItem.innerHTML = `<div style="display:flex;gap:1px;align-items:center">
@@ -1408,6 +1792,21 @@ function buildLegend() {
     <div style="width:5px;height:10px;background:#555;border-radius:0 2px 2px 0"></div>
   </div><span class="legend-label" style="margin-left:5px">LTR | internal | LTR</span>`;
   container.appendChild(ltrItem);
+
+  // BAM sample legend items
+  BAM_LABELS.forEach((label, i) => {
+    const color = BAM_COLORS[i % BAM_COLORS.length];
+    const item = document.createElement('div');
+    item.className = 'legend-item' + (hiddenSamples.has(label) ? ' hidden' : '');
+    item.innerHTML = `<div class="legend-swatch" style="background:${color}"></div><span class="legend-label">${label} (RNA)</span>`;
+    item.addEventListener('click', () => {
+      if (hiddenSamples.has(label)) hiddenSamples.delete(label);
+      else hiddenSamples.add(label);
+      item.classList.toggle('hidden');
+      renderAll();
+    });
+    container.appendChild(item);
+  });
 }
 
 // ═══════════════════════════════════════════════════════
@@ -1517,13 +1916,30 @@ def main():
     parser.add_argument('--domains', nargs='+', required=False, default=[],
                         metavar='DOM',
                         help='Protein domain GFF files, same order as --te-fastas')
+    parser.add_argument('--bam', nargs='+', required=False, default=[],
+                        metavar='BAM',
+                        help='BAM files (indexed) for coverage + transcript tracks')
+    parser.add_argument('--bam-labels', nargs='+', required=False, default=[],
+                        metavar='LABEL',
+                        help='Labels for each BAM file (same order as --bam)')
+    parser.add_argument('--bin-size', type=int, default=50,
+                        help='Coverage bin size in bp (default: 50)')
+    parser.add_argument('--threads', type=int, default=1,
+                        help='Number of parallel workers for BAM processing (default: 1)')
     parser.add_argument('--output', default='viewer.html',
                         help='Output HTML file (default: viewer.html)')
     args = parser.parse_args()
 
+    # Validate BAM args
+    if args.bam and not args.bam_labels:
+        args.bam_labels = [Path(b).stem for b in args.bam]
+    if args.bam and len(args.bam_labels) != len(args.bam):
+        print("Error: --bam-labels must match number of --bam files", file=sys.stderr)
+        sys.exit(1)
+
     # ── Parse TEs ──
     all_elements = []
-    te_map = {}  # key → TEElement
+    te_map = {}
     for level, fasta_path in enumerate(args.te_fastas):
         print(f"Parsing TE fasta level {level}: {fasta_path}", file=sys.stderr)
         elements = parse_fasta_headers(fasta_path, level)
@@ -1556,17 +1972,47 @@ def main():
 
     print(f"Loaded {len(all_elements)} TE elements, {len(genes)} genes", file=sys.stderr)
 
+    # ── Process BAMs ──
+    coverage_data = {}
+    transcript_data = {}
+    bam_labels = args.bam_labels
+
+    if args.bam:
+        try:
+            import pysam
+        except ImportError:
+            print("Error: pysam is required for BAM processing. Install with: pip install pysam",
+                  file=sys.stderr)
+            sys.exit(1)
+        coverage_data, transcript_data = compute_coverage_and_transcripts(
+            args.bam, args.bam_labels, genes, all_elements,
+            bin_size=args.bin_size, threads=args.threads
+        )
+
     # ── Serialise ──
     te_data   = json.dumps([te_to_dict(el) for el in all_elements], separators=(',', ':'))
     gene_data = json.dumps([gene_to_dict(g) for g in genes], separators=(',', ':'))
+    cov_data  = json.dumps(coverage_data, separators=(',', ':'))
+    tx_data   = json.dumps(transcript_data, separators=(',', ':'))
+    labels_data = json.dumps(bam_labels, separators=(',', ':'))
 
-    html = HTML_TEMPLATE.replace('__TE_DATA__', te_data).replace('__GENE_DATA__', gene_data)
+    html = HTML_TEMPLATE
+    html = html.replace('__TE_DATA__', te_data)
+    html = html.replace('__GENE_DATA__', gene_data)
+    html = html.replace('__COVERAGE_DATA__', cov_data)
+    html = html.replace('__TRANSCRIPT_DATA__', tx_data)
+    html = html.replace('__BAM_LABELS__', labels_data)
 
     out_path = Path(args.output)
     out_path.write_text(html, encoding='utf-8')
     print(f"\n✓ Viewer written to: {out_path.resolve()}", file=sys.stderr)
-    print(f"  TEs:   {len(all_elements)}", file=sys.stderr)
-    print(f"  Genes: {len(genes)}", file=sys.stderr)
+    print(f"  TEs:          {len(all_elements)}", file=sys.stderr)
+    print(f"  Genes:        {len(genes)}", file=sys.stderr)
+    print(f"  BAM samples:  {len(bam_labels)}", file=sys.stderr)
+    for label in bam_labels:
+        n_cov = sum(len(v) for v in coverage_data.get(label, {}).values())
+        n_tx  = len(transcript_data.get(label, []))
+        print(f"    {label}: {n_cov} coverage bins, {n_tx} transcript clusters", file=sys.stderr)
     kb = out_path.stat().st_size / 1024
     print(f"  Size:  {kb:.1f} KB", file=sys.stderr)
 

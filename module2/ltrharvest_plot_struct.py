@@ -20,17 +20,19 @@ Key features:
 - Average plots include whiskers showing 95% CI for start/end of each feature (bootstrap CI).
 - Per-chromosome positional plots are interactive IGV-like HTML viewers.
 - Prints per-family summary stats + 95% CI to terminal.
+- Flags potential false positives: elements with outlier-long lengths that lack expected proteins.
 """
 
 import argparse
 import base64
 import io
 import json
+import math
 import os
 import re
 import random
 from dataclasses import dataclass, field
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Tuple, Optional, Set
 
 import matplotlib
 matplotlib.use("Agg")
@@ -56,6 +58,7 @@ FEATURE_COLORS = {
     "ENDO": "#a67c52",
 }
 DEFAULT_COLOR = "#AAAAAA"
+FLAGGED_COLOR = "#ff4444"
 
 FEATURE_ORDER = ["LTR", "GAG", "PROT", "RT", "RH", "INT", "CH", "CHD", "CHDCR", "ARH", "ENDO"]
 
@@ -89,6 +92,8 @@ class Element:
     superfamily: str
     family: str
     shift: int = 0
+    ltr_len_raw: int = 0   # column 2 of TSV (LTR_LEN)
+    aln_len_raw: int = 0   # column 3 of TSV (ALN_LEN)
 
     strand: str = "?"
     strand_counts: Dict[str, int] = field(default_factory=lambda: {"+": 0, "-": 0})
@@ -160,6 +165,256 @@ def fig_to_base64_png(fig) -> str:
 
 
 # -----------------------------
+# Outlier detection & false-positive flagging
+# -----------------------------
+def _distributional_fence(lengths: List[float], n: int, iqr_mul: float = 1.5) -> float:
+    """
+    Compute a distributional upper fence for outlier detection.
+
+    For N >= 15: IQR method (Q3 + iqr_mul*IQR).  Default iqr_mul=1.5 (Tukey).
+        Lower values (e.g. 1.2–1.4) tighten the fence; higher values loosen it.
+    For 5 <= N < 15: MAD-based method, which is more robust for small samples.
+        MAD = median(|xi - median(x)|)
+        Scaled MAD (consistent estimator of sigma) = MAD / 0.6745
+        Upper fence = median + (iqr_mul * 2) * scaled_MAD
+        (The MAD multiplier is scaled proportionally to iqr_mul so tuning
+        has a consistent effect across both methods.)
+
+    The MAD approach is preferred for small samples because IQR estimates
+    become unreliable when quartiles are computed from few data points.
+    The factor 0.6745 makes MAD a consistent estimator of the standard
+    deviation for normally distributed data.
+    """
+    if n >= 15:
+        q1 = percentile(lengths, 25.0)
+        q3 = percentile(lengths, 75.0)
+        iqr = q3 - q1
+        return q3 + iqr_mul * iqr
+    else:
+        med = percentile(lengths, 50.0)
+        abs_devs = sorted(abs(x - med) for x in lengths)
+        mad = percentile(abs_devs, 50.0)
+        if mad < 1e-9:
+            return med * 1.15
+        scaled_mad = mad / 0.6745
+        # Scale MAD multiplier proportionally: default iqr_mul=1.5 → 3.0σ
+        mad_mul = iqr_mul * 2.0
+        return med + mad_mul * scaled_mad
+
+
+def _gap_fence(lengths: List[float], n: int) -> float:
+    """
+    Detect a natural breakpoint in the upper portion of the length distribution.
+
+    When outliers constitute a large fraction of a small sample (e.g. 2 of 9),
+    they inflate IQR/MAD and hide themselves.  A biologist looking at the plot
+    spots these as a visible *gap* between the main cluster and the long tail.
+
+    Algorithm:
+      1. Sort lengths, compute ALL consecutive gaps to establish baseline
+         spacing (median of all gaps).
+      2. Only consider gaps whose *lower* value is at or above the median
+         length as candidate breakpoints (we don't want to split the main
+         body of the distribution).
+      3. A gap qualifies as a breakpoint if it is:
+           a) > 2× the median gap (across ALL gaps), AND
+           b) > 1000 bp absolute (avoids triggering on noise).
+      4. Among qualifying gaps, pick the largest one.
+      5. The gap fence is placed at the value just below that gap, plus a
+         small tolerance (half the median gap) so elements right at the
+         boundary aren't caught by rounding.
+
+    Returns float('inf') if no qualifying gap is found.
+    """
+    if n < 5:
+        return float("inf")
+
+    sorted_L = sorted(lengths)
+    med = percentile(sorted_L, 50.0)
+
+    # Compute ALL consecutive gaps for baseline spacing
+    all_gaps = []
+    for i in range(len(sorted_L) - 1):
+        all_gaps.append(sorted_L[i + 1] - sorted_L[i])
+
+    if not all_gaps:
+        return float("inf")
+
+    median_gap = percentile(sorted(all_gaps), 50.0)
+
+    # Candidate gaps: only in the upper half (lower value >= median length)
+    upper_gaps = []  # (gap_size, index_of_lower_value)
+    for i in range(len(sorted_L) - 1):
+        if sorted_L[i] >= med:
+            gap = sorted_L[i + 1] - sorted_L[i]
+            upper_gaps.append((gap, i))
+
+    if not upper_gaps:
+        return float("inf")
+
+    # Qualifying gaps: large relative to typical spacing AND absolute minimum
+    min_abs_gap = 1000.0
+    min_relative_factor = 2.0
+    threshold = max(min_abs_gap, median_gap * min_relative_factor)
+
+    qualifying = [(g, idx) for g, idx in upper_gaps if g > threshold]
+    if not qualifying:
+        return float("inf")
+
+    # Pick the largest qualifying gap
+    qualifying.sort(key=lambda x: x[0], reverse=True)
+    _best_gap, best_idx = qualifying[0]
+
+    # Fence just above the value below the gap (small tolerance)
+    tolerance = median_gap * 0.5
+    return sorted_L[best_idx] + tolerance
+
+
+def _compute_upper_fence(lengths: List[float], n: int, iqr_mul: float = 1.5) -> float:
+    """
+    Final upper fence = min(distributional fence, gap fence).
+
+    The distributional fence (IQR or MAD) works well when outliers are a
+    small fraction of the data.  The gap fence catches cases where outliers
+    inflate the spread estimate and hide themselves — it looks for a natural
+    discontinuity in the sorted lengths.  Taking the minimum of the two
+    ensures both mechanisms can contribute.
+    """
+    d_fence = _distributional_fence(lengths, n, iqr_mul=iqr_mul)
+    g_fence = _gap_fence(lengths, n)
+    return min(d_fence, g_fence)
+
+
+def _is_dubious_clade(family_key: str) -> bool:
+    """Check if a family key indicates a dubious clade (mixture or unknown)."""
+    parts = family_key.lower().replace("/", " ").split()
+    return any(p in ("mixture", "unknown") for p in parts)
+
+
+def _is_unknown_clade(family_key: str) -> bool:
+    """Check if a family key indicates an 'unknown' clade specifically."""
+    parts = family_key.lower().replace("/", " ").split()
+    return "unknown" in parts
+
+
+def detect_false_positives(
+    fam_elements: List[Element],
+    expected_proteins: List[str],
+    family_key: str,
+    min_family_size: int = 5,
+    protein_recovery_frac: float = 0.50,
+    iqr_mul: float = 0.5,
+    min_ltr_aln: int = 120,
+    dubious_k2p: float = 0.15,
+    recovery_k2p: float = 0.10,
+    skip_unknown_iqr: bool = False,
+) -> Set[str]:
+    """
+    Identify potential false positives within a family.
+
+    Two independent mechanisms:
+
+    1. LENGTH OUTLIER DETECTION (all families with N >= min_family_size,
+       unless skip_unknown_iqr is True for unknown clades):
+       Uses IQR for N >= 15 or MAD for 5 <= N < 15, supplemented by gap
+       analysis.  Among outliers, elements with sufficient expected proteins
+       are "recovered" (considered real).  When recovery requires only 1
+       protein, an additional K2P < recovery_k2p constraint is applied.
+       Protein-rich elements (more distinct proteins than the minimum
+       threshold) are recovered unconditionally.
+
+    2. DUBIOUS-CLADE FLAGGING (mixture/unknown families only):
+       Any element with K2P > dubious_k2p, or LTR_LEN < min_ltr_aln,
+       or ALN_LEN < min_ltr_aln is flagged regardless of element length.
+
+    Returns a set of element_ids flagged as potential false positives.
+    """
+    flagged: Set[str] = set()
+    n = len(fam_elements)
+    dubious = _is_dubious_clade(family_key)
+    unknown = _is_unknown_clade(family_key)
+
+    # --- Mechanism 2: dubious-clade quality flags ---
+    if dubious:
+        for el in fam_elements:
+            reasons = []
+            if el.k2p is not None and el.k2p > dubious_k2p:
+                reasons.append(f"k2p>{dubious_k2p*100:.0f}%")
+            if el.ltr_len_raw < min_ltr_aln:
+                reasons.append(f"LTR_LEN<{min_ltr_aln}")
+            if el.aln_len_raw < min_ltr_aln:
+                reasons.append(f"ALN_LEN<{min_ltr_aln}")
+            if reasons:
+                flagged.add(el.element_id)
+
+    # --- Mechanism 1: length outlier detection ---
+    # Skip IQR for unknown clades if requested
+    if unknown and skip_unknown_iqr:
+        return flagged
+
+    if n < min_family_size:
+        return flagged  # too few for outlier analysis, return dubious flags only
+
+    lengths = sorted(float(e.length) for e in fam_elements)
+    upper_fence = _compute_upper_fence(lengths, n, iqr_mul=iqr_mul)
+
+    # Identify outlier-long elements
+    outlier_long = [e for e in fam_elements if e.length > upper_fence]
+    if not outlier_long:
+        return flagged
+
+    n_expected = len(expected_proteins)
+
+    # Compute the minimum number of proteins required for recovery
+    # This is the smallest integer h such that h / n_expected > protein_recovery_frac
+    if n_expected > 0:
+        min_proteins_for_recovery = math.floor(n_expected * protein_recovery_frac) + 1
+        # Edge case: if frac * n_expected is an exact integer, we still need +1
+        # because the comparison is strictly greater than
+        if n_expected * protein_recovery_frac == math.floor(n_expected * protein_recovery_frac):
+            min_proteins_for_recovery = int(n_expected * protein_recovery_frac) + 1
+    else:
+        min_proteins_for_recovery = 0
+
+    for el in outlier_long:
+        if n_expected == 0:
+            # Non-autonomous: no proteins to check, flag purely on length
+            flagged.add(el.element_id)
+        else:
+            # Check how many expected proteins this element has
+            el_prots = set(p.name for p in el.proteins)
+            hits = sum(1 for ep in expected_proteins if ep in el_prots)
+            total_distinct = len(el_prots)
+
+            if hits >= min_proteins_for_recovery:
+                # Has enough expected proteins.
+                # Additional recovery layer: if the element has more total
+                # distinct proteins than the minimum required, it's well-
+                # supported and recovered unconditionally.  K2P stringency
+                # only applies when the element barely meets the threshold.
+                if total_distinct > min_proteins_for_recovery:
+                    pass  # recovered — protein-rich element
+                elif min_proteins_for_recovery == 1:
+                    # Barely meets threshold with 1 protein — apply K2P gate
+                    if el.k2p is None or el.k2p >= recovery_k2p:
+                        flagged.add(el.element_id)
+                    # else: recovered (has protein AND low K2P)
+                # else: recovered (multiple expected proteins required and met)
+            else:
+                # Does NOT have enough expected proteins.
+                # But check if it's protein-rich overall — an element with
+                # many proteins is likely real even if they don't match the
+                # family's typical set (e.g. a clade where avg only has 1
+                # expected protein but the element has 5).
+                if total_distinct > min_proteins_for_recovery:
+                    pass  # recovered — protein-rich despite missing expected set
+                else:
+                    flagged.add(el.element_id)
+
+    return flagged
+
+
+# -----------------------------
 # Parsing
 # -----------------------------
 def parse_tsv(tsv_path: str) -> Dict[str, Element]:
@@ -223,6 +478,8 @@ def parse_tsv(tsv_path: str) -> Dict[str, Element]:
                 superfamily=sup,
                 family=fam,
                 k2p=k2p,
+                ltr_len_raw=ltr1,
+                aln_len_raw=ltr2,
             )
 
     print(f"[INFO] TSV loaded: {len(elements)} elements")
@@ -479,7 +736,7 @@ def normalize_all_elements_strand(elements: Dict[str, Element]) -> None:
 # -----------------------------
 # Plotting helpers
 # -----------------------------
-def build_legend_handles(features_present: List[str]) -> List[Patch]:
+def build_legend_handles(features_present: List[str], include_flagged: bool = False) -> List[Patch]:
     ordered = [f for f in FEATURE_ORDER if f in features_present]
     extras = sorted([f for f in features_present if f not in ordered])
     final = ordered + extras
@@ -487,12 +744,19 @@ def build_legend_handles(features_present: List[str]) -> List[Patch]:
     for f in final:
         col = FEATURE_COLORS.get(f, DEFAULT_COLOR)
         handles.append(Patch(facecolor=col, edgecolor="black", label=f))
+    if include_flagged:
+        handles.append(Patch(facecolor="none", edgecolor=FLAGGED_COLOR, linewidth=2.0,
+                             label="Potential FP"))
     return handles
 
 
 def draw_element(ax, y: float, el_len: int, ltr_len: int, proteins: List[Feature],
-                 label: Optional[str] = None, height: float = 0.6):
-    ax.add_patch(plt.Rectangle((0, y - height/2), el_len, height, fill=False, linewidth=1.0))
+                 label: Optional[str] = None, height: float = 0.6,
+                 flagged: bool = False):
+    outline_color = FLAGGED_COLOR if flagged else "black"
+    outline_lw = 2.0 if flagged else 1.0
+    ax.add_patch(plt.Rectangle((0, y - height/2), el_len, height, fill=False,
+                               edgecolor=outline_color, linewidth=outline_lw))
     ltr_col = FEATURE_COLORS["LTR"]
     ax.add_patch(plt.Rectangle((0, y - height/2), ltr_len, height,
                                facecolor=ltr_col, edgecolor="black", linewidth=0.6))
@@ -505,7 +769,9 @@ def draw_element(ax, y: float, el_len: int, ltr_len: int, proteins: List[Feature
         ax.add_patch(plt.Rectangle((x, y - height/2), w, height,
                                    facecolor=col, edgecolor="black", linewidth=0.6))
     if label:
-        ax.text(-0.01 * el_len, y, label, ha="right", va="center", fontsize=8)
+        label_color = FLAGGED_COLOR if flagged else "black"
+        ax.text(-0.01 * el_len, y, label, ha="right", va="center", fontsize=8,
+                color=label_color, fontweight="bold" if flagged else "normal")
 
 
 def draw_whisker(ax, y: float, lo: int, hi: int, color: str, lw: float = 1.2):
@@ -600,13 +866,21 @@ def compute_family_averages_with_ci(
     )
 
 
-def print_family_summary(family_key: str, avg: FamilyAverages):
+def print_family_summary(family_key: str, avg: FamilyAverages, flagged_ids: Set[str] = None):
     print(f"\n[SUMMARY] {family_key}  (N={avg.n_elements})")
     print(f"  Average LTR-RT len: {avg.len_center} (95% CI: {avg.len_lo}-{avg.len_hi})")
     print(f"  Average LTR len:    {avg.ltr_center} (95% CI: {avg.ltr_lo}-{avg.ltr_hi})")
     for feat in avg.features:
         print(f"  Average {feat.name} start: {feat.start_center} (95% CI: {feat.start_lo}-{feat.start_hi})")
         print(f"  Average {feat.name} end:   {feat.end_center} (95% CI: {feat.end_lo}-{feat.end_hi})")
+    if flagged_ids is not None:
+        n_flagged = len(flagged_ids)
+        if n_flagged > 0:
+            print(f"  ** Potential false positives (outlier-long, lacking proteins): {n_flagged}")
+            for eid in sorted(flagged_ids):
+                print(f"     - {eid}")
+        else:
+            print(f"  No potential false positives detected.")
 
 
 # -----------------------------
@@ -658,14 +932,20 @@ def plot_family_average_with_whiskers(family_key: str, avg: FamilyAverages, out_
     return out_path
 
 
-def plot_family_individual(family_key: str, fam_elements: List[Element], out_path: str):
-    """Plot ALL individual elements (no max cap). Always shows all proteins."""
+def plot_family_individual(family_key: str, fam_elements: List[Element], out_path: str,
+                           flagged_ids: Set[str] = None):
+    """Plot ALL individual elements (no max cap). Always shows all proteins.
+    Elements in flagged_ids are highlighted with red outlines."""
+    if flagged_ids is None:
+        flagged_ids = set()
+
     n = len(fam_elements)
     max_len = max(e.length for e in fam_elements) if fam_elements else 1
 
     prots_seen = sorted(set(p.name for e in fam_elements for p in e.proteins))
     features_present = ["LTR"] + prots_seen
-    legend_handles = build_legend_handles(features_present)
+    has_flagged = any(e.element_id in flagged_ids for e in fam_elements)
+    legend_handles = build_legend_handles(features_present, include_flagged=has_flagged)
 
     fig_h = max(3.0, 0.18 * n + 1.8)
     fig, ax = plt.subplots(figsize=(14, fig_h))
@@ -674,10 +954,18 @@ def plot_family_individual(family_key: str, fam_elements: List[Element], out_pat
         y = n - i
         prots = sorted(e.proteins, key=lambda x: x.start)
         k2p_txt = "NA" if e.k2p is None else f"{e.k2p * 100:.1f}%"
+        is_flagged = e.element_id in flagged_ids
+        label = f"{e.element_id}  {k2p_txt}"
+        if is_flagged:
+            label += "  [FP?]"
         draw_element(ax, y=y, el_len=e.length, ltr_len=e.ltr_len, proteins=prots,
-                     label=f"{e.element_id}  {k2p_txt}", height=0.65)
+                     label=label, height=0.65, flagged=is_flagged)
 
-    ax.set_title(f"{family_key} : Individual elements (n={n})")
+    n_flagged = sum(1 for e in fam_elements if e.element_id in flagged_ids)
+    title = f"{family_key} : Individual elements (n={n})"
+    if n_flagged > 0:
+        title += f"  [{n_flagged} potential FP highlighted]"
+    ax.set_title(title)
     ax.set_xlim(0, max_len * 1.02)
     ax.set_ylim(0, n + 1)
     ax.set_yticks([])
@@ -1437,6 +1725,34 @@ def main():
                          "otherwise only chromosome plots are HTML and family plots are PDF")
     ap.add_argument("--seed", type=int, default=1, help="Random seed for bootstrapping (default 1)")
 
+    # --- False-positive detection parameters ---
+    ap.add_argument("--no_fp", action="store_true",
+                    help="Skip false-positive detection entirely; just plot LTR structure")
+    ap.add_argument("--min_family_size", type=int, default=5,
+                    help="Minimum number of elements in a family to perform outlier detection (default 5)")
+    ap.add_argument("--fp_recovery_frac", type=float, default=0.50,
+                    help="Fraction of expected proteins an outlier-long element must have "
+                         "to be recovered from false-positive flagging (default 0.50)")
+    ap.add_argument("--iqr_mul", type=float, default=0.5,
+                    help="IQR multiplier for outlier fence: Q3 + iqr_mul*IQR (default 0.5). "
+                         "Lower values tighten the fence and flag more elements; "
+                         "higher values loosen it. Also scales the MAD multiplier for small families.")
+    ap.add_argument("--min_ltr_aln", type=int, default=100,
+                    help="Minimum LTR_LEN and ALN_LEN (bp) for dubious-clade quality filter "
+                         "(default 120). Elements in mixture/unknown clades with LTR_LEN or "
+                         "ALN_LEN below this value are flagged.")
+    ap.add_argument("--dubious_k2p", type=float, default=0.15,
+                    help="K2P divergence cutoff for dubious clades (mixture/unknown). "
+                         "Elements above this threshold are flagged (default 0.15 = 15%%).")
+    ap.add_argument("--recovery_k2p", type=float, default=0.10,
+                    help="K2P divergence cutoff for single-protein recovery. When an outlier-"
+                         "long element has exactly 1 protein and that barely meets the threshold, "
+                         "it must have K2P below this value to be recovered (default 0.10 = 10%%).")
+    ap.add_argument("--skip_unknown_iqr", action="store_true",
+                    help="Skip IQR-based length outlier detection for 'unknown' clades. "
+                         "If provided, unknown-clade elements are flagged solely based on "
+                         "K2P and LTR_LEN/ALN_LEN quality filters.")
+
     args = ap.parse_args()
     random.seed(args.seed)
 
@@ -1466,9 +1782,11 @@ def main():
 
     print(f"[INFO] Grouped into {len(family_to_elements)} families")
 
-    # Compute averages, print summaries, plot
+    # Compute averages, detect false positives, print summaries, plot
     family_avg_map: Dict[str, FamilyAverages] = {}
+    family_flagged: Dict[str, Set[str]] = {}
     family_plots_b64: Dict[str, Dict[str, str]] = {}  # for --html mode
+    total_flagged = 0
 
     for fk, fam_elements in sorted(family_to_elements.items()):
         avg = compute_family_averages_with_ci(
@@ -1477,6 +1795,27 @@ def main():
             boot=args.boot,
         )
         family_avg_map[fk] = avg
+
+        # --- False-positive detection ---
+        if args.no_fp:
+            flagged_ids: Set[str] = set()
+        else:
+            # Expected proteins are those that passed the min_presence filter in the average
+            expected_proteins = [f.name for f in avg.features]
+            flagged_ids = detect_false_positives(
+                fam_elements=fam_elements,
+                expected_proteins=expected_proteins,
+                family_key=fk,
+                min_family_size=args.min_family_size,
+                protein_recovery_frac=args.fp_recovery_frac,
+                iqr_mul=args.iqr_mul,
+                min_ltr_aln=args.min_ltr_aln,
+                dubious_k2p=args.dubious_k2p,
+                recovery_k2p=args.recovery_k2p,
+                skip_unknown_iqr=args.skip_unknown_iqr,
+            )
+        family_flagged[fk] = flagged_ids
+        total_flagged += len(flagged_ids)
 
         # Excluded proteins info
         present_counts = {}
@@ -1488,7 +1827,7 @@ def main():
             if p not in [ff.name for ff in avg.features]:
                 frac = c / len(fam_elements)
                 excluded.append(f"{p} ({c}/{len(fam_elements)}={frac:.3f})")
-        print_family_summary(fk, avg)
+        print_family_summary(fk, avg, flagged_ids)
         if excluded:
             print(f"  Excluded rare proteins (<{args.min_presence:.2f} presence): " +
                   ", ".join(excluded[:12]) + (" ..." if len(excluded) > 12 else ""))
@@ -1499,9 +1838,9 @@ def main():
         out_avg = os.path.join(args.out_dir, f"{safe_fk}_average.pdf")
         plot_family_average_with_whiskers(fk, avg, out_avg)
 
-        # Individual plot (shows ALL proteins, no max cap)
+        # Individual plot (shows ALL proteins, no max cap) — with FP highlighting
         out_ind = os.path.join(args.out_dir, f"{safe_fk}_individual.pdf")
-        plot_family_individual(fk, fam_elements, out_ind)
+        plot_family_individual(fk, fam_elements, out_ind, flagged_ids=flagged_ids)
 
         # If --html, also generate base64 PNGs
         if args.html:
@@ -1532,24 +1871,34 @@ def main():
             avg_b64 = fig_to_base64_png(fig_avg)
             plt.close(fig_avg)
 
-            # Individual as PNG
+            # Individual as PNG — with FP highlighting
             n = len(fam_elements)
             max_len = max(e.length for e in fam_elements) if fam_elements else 1
             prots_seen = sorted(set(p.name for e in fam_elements for p in e.proteins))
             fig_h = max(3.0, 0.18 * n + 1.8)
             fig_ind, ax_ind = plt.subplots(figsize=(14, fig_h))
+            has_flagged = any(e.element_id in flagged_ids for e in fam_elements)
             for i, e in enumerate(fam_elements):
                 y = n - i
                 prots = sorted(e.proteins, key=lambda x: x.start)
                 k2p_txt = "NA" if e.k2p is None else f"{e.k2p*100:.1f}%"
+                is_flagged = e.element_id in flagged_ids
+                label = f"{e.element_id}  {k2p_txt}"
+                if is_flagged:
+                    label += "  [FP?]"
                 draw_element(ax_ind, y=y, el_len=e.length, ltr_len=e.ltr_len, proteins=prots,
-                             label=f"{e.element_id}  {k2p_txt}", height=0.65)
-            ax_ind.set_title(f"{fk} : Individual (n={n})")
+                             label=label, height=0.65, flagged=is_flagged)
+            title = f"{fk} : Individual (n={n})"
+            n_flagged_fam = sum(1 for e in fam_elements if e.element_id in flagged_ids)
+            if n_flagged_fam > 0:
+                title += f"  [{n_flagged_fam} potential FP]"
+            ax_ind.set_title(title)
             ax_ind.set_xlim(0, max_len*1.02)
             ax_ind.set_ylim(0, n+1)
             ax_ind.set_yticks([])
             ax_ind.set_xlabel("Position [bp]")
-            ax_ind.legend(handles=build_legend_handles(["LTR"]+prots_seen), loc="lower right", frameon=False, ncol=6)
+            ax_ind.legend(handles=build_legend_handles(["LTR"]+prots_seen, include_flagged=has_flagged),
+                          loc="lower right", frameon=False, ncol=6)
             plt.tight_layout()
             ind_b64 = fig_to_base64_png(fig_ind)
             plt.close(fig_ind)
@@ -1640,10 +1989,111 @@ def main():
             out_path=master_path,
         )
 
+    # Write flagged elements to a TSV and filtered input TSV (excluding FPs)
+    all_flagged_ids: Set[str] = set()
+    if not args.no_fp:
+        for fids in family_flagged.values():
+            all_flagged_ids.update(fids)
+
+        flagged_tsv_path = os.path.join(args.out_dir, "flagged_false_positives.tsv")
+        with open(flagged_tsv_path, "w", encoding="utf-8") as fout:
+            fout.write("#element_id\tfamily\tlength\tltr_len_raw\taln_len_raw\tk2p\t"
+                       "num_proteins\texpected_proteins\treason\n")
+            for fk in sorted(family_flagged.keys()):
+                flagged_ids = family_flagged[fk]
+                if not flagged_ids:
+                    continue
+                expected_proteins = [f.name for f in family_avg_map[fk].features]
+                dubious = _is_dubious_clade(fk)
+                unknown = _is_unknown_clade(fk)
+
+                # Recompute upper fence for reason annotation
+                fam_els = family_to_elements[fk]
+                n_fam = len(fam_els)
+                skip_iqr_here = unknown and args.skip_unknown_iqr
+                if n_fam >= args.min_family_size and not skip_iqr_here:
+                    lengths = sorted(float(e.length) for e in fam_els)
+                    upper_fence = _compute_upper_fence(lengths, n_fam, iqr_mul=args.iqr_mul)
+                else:
+                    upper_fence = float("inf")
+
+                n_expected = len(expected_proteins)
+
+                for el in fam_els:
+                    if el.element_id not in flagged_ids:
+                        continue
+                    el_prots = sorted(set(p.name for p in el.proteins))
+                    k2p_str = f"{el.k2p:.4f}" if el.k2p is not None else "NA"
+                    reasons = []
+
+                    # Check dubious-clade reasons
+                    if dubious:
+                        if el.k2p is not None and el.k2p > args.dubious_k2p:
+                            reasons.append(f"dubious_clade;k2p>{args.dubious_k2p*100:.0f}%")
+                        if el.ltr_len_raw < args.min_ltr_aln:
+                            reasons.append(f"dubious_clade;LTR_LEN<{args.min_ltr_aln}")
+                        if el.aln_len_raw < args.min_ltr_aln:
+                            reasons.append(f"dubious_clade;ALN_LEN<{args.min_ltr_aln}")
+
+                    # Check length-outlier reason
+                    if el.length > upper_fence:
+                        if n_expected == 0:
+                            reasons.append("outlier_long;non_autonomous")
+                        else:
+                            n_hits = sum(1 for ep in expected_proteins if ep in el_prots)
+                            reasons.append(f"outlier_long;proteins={n_hits}/{n_expected}")
+
+                    reason_str = "|".join(reasons) if reasons else "flagged"
+                    fout.write(f"{el.element_id}\t{fk}\t{el.length}\t"
+                               f"{el.ltr_len_raw}\t{el.aln_len_raw}\t{k2p_str}\t"
+                               f"{len(el_prots)}\t{','.join(expected_proteins) or 'none'}\t"
+                               f"{reason_str}\n")
+        print(f"[INFO] Flagged false positives written: {flagged_tsv_path} ({total_flagged} elements)")
+
+    # Write filtered TSV (input TSV minus flagged elements)
+    if not args.no_fp:
+        filtered_tsv_path = os.path.join(args.out_dir, "filtered.tsv")
+        n_kept = 0
+        n_removed = 0
+        with open(args.tsv, "r", encoding="utf-8") as fin, \
+             open(filtered_tsv_path, "w", encoding="utf-8") as fout:
+            for line in fin:
+                stripped = line.strip()
+                if not stripped or stripped.startswith("#"):
+                    fout.write(line)
+                    continue
+                parts = stripped.split("\t")
+                if len(parts) < 3:
+                    fout.write(line)
+                    continue
+                raw_id = parts[0]
+                if "#" in raw_id:
+                    elem_part = raw_id.split("#", 1)[0]
+                else:
+                    elem_part = raw_id
+                if elem_part in all_flagged_ids:
+                    n_removed += 1
+                else:
+                    fout.write(line)
+                    n_kept += 1
+        print(f"[INFO] Filtered TSV written: {filtered_tsv_path} "
+              f"(kept={n_kept}, removed={n_removed})")
+
     print(f"\n[INFO] Done.")
     print(f"[INFO] Output directory: {args.out_dir}")
     print(f"[INFO] Average plots exclude proteins with presence < {args.min_presence:.2f} "
           f"and show 95% bootstrap CI whiskers.")
+    if args.no_fp:
+        print(f"[INFO] False-positive detection: DISABLED (--no_fp)")
+    else:
+        print(f"[INFO] False-positive detection: IQR (N>=15) / MAD (N<15) + gap analysis, "
+              f"iqr_mul={args.iqr_mul:.2f}, min_family_size={args.min_family_size}, "
+              f"protein_recovery_frac={args.fp_recovery_frac:.2f}, "
+              f"recovery_k2p={args.recovery_k2p:.0%}, "
+              f"dubious_k2p={args.dubious_k2p:.0%}, min_ltr_aln={args.min_ltr_aln}")
+        if args.skip_unknown_iqr:
+            print(f"[INFO] IQR skipped for 'unknown' clades (--skip_unknown_iqr)")
+        print(f"[INFO] Total potential false positives flagged: {total_flagged}")
     if args.html:
         print(f"[INFO] Master HTML: {os.path.join(args.out_dir, 'index.html')}")
     if chrom_html_files:

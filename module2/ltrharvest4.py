@@ -1591,6 +1591,12 @@ def dedup_kmer2ltr_tsv(kmer2ltr_tsv: str, out_tsv: str, threshold: float) -> Non
     """
     Dedup a Kmer2LTR output TSV (main output file), keeping the lowest p-distance (col7).
     Tie-breaker: if p-distance ties, keep the record with the largest aln_len (col3).
+    
+    May fail in cases like this:
+    chr4:59724432-59730260#LTR/Copia/TAR	271	261	11	9	2	0.042146	702427	0.043376	722935	0.043723	728714
+    chr4:59724432-59730521#LTR/Copia/TAR	532	522	32	19	13	0.061303	1021711	0.063954	1065892	0.064178	1069628
+
+    Above, line2 is the real, but it chooses line1. I may need a more sophistacated mechanism for identifying overlaps like this where extension is required, but it yeilds slightly higher divergence, so gets chopped. 
     """
     in_path = Path(kmer2ltr_tsv)
     if not in_path.exists() or in_path.stat().st_size == 0:

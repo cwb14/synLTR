@@ -39,7 +39,7 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Tuple, Iterable, Optional
+from typing import Dict, List, Set, Tuple, Iterable, Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 
@@ -70,6 +70,21 @@ def which_or_die(prog: str):
 def mkdirp(p: Path):
     p.mkdir(parents=True, exist_ok=True)
     return p
+
+def _clean_path(path, verbose: bool = False):
+    """Remove a file or directory quietly (used for incremental --clean purges)."""
+    p = Path(path)
+    if p.is_dir():
+        shutil.rmtree(p, ignore_errors=True)
+        if verbose:
+            print(f"[CLEAN] removed dir:  {p}", file=sys.stderr)
+    elif p.exists():
+        try:
+            p.unlink()
+        except Exception:
+            pass
+        if verbose:
+            print(f"[CLEAN] removed file: {p}", file=sys.stderr)
 
 def _format_hms(seconds: float) -> str:
     if not seconds or seconds == float("inf"):
@@ -1577,6 +1592,23 @@ def _parse_interval_from_kmer2ltr_col1(col1: str) -> Optional[Tuple[str, int, in
     return chrom, start, end
 
 
+def _tsd_names_from_fasta(fa_path: str) -> Set[str]:
+    """Return set of 'chrom:start-end' keys parsed from TSD-positive FASTA headers.
+
+    Expected header format: >chrom:start-end#classification ...
+    """
+    names: Set[str] = set()
+    p = Path(fa_path)
+    if not p.exists() or p.stat().st_size == 0:
+        return names
+    with open(fa_path) as f:
+        for line in f:
+            if line.startswith(">"):
+                key = line[1:].strip().split("#")[0].split()[0]
+                names.add(key)
+    return names
+
+
 def _overlap_fraction_of_shorter(a: Tuple[int, int], b: Tuple[int, int]) -> float:
     a0, a1 = a
     b0, b1 = b
@@ -1587,16 +1619,18 @@ def _overlap_fraction_of_shorter(a: Tuple[int, int], b: Tuple[int, int]) -> floa
     lenb = b1 - b0 + 1
     return inter / min(lena, lenb)
 
-def dedup_kmer2ltr_tsv(kmer2ltr_tsv: str, out_tsv: str, threshold: float) -> None:
+def dedup_kmer2ltr_tsv(kmer2ltr_tsv: str, out_tsv: str, threshold: float,
+                       tsd_names: Optional[Set[str]] = None) -> None:
     """
     Dedup a Kmer2LTR output TSV (main output file), keeping the lowest p-distance (col7).
     Tie-breaker: if p-distance ties, keep the record with the largest aln_len (col3).
-    
-    May fail in cases like this:
-    chr4:59724432-59730260#LTR/Copia/TAR	271	261	11	9	2	0.042146	702427	0.043376	722935	0.043723	728714
-    chr4:59724432-59730521#LTR/Copia/TAR	532	522	32	19	13	0.061303	1021711	0.063954	1065892	0.064178	1069628
 
-    Above, line2 is the real, but it chooses line1. I may need a more sophistacated mechanism for identifying overlaps like this where extension is required, but it yeilds slightly higher divergence, so gets chopped. 
+    For "extension" pairs — records sharing a start or end coordinate — one is a
+    truncation of the other.  The extension yields slightly higher p-distance but is
+    the more complete element.  Resolution order:
+      1. If tsd_names is provided and exactly one record has a TSD, keep the TSD record.
+      2. Otherwise fall back to lowest p-distance, but print a warning for pairs where
+         no TSD information is available so we can study the scale of the problem.
     """
     in_path = Path(kmer2ltr_tsv)
     if not in_path.exists() or in_path.stat().st_size == 0:
@@ -1614,7 +1648,45 @@ def dedup_kmer2ltr_tsv(kmer2ltr_tsv: str, out_tsv: str, threshold: float) -> Non
     def flush_cluster(out_handle):
         if not cluster:
             return
-        best = min(cluster, key=lambda x: (float(x["p"]), -int(x["aln"])))  # type: ignore
+        if len(cluster) == 1:
+            out_handle.write(cluster[0]["line"])
+            return
+
+        # For extension pairs (sharing start or end coord), use TSD as tiebreaker.
+        # If neither has TSD info, fall back to p-dist and print a warning.
+        dominated: Set[int] = set()
+        for ii in range(len(cluster)):
+            for jj in range(ii + 1, len(cluster)):
+                ri = cluster[ii]
+                rj = cluster[jj]
+                si, ei = int(ri["s"]), int(ri["e"])
+                sj, ej = int(rj["s"]), int(rj["e"])
+                if si != sj and ei != ej:
+                    continue  # not an extension pair
+                key_i = f"{ri['chrom']}:{si}-{ei}"
+                key_j = f"{rj['chrom']}:{sj}-{ej}"
+                has_i = tsd_names is not None and key_i in tsd_names
+                has_j = tsd_names is not None and key_j in tsd_names
+                if has_i and not has_j:
+                    dominated.add(jj)
+                elif has_j and not has_i:
+                    dominated.add(ii)
+                elif not has_i and not has_j:
+                    len_i = ei - si + 1
+                    len_j = ej - sj + 1
+                    longer  = ri if len_i >= len_j else rj
+                    shorter = rj if len_i >= len_j else ri
+                    print(
+                        f"[dedup WARNING] extension pair, no TSD to resolve: "
+                        f"shorter={shorter['chrom']}:{int(shorter['s'])}-{int(shorter['e'])} "
+                        f"p={shorter['p']} aln={shorter['aln']}  "
+                        f"longer={longer['chrom']}:{int(longer['s'])}-{int(longer['e'])} "
+                        f"p={longer['p']} aln={longer['aln']}"
+                    )
+                # both have TSD → no preference, fall through to p-dist
+
+        survivors = [cluster[i] for i in range(len(cluster)) if i not in dominated]
+        best = min(survivors, key=lambda x: (float(x["p"]), -int(x["aln"])))  # type: ignore
         out_handle.write(best["line"])  # type: ignore
 
     with open(tmp_sorted, "r") as fin, open(out_tsv, "w") as out:
@@ -2304,6 +2376,14 @@ def main():
         gene_te_masked_fa = str(workdir / f"{out_prefix}.gene_TEmasked.fa")
         shutil.copyfile(genic_masked_fa, gene_te_masked_fa)
 
+    # --clean: purge masking intermediates now that gene_te_masked_fa is ready
+    if args.clean:
+        for _p in [gff_path, genic_bed, genic_masked_fa]:
+            _clean_path(_p, verbose)
+        if args.te_library:
+            for _p in [nonltr_fa, paf_path, repeats_bed, merged_bed]:
+                _clean_path(_p, verbose)
+
     # Step 4
     print("[Step4] chunking masked genome...")
     chunks_dir = str(workdir / "chunks")
@@ -2312,6 +2392,10 @@ def main():
         raise RuntimeError("No chunks produced (empty genome?)")
     if verbose:
         print(f"  {len(chunks)} chunks (size={args.size:,}, overlap={args.overlap:,})", file=sys.stderr)
+
+    # --clean: masked genome is now chunked; the masked FASTA is no longer needed
+    if args.clean:
+        _clean_path(gene_te_masked_fa, verbose)
 
     # Step 5
     print(f"[Step5] LTR calling on {len(chunks)} chunks with {args.threads} workers...")
@@ -2382,6 +2466,11 @@ def main():
     if failures:
         print(f"[WARN] {failures} chunks failed; stitching continues using successes only.")
 
+    # --clean: chunk FASTAs are no longer needed once LTR calling is done
+    if args.clean:
+        print(f"[CLEAN] purging chunks dir: {chunks_dir}", file=sys.stderr)
+        _clean_path(chunks_dir, verbose)
+
     # Step 6 stitched outputs (inside workdir)
     stitched_gff3 = str(workdir / f"{out_prefix}.ltrharvest.stitched.gff3")
     stitched_harvest_scn = str(workdir / f"{out_prefix}.ltrharvest.stitched.scn")
@@ -2414,6 +2503,13 @@ def main():
 
     print(f"[Step6] merging stitched SCN(s) -> {merged_scn}")
     merge_stitched_scns(to_merge, merged_scn)
+
+    # --clean: per-chunk run dirs and individual stitched SCNs/GFF3 are now merged
+    if args.clean:
+        print(f"[CLEAN] purging ltr_runs dir: {ltr_work}", file=sys.stderr)
+        _clean_path(ltr_work, verbose)
+        for _p in [stitched_harvest_scn, stitched_finder_scn, stitched_gff3]:
+            _clean_path(_p, verbose)
 
     # Optional: size-based filtering of merged SCN
     if any([
@@ -2453,6 +2549,8 @@ def main():
     req_chars = None
     if args.require_run_chars:
         req_chars = [x.strip() for x in args.require_run_chars.split(",") if x.strip()]
+
+    tsd_pass2_fa: Optional[str] = None  # populated below if --tsd-pass2 is active
 
     if args.use_tesorter:
         if args.tesorter_use_ret:
@@ -2570,7 +2668,8 @@ def main():
 
     k2l_dedup_out = f"{out_prefix}_kmer2ltr_dedup"
     print(f"[Step9b] deduping Kmer2LTR output -> {k2l_dedup_out}")
-    dedup_kmer2ltr_tsv(k2l_main, k2l_dedup_out, threshold=args.dedup_threshold)
+    tsd_name_set = _tsd_names_from_fasta(tsd_pass2_fa) if tsd_pass2_fa else None
+    dedup_kmer2ltr_tsv(k2l_main, k2l_dedup_out, threshold=args.dedup_threshold, tsd_names=tsd_name_set)
 
     keep_names = names_from_kmer2ltr_dedup(k2l_dedup_out)
 

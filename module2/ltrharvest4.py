@@ -1992,7 +1992,7 @@ def main():
     ap.add_argument("--workdir", default=None, help="Working directory (default: {out_prefix}.work)")
     ap.add_argument("--gt", default="gt", help="Path to GenomeTools 'gt' executable")
 
-    ap.add_argument("--clean", action="store_true", help="Remove {out_prefix}.work after success (keeps ./tools and stitched outputs)")
+    ap.add_argument("--clean", action="store_true", help="Remove {out_prefix}.work and ./tools after success")
 
     ap.add_argument("--verbose", action="store_true",
                     help="Print subcommands and additional progress details to stderr")
@@ -2602,6 +2602,8 @@ def main():
     if args.clean:
         print(f"[CLEAN] removing workdir: {workdir}")
         shutil.rmtree(workdir, ignore_errors=True)
+        print(f"[CLEAN] removing tools dir: {tools_dir}")
+        shutil.rmtree(tools_dir, ignore_errors=True)
 
 if __name__ == "__main__":
     main()

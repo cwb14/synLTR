@@ -1652,42 +1652,50 @@ def dedup_kmer2ltr_tsv(kmer2ltr_tsv: str, out_tsv: str, threshold: float,
             out_handle.write(cluster[0]["line"])
             return
 
-        # For extension pairs (sharing start or end coord), use TSD as tiebreaker.
-        # If neither has TSD info, fall back to p-dist and print a warning.
+        # --- Layer 1: TSD tiebreaker (all overlap pairs, not just extension pairs) ---
         dominated: Set[int] = set()
         for ii in range(len(cluster)):
             for jj in range(ii + 1, len(cluster)):
-                ri = cluster[ii]
-                rj = cluster[jj]
-                si, ei = int(ri["s"]), int(ri["e"])
-                sj, ej = int(rj["s"]), int(rj["e"])
-                if si != sj and ei != ej:
-                    continue  # not an extension pair
-                key_i = f"{ri['chrom']}:{si}-{ei}"
-                key_j = f"{rj['chrom']}:{sj}-{ej}"
+                ri, rj = cluster[ii], cluster[jj]
+                key_i = f"{ri['chrom']}:{int(ri['s'])}-{int(ri['e'])}"
+                key_j = f"{rj['chrom']}:{int(rj['s'])}-{int(rj['e'])}"
                 has_i = tsd_names is not None and key_i in tsd_names
                 has_j = tsd_names is not None and key_j in tsd_names
                 if has_i and not has_j:
                     dominated.add(jj)
                 elif has_j and not has_i:
                     dominated.add(ii)
-                elif not has_i and not has_j:
-                    len_i = ei - si + 1
-                    len_j = ej - sj + 1
-                    longer  = ri if len_i >= len_j else rj
-                    shorter = rj if len_i >= len_j else ri
-                    print(
-                        f"[dedup WARNING] extension pair, no TSD to resolve: "
-                        f"shorter={shorter['chrom']}:{int(shorter['s'])}-{int(shorter['e'])} "
-                        f"p={shorter['p']} aln={shorter['aln']}  "
-                        f"longer={longer['chrom']}:{int(longer['s'])}-{int(longer['e'])} "
-                        f"p={longer['p']} aln={longer['aln']}"
-                    )
-                # both have TSD → no preference, fall through to p-dist
+                # both have TSD or both lack TSD → no preference, fall through
 
         survivors = [cluster[i] for i in range(len(cluster)) if i not in dominated]
-        best = min(survivors, key=lambda x: (float(x["p"]), -int(x["aln"])))  # type: ignore
-        out_handle.write(best["line"])  # type: ignore
+        if len(survivors) == 1:
+            out_handle.write(survivors[0]["line"])
+            return
+
+        # --- Layer 2: Matching-bases score with ratio guard ---
+        def _matching_bases(rec):
+            return float(rec["aln"]) * (1.0 - float(rec["p"]))
+
+        RATIO_CAP = 2.5
+
+        best_score = max(survivors, key=lambda x: _matching_bases(x))
+        best_pdist = min(survivors, key=lambda x: (float(x["p"]), -int(x["aln"])))
+
+        if best_score is best_pdist:
+            best = best_score
+        else:
+            p_hi  = max(float(best_score["p"]), 1e-10)
+            p_lo  = max(float(best_pdist["p"]), 1e-10)
+            aln_hi = max(int(best_score["aln"]), 1)
+            aln_lo = max(int(best_pdist["aln"]), 1)
+
+            if p_hi / p_lo > RATIO_CAP * (aln_hi / aln_lo):
+                # Divergence jumped disproportionately → fall back to p-dist
+                best = best_pdist
+            else:
+                best = best_score
+
+        out_handle.write(best["line"])
 
     with open(tmp_sorted, "r") as fin, open(out_tsv, "w") as out:
         for raw in fin:
@@ -1870,6 +1878,87 @@ def _has_exact_tsd(left: str, right: str, min_len: int = 5) -> bool:
                 return True
 
     return False
+
+def wfa_guided_tsd_names(
+    kmer2ltr_tsv: str,
+    genome_fa: str,
+    existing_tsd_names: Set[str],
+    min_len: int = 5,
+) -> Set[str]:
+    """
+    For kmer2ltr candidates WITHOUT an existing TSD, use WFA left/right trim
+    columns (cols 13-14, 1-indexed) to adjust element boundaries inward and
+    retry TSD search at the shifted positions.
+
+    The WFA -k trim tells us how many alignment columns at each end of the
+    LTR-pair alignment are unreliable (no k consecutive matches).  This
+    corresponds to boundary over-extension:
+      - left_trim  → 5' LTR outer boundary shifted left into flanking DNA
+      - right_trim → 3' LTR outer boundary shifted right into flanking DNA
+
+    Returns set of newly recovered 'chrom:start-end' keys.
+    """
+    tsv_path = Path(kmer2ltr_tsv)
+    if not tsv_path.exists() or tsv_path.stat().st_size == 0:
+        return set()
+
+    genome = load_fasta_as_dict(genome_fa)
+    recovered: Set[str] = set()
+
+    with open(kmer2ltr_tsv) as f:
+        for line in f:
+            line = line.rstrip("\n")
+            if not line:
+                continue
+            parts = line.split("\t")
+            if len(parts) < 14:
+                continue
+
+            parsed = _parse_interval_from_kmer2ltr_col1(parts[0])
+            if parsed is None:
+                continue
+            chrom, s, e = parsed
+            key = f"{chrom}:{s}-{e}"
+
+            if key in existing_tsd_names:
+                continue
+
+            try:
+                left_trim = int(parts[12])
+                right_trim = int(parts[13])
+            except (ValueError, IndexError):
+                continue
+
+            if left_trim == 0 and right_trim == 0:
+                continue
+
+            seq = genome.get(chrom)
+            if seq is None:
+                continue
+
+            adj_s = s + left_trim   # shift 5' outer boundary inward (1-based)
+            adj_e = e - right_trim  # shift 3' outer boundary inward (1-based)
+
+            if adj_s >= adj_e or adj_s < 1 or adj_e > len(seq):
+                continue
+
+            # Extract flanks at adjusted boundaries (same window as tsd_positive_full_length_from_scn)
+            fl0 = adj_s - 1  # 0-based left boundary
+            fr0 = adj_e      # 0-based one-past-end
+
+            left_start0  = max(0, fl0 - 6)
+            left_end0    = min(len(seq), fl0 + 1)
+            right_start0 = max(0, fr0 - 1)
+            right_end0   = min(len(seq), (fr0 - 1) + 7)
+
+            left_flank  = seq[left_start0:left_end0]
+            right_flank = seq[right_start0:right_end0]
+
+            if _has_exact_tsd(left_flank, right_flank, min_len=min_len):
+                recovered.add(key)
+
+    return recovered
+
 
 def rescue_nonautonomous_by_tsd_from_scn(
     stitched_scn: str,
@@ -2668,8 +2757,17 @@ def main():
 
     k2l_dedup_out = f"{out_prefix}_kmer2ltr_dedup"
     print(f"[Step9b] deduping Kmer2LTR output -> {k2l_dedup_out}")
-    tsd_name_set = _tsd_names_from_fasta(tsd_pass2_fa) if tsd_pass2_fa else None
-    dedup_kmer2ltr_tsv(k2l_main, k2l_dedup_out, threshold=args.dedup_threshold, tsd_names=tsd_name_set)
+    tsd_name_set = _tsd_names_from_fasta(tsd_pass2_fa) if tsd_pass2_fa else set()
+
+    # WFA-guided TSD recovery: use alignment trim info to find TSDs at adjusted boundaries
+    wfa_recovered = wfa_guided_tsd_names(k2l_main, args.genome, tsd_name_set,
+                                         min_len=args.tsd_min_len)
+    if wfa_recovered:
+        print(f"[Step9b] WFA-guided TSD recovery: {len(wfa_recovered)} additional TSDs")
+    combined_tsd = tsd_name_set | wfa_recovered if (tsd_name_set or wfa_recovered) else None
+
+    dedup_kmer2ltr_tsv(k2l_main, k2l_dedup_out, threshold=args.dedup_threshold,
+                       tsd_names=combined_tsd)
 
     keep_names = names_from_kmer2ltr_dedup(k2l_dedup_out)
 

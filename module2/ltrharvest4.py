@@ -1609,6 +1609,64 @@ def _tsd_names_from_fasta(fa_path: str) -> Set[str]:
     return names
 
 
+def pre_purge_tsd_dominated(
+    stitched_scn: str,
+    tsd_names: Set[str],
+    threshold: float,
+) -> Set[str]:
+    """
+    Identify non-TSD SCN candidates whose genomic interval overlaps a TSD+
+    candidate at >= *threshold* (fraction of the shorter interval).
+
+    These candidates would be eliminated by Layer-1 of dedup anyway, so
+    removing them before TEsorter / Kmer2LTR saves runtime without
+    changing the final library.
+
+    Returns the set of 'chrom:start-end' keys to EXCLUDE.
+    """
+    by_chrom_tsd: Dict[str, List[Tuple[int, int]]] = {}
+    by_chrom_nontsd: Dict[str, List[Tuple[int, int, str]]] = {}
+    seen: Set[str] = set()
+
+    with open(stitched_scn) as fh:
+        for line in fh:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = re.split(r"\s+", line)
+            if len(parts) < 12:
+                continue
+            sret_s, eret_s = parts[0], parts[1]
+            chrom = parts[-1]
+            if not (sret_s.isdigit() and eret_s.isdigit()):
+                continue
+            s, e = int(sret_s), int(eret_s)
+            if e < s:
+                s, e = e, s
+            key = f"{chrom}:{s}-{e}"
+            if key in seen:
+                continue
+            seen.add(key)
+
+            if key in tsd_names:
+                by_chrom_tsd.setdefault(chrom, []).append((s, e))
+            else:
+                by_chrom_nontsd.setdefault(chrom, []).append((s, e, key))
+
+    exclude: Set[str] = set()
+    for chrom, nontsd_intervals in by_chrom_nontsd.items():
+        tsd_intervals = by_chrom_tsd.get(chrom)
+        if not tsd_intervals:
+            continue
+        for s, e, key in nontsd_intervals:
+            for ts, te in tsd_intervals:
+                if _overlap_fraction_of_shorter((s, e), (ts, te)) >= threshold:
+                    exclude.add(key)
+                    break
+
+    return exclude
+
+
 def _overlap_fraction_of_shorter(a: Tuple[int, int], b: Tuple[int, int]) -> float:
     a0, a1 = a
     b0, b1 = b
@@ -2706,6 +2764,33 @@ def main():
             merged_path = merge_pass2_fastas(args.pass2_classified_fasta, tsd_pass2_fa, merged_pass2)
 
             pass2_for_tesorter = merged_path if merged_path else None
+
+            # --- Step 8.9b: pre-purge TSD-dominated candidates ---
+            # Non-TSD candidates that overlap a TSD+ candidate at >= dedup
+            # threshold would be eliminated by Layer-1 of dedup anyway.
+            # Removing them now shrinks the TEsorter + Kmer2LTR input.
+            tsd_names_early = _tsd_names_from_fasta(tsd_pass2_fa)
+            if tsd_names_early:
+                purge_set = pre_purge_tsd_dominated(
+                    merged_scn, tsd_names_early,
+                    threshold=args.dedup_threshold,
+                )
+                if purge_set:
+                    prepurge_fa = str(workdir / f"{out_prefix}.ltrtools.prepurge.fa")
+                    n_before = 0
+                    n_after = 0
+                    with open(prepurge_fa, "w") as out_fh:
+                        for name, seq in iter_fasta(tesorter_in_fa):
+                            n_before += 1
+                            if name in purge_set:
+                                continue
+                            n_after += 1
+                            out_fh.write(f">{name}\n")
+                            for i in range(0, len(seq), 60):
+                                out_fh.write(seq[i:i+60] + "\n")
+                    print(f"[Step8.9b] pre-purge: {n_before} -> {n_after} candidates "
+                          f"({n_before - n_after} TSD-dominated removed)")
+                    tesorter_in_fa = prepurge_fa
 
         print(f"[Step9] running TEsorter on stitched FASTA (outputs -> {tesorter_outdir})")
 

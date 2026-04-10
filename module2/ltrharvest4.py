@@ -1533,6 +1533,7 @@ def run_tesorter(stitched_fa: str, tesorter_py_path: str, outdir: Path,
 def run_kmer2ltr(kmer2ltr_py: str, in_fa: str, out_prefix: str, outdir: Path,
                 threads: int, max_win_overdisp: float, min_retained_fraction: float,
                 domain_file: Optional[str] = None,
+                wfa_align: bool = False,
                 verbose: bool = False) -> str:
     """
     Runs Kmer2LTR in outdir.
@@ -1560,13 +1561,17 @@ def run_kmer2ltr(kmer2ltr_py: str, in_fa: str, out_prefix: str, outdir: Path,
             raise RuntimeError(f"Kmer2LTR domain file requested but missing/empty: {df}")
         cmd += ["-D", str(df)]
 
+    if wfa_align:
+        cmd += ["--wfa-align"]
+
     if verbose:
         label = f"  $ {' '.join(cmd)}\n    (cwd: {outdir})"
         print(label, file=sys.stderr)
 
-    r = subprocess.run(cmd, cwd=str(outdir), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    # Let stderr pass through so Kmer2LTR's progress counter is visible
+    r = subprocess.run(cmd, cwd=str(outdir), stdout=subprocess.PIPE, text=True)
     if r.returncode != 0:
-        raise RuntimeError(f"Kmer2LTR failed:\n{(r.stderr or '').strip()}")
+        raise RuntimeError(f"Kmer2LTR failed (exit {r.returncode})")
 
     main_out = outdir / out_prefix
     if not main_out.exists():
@@ -2256,6 +2261,8 @@ def main():
                     help="Kmer2LTR --min-retained-fraction")
     ap.add_argument("--dedup-threshold", type=float, default=0.80,
                     help="Overlap threshold (fraction of shorter interval) for dedup (default: 0.80)")
+    ap.add_argument("--wfa-align", action="store_true", dest="wfa_align",
+                    help="Pass --wfa-align to Kmer2LTR: use WFA instead of mafft for pairwise LTR alignment (~30-50x faster)")
     
     ap.add_argument(
         "--kmer2ltr-domains",
@@ -2457,7 +2464,15 @@ def main():
             print(f"  exclude_run:   {exclude_run_char} (>=10bp run)", file=sys.stderr)
         print("", file=sys.stderr)
 
+    # Timing accumulators for core modules
+    _t_miniprot = 0.0
+    _t_ltr_annotation = 0.0
+    _t_tesorter = 0.0
+    _t_kmer2ltr = 0.0
+    _t_total_start = time.monotonic()
+
     # Step 2
+    _t0 = time.monotonic()
     if args.proteins:
         print("[Step2] miniprot gene masking...")
         gff_path, genic_bed, genic_masked_fa = run_miniprot_gene_mask(
@@ -2523,15 +2538,19 @@ def main():
         gene_te_masked_fa = str(workdir / f"{out_prefix}.gene_TEmasked.fa")
         shutil.copyfile(genic_masked_fa, gene_te_masked_fa)
 
-    # --clean: purge masking intermediates now that gene_te_masked_fa is ready
+    _t_miniprot = time.monotonic() - _t0
+
+    # Always purge genic_masked.fa; purge other masking intermediates with --clean
+    _clean_path(genic_masked_fa, verbose)
     if args.clean:
-        for _p in [gff_path, genic_bed, genic_masked_fa]:
+        for _p in [gff_path, genic_bed]:
             _clean_path(_p, verbose)
         if args.te_library:
             for _p in [nonltr_fa, paf_path, repeats_bed, merged_bed]:
                 _clean_path(_p, verbose)
 
     # Step 4
+    _t0 = time.monotonic()
     print("[Step4] chunking masked genome...")
     chunks_dir = str(workdir / "chunks")
     chunks = make_chunks(gene_te_masked_fa, chunks_dir, args.size, args.overlap)
@@ -2540,9 +2559,8 @@ def main():
     if verbose:
         print(f"  {len(chunks)} chunks (size={args.size:,}, overlap={args.overlap:,})", file=sys.stderr)
 
-    # --clean: masked genome is now chunked; the masked FASTA is no longer needed
-    if args.clean:
-        _clean_path(gene_te_masked_fa, verbose)
+    # Masked genome is now chunked; no longer needed
+    _clean_path(gene_te_masked_fa, verbose)
 
     # Step 5
     print(f"[Step5] LTR calling on {len(chunks)} chunks with {args.threads} workers...")
@@ -2613,10 +2631,8 @@ def main():
     if failures:
         print(f"[WARN] {failures} chunks failed; stitching continues using successes only.")
 
-    # --clean: chunk FASTAs are no longer needed once LTR calling is done
-    if args.clean:
-        print(f"[CLEAN] purging chunks dir: {chunks_dir}", file=sys.stderr)
-        _clean_path(chunks_dir, verbose)
+    # Chunk FASTAs are no longer needed once LTR calling is done
+    _clean_path(chunks_dir, verbose)
 
     # Step 6 stitched outputs (inside workdir)
     stitched_gff3 = str(workdir / f"{out_prefix}.ltrharvest.stitched.gff3")
@@ -2651,10 +2667,9 @@ def main():
     print(f"[Step6] merging stitched SCN(s) -> {merged_scn}")
     merge_stitched_scns(to_merge, merged_scn)
 
-    # --clean: per-chunk run dirs and individual stitched SCNs/GFF3 are now merged
+    # Per-chunk run dirs are no longer needed after stitching
+    _clean_path(ltr_work, verbose)
     if args.clean:
-        print(f"[CLEAN] purging ltr_runs dir: {ltr_work}", file=sys.stderr)
-        _clean_path(ltr_work, verbose)
         for _p in [stitched_harvest_scn, stitched_finder_scn, stitched_gff3]:
             _clean_path(_p, verbose)
 
@@ -2689,11 +2704,14 @@ def main():
     else:
         print("[Step6b] skipping SCN length filtering (no --scn-* filters set).")
 
+    _t_ltr_annotation = time.monotonic() - _t0
+
     internals_fa = str(workdir / f"{out_prefix}.ltrtools.internals.fa")
     intact_for_tesorter_fa = str(workdir / f"{out_prefix}.ltrtools.intact_for_tesorter.fa")
     intact_fa = f"{out_prefix}.ltrtools.intact.fa"
 
     req_chars = None
+    _t0 = time.monotonic()
     if args.require_run_chars:
         req_chars = [x.strip() for x in args.require_run_chars.split(",") if x.strip()]
 
@@ -2812,12 +2830,15 @@ def main():
         print(f"[Step9] building full-length LTR FASTA from cls.tsv -> {tesorter_lib_fa}")
         build_tesorter_full_length_ltr_fasta_from_cls_tsv(cls_tsv_path, args.genome, tesorter_lib_fa)
 
+    _t_tesorter = time.monotonic() - _t0
+
     # Step 8: kmer2ltr.domain from stitched SCN
     kmer2ltr_domain = str(workdir / f"{out_prefix}.kmer2ltr.domain")
     print(f"[Step8] building kmer2ltr domain -> {kmer2ltr_domain}")
     scn_to_kmer2ltr_domain(merged_scn, kmer2ltr_domain, tesorter_cls_tsv=cls_tsv_path)
 
     # Step 9b: Kmer2LTR
+    _t0 = time.monotonic()
     print("[Step9b] running Kmer2LTR (dedup driver)...")
     k2l_prefix = f"{out_prefix}_kmer2ltr"
 
@@ -2837,10 +2858,11 @@ def main():
         max_win_overdisp=args.kmer2ltr_max_win_overdisp,
         min_retained_fraction=args.kmer2ltr_min_retained_fraction,
         domain_file=domain_arg,
+        wfa_align=args.wfa_align,
         verbose=verbose,
     )
 
-    k2l_dedup_out = f"{out_prefix}_kmer2ltr_dedup"
+    k2l_dedup_out = f"{out_prefix}_ltr.tsv"
     print(f"[Step9b] deduping Kmer2LTR output -> {k2l_dedup_out}")
     tsd_name_set = _tsd_names_from_fasta(tsd_pass2_fa) if tsd_pass2_fa else set()
 
@@ -2854,10 +2876,12 @@ def main():
     dedup_kmer2ltr_tsv(k2l_main, k2l_dedup_out, threshold=args.dedup_threshold,
                        tsd_names=combined_tsd)
 
+    _t_kmer2ltr = time.monotonic() - _t0
+
     keep_names = names_from_kmer2ltr_dedup(k2l_dedup_out)
 
     if args.use_tesorter:
-        tesorter_lib_fa_dedup = f"{out_prefix}.ltrharvest.full_length.dedup.fa.{args.tesorter_db}.cls.lib.fa"
+        tesorter_lib_fa_dedup = f"{out_prefix}_ltr.fa"
         print(f"[Step9b] subsetting full-length FASTA by dedup list -> {tesorter_lib_fa_dedup}")
         subset_fasta_by_name_set(k2l_in_fa, tesorter_lib_fa_dedup, keep_names)
     else:
@@ -2865,12 +2889,20 @@ def main():
         print(f"[Step9b] subsetting intact FASTA by dedup list -> {intact_dedup_fa}")
         subset_fasta_by_name_set(intact_fa, intact_dedup_fa, keep_names)
 
+    _t_total = time.monotonic() - _t_total_start
     print("\nDone.")
+    print("Runtimes:")
+    print(f"  Miniprot/masking:   {_format_hms(_t_miniprot)}")
+    print(f"  LTR annotation:    {_format_hms(_t_ltr_annotation)}")
+    print(f"  TEsorter:          {_format_hms(_t_tesorter)}")
+    print(f"  Kmer2LTR:          {_format_hms(_t_kmer2ltr)}")
+    print(f"  Total:             {_format_hms(_t_total)}")
+    print("")
     print("Primary outputs:")
-    print(f"  Kmer2LTR dedup TSV:          {out_prefix}_kmer2ltr_dedup")
+    print(f"  LTR TSV:   {out_prefix}_ltr.tsv")
 
     if args.use_tesorter:
-        print(f"  TEsorter full-length dedup FASTA: {out_prefix}.ltrharvest.full_length.dedup.fa.{args.tesorter_db}.cls.lib.fa")
+        print(f"  LTR FASTA: {out_prefix}_ltr.fa")
         print("")
         print("Workdir outputs:")
         print(f"  Full-length (pre-dedup) FASTA: {tesorter_lib_fa}")
@@ -2886,6 +2918,14 @@ def main():
         shutil.rmtree(workdir, ignore_errors=True)
         print(f"[CLEAN] removing tools dir: {tools_dir}")
         shutil.rmtree(tools_dir, ignore_errors=True)
+    else:
+        # Compress FASTA files in workdir in background
+        fa_files = list(workdir.glob("*.fa"))
+        if fa_files:
+            for fa in fa_files:
+                subprocess.Popen(["gzip", str(fa)],
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            print(f"[COMPRESS] gzipping {len(fa_files)} FASTA file(s) in {workdir}/ (background)")
 
 if __name__ == "__main__":
     main()

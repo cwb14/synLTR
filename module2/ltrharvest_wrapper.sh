@@ -5,7 +5,7 @@
 # Usage:
 #   bash nest_ltr_detector.sh --genome genome.fa [--proteins prot.fa] [--terminate_count 100]
 #       [--max-rounds N] [--script_path ./synLTR/module2/] [--threads 20] [--out_prefix ltrs]
-#       [--ltrharvest4-args "KEY=VALUE ..."] [--ltrharvest4-args-from-round N "KEY=VALUE ..."]
+#       [--wfa-align] [--ltrharvest4-args "KEY=VALUE ..."] [--ltrharvest4-args-from-round N "KEY=VALUE ..."]
 #
 # Notes:
 # - Runs Round 1 on the original genome, then masks the ORIGINAL genome each round to build genome_r{N}.fa for next round.
@@ -37,6 +37,12 @@
 
 set -euo pipefail
 
+# Print the exact command for reproducibility
+echo "Command: $0 $*"
+echo ""
+
+WRAPPER_START=$SECONDS
+
 # ----------------------------
 # Defaults
 # ----------------------------
@@ -48,6 +54,7 @@ SCRIPT_PATH=""
 THREADS=20
 OUT_PREFIX="ltrs"
 RUN_TRF=false
+WFA_ALIGN=false
 
 # Storage for extra ltrharvest4.py arg directives
 # Each entry is tab-separated: "FROMROUND\tKEY\tVALUE\tIS_BOOL"
@@ -63,7 +70,7 @@ usage() {
 Usage:
   bash nest_ltr_detector.sh --genome genome.fa [--proteins prot.fa] [--terminate_count 100]
       [--max-rounds N] [--script_path ./synLTR/module2/] [--threads 20] [--out_prefix ltrs]
-      [--ltrharvest4-args "KEY=VALUE ..."] [--ltrharvest4-args-from-round N "KEY=VALUE ..."]
+      [--wfa-align] [--ltrharvest4-args "KEY=VALUE ..."] [--ltrharvest4-args-from-round N "KEY=VALUE ..."]
 
 Required:
   --genome              Genome FASTA (.fa/.fasta)
@@ -77,6 +84,7 @@ Optional:
   --threads             Threads for ltrharvest4.py (default 20)
   --out_prefix          Output prefix (default ltrs)
   --run-trf             Enable TRF instead of default --no-trf
+  --wfa-align           Use WFA instead of mafft for Kmer2LTR pairwise alignment (~30-50x faster)
 
 Extra ltrharvest4.py options:
   --ltrharvest4-args "KEY=VALUE [KEY2=VALUE2 ...]"
@@ -214,6 +222,7 @@ while [[ $# -gt 0 ]]; do
     --threads) THREADS="${2:-}"; shift 2;;
     --out_prefix) OUT_PREFIX="${2:-}"; shift 2;;
     --run-trf) RUN_TRF=true; shift;;
+    --wfa-align) WFA_ALIGN=true; shift;;
     --ltrharvest4-args)
       parse_kv_string 1 "${2:-}"
       shift 2;;
@@ -294,6 +303,11 @@ if [[ "$RUN_TRF" == true ]]; then
   TRF_OPTS=(--trf --trf-args "-a 5 -b 30 -g 30 -G 1 -s 150 -p 10" --trf-min-copy 40)
 else
   TRF_OPTS=(--no-trf)
+fi
+
+WFA_OPTS=()
+if [[ "$WFA_ALIGN" == true ]]; then
+  WFA_OPTS=(--wfa-align)
 fi
 
 SIZE=500000
@@ -411,6 +425,7 @@ for (( round=1; round<=MAX_ROUNDS; round++ )); do
     --nested-flank-min "$NESTED_FLANK_MIN" \
     --nested-base-min "$NESTED_BASE_MIN" \
     "${pass2_opts[@]}" \
+    "${WFA_OPTS[@]}" \
     "${extra_round_args[@]}" \
     || ltrharvest_exit=$?
   set +x
@@ -426,7 +441,7 @@ for (( round=1; round<=MAX_ROUNDS; round++ )); do
     break
   fi
 
-  lib="${out_prefix_round}.ltrharvest.full_length.dedup.fa.rexdb-plant.cls.lib.fa"
+  lib="${out_prefix_round}_ltr.fa"
   if [[ ! -s "$lib" ]]; then
     echo "" >&2
     echo "============================================================" >&2
@@ -490,4 +505,17 @@ done
 
 # Cleanup
 rm -f "$temp_lib" 2>/dev/null || true
+rm -rf ./tools/ 2>/dev/null || true
+
+WRAPPER_ELAPSED=$((SECONDS - WRAPPER_START))
+WRAPPER_H=$((WRAPPER_ELAPSED / 3600))
+WRAPPER_M=$(( (WRAPPER_ELAPSED % 3600) / 60 ))
+WRAPPER_S=$((WRAPPER_ELAPSED % 60))
+if [[ "$WRAPPER_H" -gt 0 ]]; then
+  WRAPPER_TIME="${WRAPPER_H}:$(printf '%02d' $WRAPPER_M):$(printf '%02d' $WRAPPER_S)"
+else
+  WRAPPER_TIME="${WRAPPER_M}:$(printf '%02d' $WRAPPER_S)"
+fi
+echo ""
+echo "Wrapper total runtime: ${WRAPPER_TIME}"
 echo "Done."

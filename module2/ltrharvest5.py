@@ -28,6 +28,14 @@ python ../PrinTE/util/bedtools.py -pass_scn burnin.fasta.mod.EDTA.raw/LTR/burnin
    Entries unique to SCN/PASS file: 0 = 0/4468 = 0.0 = false positive.
    Entries unique to BED file: 2383 = 2383/4468 = 0.533348 = false negative.
    F1 = 0.64
+
+# NOTES; It now resolves multiple layers of nesting in a single round. I was sometimes observing catching outer-nest LTR-RTs and missing the inner-nest. I modified to fix this, but it unearthers two areas of improvement. 
+(1) TEsorter classification: Nested TEs fed to TEsorter may be missclassified. Ie, a Tork nested in an Ogre may lead to the Ogre being misclassified as a Tork or mixture. Eg:
+    chr1:907045-918753#LTR/Copia/Bianca     340     330     32      17      15      0.096970        1616162 0.103837        1730621 0.104197        1736609 0   0.       INT|Reina@907840-908727;RH|Reina@909001-909432  nest-outer:chr1:909422-915750
+    chr1:909422-915750#LTR/Copia/Bianca     334     323     21      12      9       0.065015        1083591 0.068008        1133462 0.068221        1137014 0   0.       RH|Bianca@910002-910364;RT|Bianca@910695-911483;INT|Bianca@912348-912953;PROT|Bianca@913164-913376;GAG|Bianca@914136-914405     nest-inner:chr1:907045-918753
+Line 2 (inner) is nested in line 1 (outer). Line 2 inner looks like Bianca. Line 1 outer looks like Reina. They both get Bianca though since they were fed to TEsorter as a single unit. 
+
+(2) Nest unraveling archetectire: The script uses rounds to resolve complicated nesting, but if its now resolving nesting in a single round, it may be nice to reconcile the round approach with the ones that are detected with a single scan. 
 """
 
 import argparse

@@ -37,6 +37,7 @@ import shutil
 import subprocess
 import sys
 import time
+from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Set, Tuple, Iterable, Optional
@@ -1809,6 +1810,36 @@ def _ltrs_shared(
     return False
 
 
+def _sub_dedup_shared_ltr_group(
+    group: List[Dict[str, object]],
+    ratio_cap: float = 2.5,
+) -> Dict[str, object]:
+    """From a group of near-duplicate records (shared LTRs), keep the best one.
+
+    Uses Layer-2 scoring: matching-bases with ratio guard.
+    """
+    if len(group) == 1:
+        return group[0]
+
+    def _mb(rec):
+        return float(rec["aln"]) * (1.0 - float(rec["p"]))
+
+    best_score = max(group, key=lambda x: _mb(x))
+    best_pdist = min(group, key=lambda x: (float(x["p"]), -int(x["aln"])))
+
+    if best_score is best_pdist:
+        return best_score
+
+    p_hi  = max(float(best_score["p"]), 1e-10)
+    p_lo  = max(float(best_pdist["p"]), 1e-10)
+    aln_hi = max(int(best_score["aln"]), 1)
+    aln_lo = max(int(best_pdist["aln"]), 1)
+
+    if p_hi / p_lo > ratio_cap * (aln_hi / aln_lo):
+        return best_pdist
+    return best_score
+
+
 def load_scn_ltr_boundaries(
     scn_path: str,
 ) -> Dict[str, Tuple[int, int, int, int]]:
@@ -1845,7 +1876,7 @@ def load_scn_ltr_boundaries(
 
 
 def dedup_kmer2ltr_tsv(kmer2ltr_tsv: str, out_tsv: str, threshold: float,
-                       tsd_names: Optional[Set[str]] = None,
+                       tsd_names: Optional[Dict[str, str]] = None,
                        gff3_domains: Optional[Dict[str, list]] = None,
                        ltr_bounds: Optional[Dict[str, Tuple[int, int, int, int]]] = None,
                        ) -> None:
@@ -1873,11 +1904,67 @@ def dedup_kmer2ltr_tsv(kmer2ltr_tsv: str, out_tsv: str, threshold: float,
     cluster: List[Dict[str, object]] = []
     cluster_chrom: Optional[str] = None
 
+    # --- helpers for enriched output ---
+
+    def _rec_key(rec):
+        return f"{rec['chrom']}:{int(rec['s'])}-{int(rec['e'])}"
+
+    def _format_domains_for_output(te_key, excluded_ranges=None):
+        """Format domains as 'gene|clade@start-end;...' or '.' if none.
+
+        excluded_ranges: list of (start, end) tuples. Domains overlapping
+        any excluded range are omitted (used for nest-outer filtering).
+        """
+        if gff3_domains is None:
+            return "."
+        entries = gff3_domains.get(te_key, [])
+        if not entries:
+            return "."
+        parts = []
+        for d in entries:
+            if excluded_ranges:
+                skip = False
+                for ex_s, ex_e in excluded_ranges:
+                    if d["start"] >= ex_s and d["end"] <= ex_e:
+                        skip = True
+                        break
+                if skip:
+                    continue
+            parts.append(f"{d['gene']}|{d['clade']}@{d['start']}-{d['end']}")
+        return ";".join(parts) if parts else "."
+
+    def _write_enriched(rec, handle, nest_rels):
+        """Write a record with tsd, domains, nest_status columns appended."""
+        key = _rec_key(rec)
+
+        # TSD: actual motif or "."
+        tsd_val = tsd_names.get(key, ".") if tsd_names else "."
+
+        # Nest status
+        rels = nest_rels.get(id(rec), [])
+        nest_val = ";".join(f"{r}:{k}" for r, k in rels) if rels else "."
+
+        # Domains (for nest-outer, exclude domains inside inner boundaries)
+        inner_ranges = []
+        for role, partner_key in rels:
+            if role == "nest-outer":
+                parsed = _parse_interval_from_kmer2ltr_col1(partner_key)
+                if parsed:
+                    inner_ranges.append((parsed[1], parsed[2]))
+        dom_val = _format_domains_for_output(
+            key, excluded_ranges=inner_ranges if inner_ranges else None)
+
+        line = rec["line"].rstrip("\n")
+        handle.write(f"{line}\t{tsd_val}\t{dom_val}\t{nest_val}\n")
+
     def flush_cluster(out_handle):
         if not cluster:
             return
+        # nest_relationships: id(rec) -> list of (role, partner_key)
+        nest_rels: Dict[int, List[Tuple[str, str]]] = defaultdict(list)
+
         if len(cluster) == 1:
-            out_handle.write(cluster[0]["line"])
+            _write_enriched(cluster[0], out_handle, nest_rels)
             return
 
         # --- Layer 1: TSD tiebreaker (all overlap pairs, not just extension pairs) ---
@@ -1907,12 +1994,10 @@ def dedup_kmer2ltr_tsv(kmer2ltr_tsv: str, out_tsv: str, threshold: float,
 
         survivors = [cluster[i] for i in range(len(cluster)) if i not in dominated]
         if len(survivors) == 1:
-            out_handle.write(survivors[0]["line"])
+            _write_enriched(survivors[0], out_handle, nest_rels)
             return
 
         # --- Layer 1.5: Containment / nesting detection + diagnostics ---
-        # When one candidate fully contains another, keep BOTH and print
-        # diagnostic metadata.  Resolution deferred to a future version.
         def _matching_bases(rec):
             return float(rec["aln"]) * (1.0 - float(rec["p"]))
 
@@ -1973,8 +2058,12 @@ def dedup_kmer2ltr_tsv(kmer2ltr_tsv: str, out_tsv: str, threshold: float,
                     nest_involved.add(ii)
                     nest_involved.add(jj)
 
-                    inner_tsd = "yes" if (tsd_names and inner_key in tsd_names) else "no"
-                    outer_tsd = "yes" if (tsd_names and outer_key in tsd_names) else "no"
+                    # Record nesting relationships
+                    nest_rels[id(inner_rec)].append(("nest-inner", outer_key))
+                    nest_rels[id(outer_rec)].append(("nest-outer", inner_key))
+
+                    inner_tsd = tsd_names.get(inner_key, ".") if tsd_names else "."
+                    outer_tsd = tsd_names.get(outer_key, ".") if tsd_names else "."
                     inner_mb = _matching_bases(inner_rec)
                     outer_mb = _matching_bases(outer_rec)
 
@@ -1992,12 +2081,59 @@ def dedup_kmer2ltr_tsv(kmer2ltr_tsv: str, out_tsv: str, threshold: float,
                     print(f"    domains: {_format_domains(inner_key)}")
                     print(f"  outer_domains_inside_inner: "
                           f"{n_inside}/{n_total} ({inside_genes})")
-                    print(f"  BOTH_RETAINED")
 
         if nest_involved:
-            # Write all elements that participated in containment pairs.
-            for i in sorted(nest_involved):
-                out_handle.write(survivors[i]["line"])
+            # Sub-dedup near-duplicates within nest_involved:
+            # group by shared LTRs (union-find), keep best per group.
+            ni_list = sorted(nest_involved)
+            parent = {i: i for i in ni_list}
+
+            def _uf_find(x):
+                while parent[x] != x:
+                    parent[x] = parent[parent[x]]
+                    x = parent[x]
+                return x
+
+            def _uf_union(a, b):
+                ra, rb = _uf_find(a), _uf_find(b)
+                if ra != rb:
+                    parent[ra] = rb
+
+            for idx_a in range(len(ni_list)):
+                for idx_b in range(idx_a + 1, len(ni_list)):
+                    ia, ib = ni_list[idx_a], ni_list[idx_b]
+                    ri, rj = survivors[ia], survivors[ib]
+                    ki = _rec_key(ri)
+                    kj = _rec_key(rj)
+                    if _ltrs_shared(ki, kj, ltr_bounds):
+                        _uf_union(ia, ib)
+
+            groups: Dict[int, List[int]] = defaultdict(list)
+            for i in ni_list:
+                groups[_uf_find(i)].append(i)
+
+            deduped_nest: List[int] = []
+            for members in groups.values():
+                if len(members) == 1:
+                    deduped_nest.append(members[0])
+                else:
+                    recs = [survivors[m] for m in members]
+                    best = _sub_dedup_shared_ltr_group(recs)
+                    for m in members:
+                        if survivors[m] is best:
+                            deduped_nest.append(m)
+                            break
+
+            # Prune stale partner references from nest_rels
+            surviving_keys = {_rec_key(survivors[i]) for i in deduped_nest}
+            for rec_id in list(nest_rels.keys()):
+                nest_rels[rec_id] = [
+                    (role, pk) for role, pk in nest_rels[rec_id]
+                    if pk in surviving_keys or role == "nest-inner"
+                ]
+
+            for i in sorted(deduped_nest):
+                _write_enriched(survivors[i], out_handle, nest_rels)
             # Also write any non-involved survivors through Layer 2 below.
             remaining = [survivors[i] for i in range(n_surv)
                          if i not in nest_involved]
@@ -2005,7 +2141,7 @@ def dedup_kmer2ltr_tsv(kmer2ltr_tsv: str, out_tsv: str, threshold: float,
                 return
             survivors = remaining
             if len(survivors) == 1:
-                out_handle.write(survivors[0]["line"])
+                _write_enriched(survivors[0], out_handle, nest_rels)
                 return
 
         # --- Layer 2: Matching-bases score with ratio guard ---
@@ -2027,27 +2163,31 @@ def dedup_kmer2ltr_tsv(kmer2ltr_tsv: str, out_tsv: str, threshold: float,
             else:
                 best = best_score
 
-        out_handle.write(best["line"])
+        _write_enriched(best, out_handle, nest_rels)
 
     with open(tmp_sorted, "r") as fin, open(out_tsv, "w") as out:
+        # Header line
+        out.write("#name\tLTR_len\taln_len\tsubs\tti\ttv\traw_d\traw_T\t"
+                  "JC69_d\tJC69_T\tK2P_d\tK2P_T\tleft_trim\tright_trim\t"
+                  "tsd\tdomains\tnest_status\n")
         for raw in fin:
             if not raw.strip():
                 continue
             parts = raw.rstrip("\n").split("\t")
             if len(parts) < 7:
-                out.write(raw)
+                out.write(raw.rstrip("\n") + "\t.\t.\t.\n")
                 continue
 
             parsed = _parse_interval_from_kmer2ltr_col1(parts[0])
             if parsed is None:
-                out.write(raw)
+                out.write(raw.rstrip("\n") + "\t.\t.\t.\n")
                 continue
             chrom, s, e = parsed
 
             try:
                 p = float(parts[6])
             except ValueError:
-                out.write(raw)
+                out.write(raw.rstrip("\n") + "\t.\t.\t.\n")
                 continue
 
             try:
@@ -2110,9 +2250,10 @@ def names_from_kmer2ltr_dedup(dedup_tsv: str) -> set:
     keep = set()
     with open(dedup_tsv, "r") as f:
         for line in f:
-            if not line.strip():
+            line = line.strip()
+            if not line or line.startswith("#"):
                 continue
-            cols = line.rstrip("\n").split("\t")
+            cols = line.split("\t")
             if cols:
                 keep.add(cols[0])
     return keep
@@ -2186,16 +2327,17 @@ def build_tesorter_full_length_ltr_fasta_from_cls_tsv(cls_tsv_path: str, genome_
         Path(out_fa).touch()
 
 
-def _has_exact_tsd(left: str, right: str, min_len: int = 5) -> bool:
+def _find_tsd_seq(left: str, right: str, min_len: int = 5) -> Optional[str]:
     """
-    Returns True if left and right share ANY exact substring of length >= min_len,
-    BUT rejects low-complexity kmers (must contain >=2 distinct bases).
+    Return the longest exact shared substring (>= min_len) between left and
+    right flanks, or None.  Rejects low-complexity kmers (must contain >=2
+    distinct bases).  Iterates longest-first so the first hit is the best.
     """
     left = left.upper()
     right = right.upper()
 
     if len(left) < min_len or len(right) < min_len:
-        return False
+        return None
 
     maxk = min(len(left), len(right))
 
@@ -2207,16 +2349,21 @@ def _has_exact_tsd(left: str, right: str, min_len: int = 5) -> bool:
                 continue
 
             if mer in right:
-                return True
+                return mer
 
-    return False
+    return None
+
+
+def _has_exact_tsd(left: str, right: str, min_len: int = 5) -> bool:
+    """Wrapper: True if a valid TSD exists between left and right flanks."""
+    return _find_tsd_seq(left, right, min_len=min_len) is not None
 
 def wfa_guided_tsd_names(
     kmer2ltr_tsv: str,
     genome_fa: str,
-    existing_tsd_names: Set[str],
+    existing_tsd_names: Dict[str, str],
     min_len: int = 5,
-) -> Set[str]:
+) -> Dict[str, str]:
     """
     For kmer2ltr candidates WITHOUT an existing TSD, use WFA left/right trim
     columns (cols 13-14, 1-indexed) to adjust element boundaries inward and
@@ -2228,14 +2375,14 @@ def wfa_guided_tsd_names(
       - left_trim  → 5' LTR outer boundary shifted left into flanking DNA
       - right_trim → 3' LTR outer boundary shifted right into flanking DNA
 
-    Returns set of newly recovered 'chrom:start-end' keys.
+    Returns dict mapping newly recovered 'chrom:start-end' keys to TSD motifs.
     """
     tsv_path = Path(kmer2ltr_tsv)
     if not tsv_path.exists() or tsv_path.stat().st_size == 0:
-        return set()
+        return {}
 
     genome = load_fasta_as_dict(genome_fa)
-    recovered: Set[str] = set()
+    recovered: Dict[str, str] = {}
 
     with open(kmer2ltr_tsv) as f:
         for line in f:
@@ -2286,8 +2433,9 @@ def wfa_guided_tsd_names(
             left_flank  = seq[left_start0:left_end0]
             right_flank = seq[right_start0:right_end0]
 
-            if _has_exact_tsd(left_flank, right_flank, min_len=min_len):
-                recovered.add(key)
+            tsd_motif = _find_tsd_seq(left_flank, right_flank, min_len=min_len)
+            if tsd_motif is not None:
+                recovered[key] = tsd_motif
 
     return recovered
 
@@ -2389,16 +2537,17 @@ def tsd_positive_full_length_from_scn(
     exclude_run_char: Optional[str] = None,
     base_min: int = 800,
     flank_min: int = 80,
-) -> int:
+) -> Tuple[int, Dict[str, str]]:
     """
     Scan ALL SCN candidates for a TSD near intact boundaries and write those candidates
     as full-length FASTA suitable for TEsorter --pass2-classified-fasta.
-    Returns number written.
+    Returns (number_written, dict mapping 'chrom:start-end' -> TSD_sequence).
     """
     genome = load_fasta_as_dict(genome_fa)
 
     written = 0
     seen = set()
+    tsd_seqs: Dict[str, str] = {}
 
     req = _is_valid_require_run_chars(require_run_chars)
 
@@ -2443,7 +2592,8 @@ def tsd_positive_full_length_from_scn(
             left = seq[left_start0:left_end0]
             right = seq[right_start0:right_end0]
 
-            if not _has_exact_tsd(left, right, min_len=min_len):
+            tsd_motif = _find_tsd_seq(left, right, min_len=min_len)
+            if tsd_motif is None:
                 continue
 
             frag = seq[fl0:fr0]
@@ -2456,6 +2606,8 @@ def tsd_positive_full_length_from_scn(
                 if has_exclude_run_char(frag.upper(), exclude_run_char):
                     continue
 
+            tsd_seqs[te_key] = tsd_motif
+
             hdr = f"{te_key}#LTR/unknown/unknown"
             out.write(f">{hdr}\n")
             for i in range(0, len(frag), 60):
@@ -2464,7 +2616,7 @@ def tsd_positive_full_length_from_scn(
 
     if written == 0:
         Path(out_fa).touch()
-    return written
+    return written, tsd_seqs
 
 
 # -----------------------------
@@ -2985,6 +3137,7 @@ def main():
         req_chars = [x.strip() for x in args.require_run_chars.split(",") if x.strip()]
 
     tsd_pass2_fa: Optional[str] = None  # populated below if --tsd-pass2 is active
+    tsd_seqs_from_scn: Dict[str, str] = {}  # populated by tsd_positive_full_length_from_scn
 
     if args.use_tesorter:
         if args.tesorter_use_ret:
@@ -3038,7 +3191,7 @@ def main():
             tsd_pass2_fa = str(workdir / f"{out_prefix}.tsd_pass2.full_length.fa")
             print(f"[Step8.9] scanning SCN candidates for TSDs -> {tsd_pass2_fa}")
 
-            n_tsd = tsd_positive_full_length_from_scn(
+            n_tsd, tsd_seqs_from_scn = tsd_positive_full_length_from_scn(
                 stitched_scn=merged_scn,
                 genome_fa=args.genome,
                 out_fa=tsd_pass2_fa,
@@ -3139,14 +3292,15 @@ def main():
 
     k2l_dedup_out = f"{out_prefix}_ltr.tsv"
     print(f"[Step9b] deduping Kmer2LTR output -> {k2l_dedup_out}")
-    tsd_name_set = _tsd_names_from_fasta(tsd_pass2_fa) if tsd_pass2_fa else set()
+    # Build TSD dict: key -> TSD motif sequence
+    tsd_seq_dict: Dict[str, str] = dict(tsd_seqs_from_scn)
 
     # WFA-guided TSD recovery: use alignment trim info to find TSDs at adjusted boundaries
-    wfa_recovered = wfa_guided_tsd_names(k2l_main, args.genome, tsd_name_set,
+    wfa_recovered = wfa_guided_tsd_names(k2l_main, args.genome, tsd_seq_dict,
                                          min_len=args.tsd_min_len)
     if wfa_recovered:
         print(f"[Step9b] WFA-guided TSD recovery: {len(wfa_recovered)} additional TSDs")
-    combined_tsd = tsd_name_set | wfa_recovered if (tsd_name_set or wfa_recovered) else None
+    combined_tsd = {**tsd_seq_dict, **wfa_recovered} if (tsd_seq_dict or wfa_recovered) else None
 
     # Load GFF3 domain positions for nesting diagnostics
     gff3_dom_data = None

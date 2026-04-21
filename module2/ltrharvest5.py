@@ -2132,12 +2132,13 @@ def dedup_kmer2ltr_tsv(kmer2ltr_tsv: str, out_tsv: str, threshold: float,
                             deduped_nest.append(m)
                             break
 
-            # Prune stale partner references from nest_rels
+            # Prune stale partner references from nest_rels: nest-inner refs to deduped outer would be dangling pointers. 
             surviving_keys = {_rec_key(survivors[i]) for i in deduped_nest}
             for rec_id in list(nest_rels.keys()):
                 nest_rels[rec_id] = [
                     (role, pk) for role, pk in nest_rels[rec_id]
-                    if pk in surviving_keys or role == "nest-inner"
+                    if pk in surviving_keys
+#                   if pk in surviving_keys or role == "nest-inner"
                 ]
 
             for i in sorted(deduped_nest):

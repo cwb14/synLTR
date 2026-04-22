@@ -45,7 +45,7 @@ import shutil
 import subprocess
 import sys
 import time
-from collections import defaultdict
+from collections import defaultdict, Counter
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Set, Tuple, Iterable, Optional
@@ -1292,9 +1292,15 @@ def load_tesorter_gff3_domains(gff3_path: str) -> Dict[str, list]:
                     k, v = field.split("=", 1)
                     attrs[k] = v
 
-            # Extract TE name from ID attribute (before the '|' delimiter)
+            # Extract TE name and full rexdb clade path from ID attribute.
+            # Example ID: NC_1:488645-501445|Class_I/LTR/Ty1_copia/Ikeros:Ty1-INT
             id_val = attrs.get("ID", "")
-            te_name = id_val.split("|", 1)[0] if "|" in id_val else id_val
+            if "|" in id_val:
+                te_name, _after = id_val.split("|", 1)
+                clade_path = _after.split(":", 1)[0] if ":" in _after else _after
+            else:
+                te_name = id_val
+                clade_path = ""
 
             if not te_name:
                 continue
@@ -1302,6 +1308,7 @@ def load_tesorter_gff3_domains(gff3_path: str) -> Dict[str, list]:
             domain_entry = {
                 "gene": attrs.get("gene", ""),
                 "clade": attrs.get("clade", ""),
+                "clade_path": clade_path,
                 "start": gff_start,
                 "end": gff_end,
                 "evalue": attrs.get("evalue", ""),
@@ -1883,10 +1890,70 @@ def load_scn_ltr_boundaries(
     return result
 
 
+def _parse_rexdb_path(clade: str) -> Tuple[str, str]:
+    # Mirror of TEsorter's Classifier._parse_rexdb (tools/TEsorter/TEsorter/app.py).
+    if clade.startswith("Class_I/LTR/Ty1_copia"):
+        return ("LTR", "Copia")
+    if clade.startswith("Class_I/LTR/Ty3_gypsy"):
+        return ("LTR", "Gypsy")
+    if clade.startswith("Class_I/LTR/"):
+        parts = clade.split("/")
+        if len(parts) >= 3:
+            return (parts[1], parts[2])
+        return ("LTR", "unknown")
+    if clade.startswith("Class_I/"):
+        parts = clade.split("/")
+        if len(parts) >= 3:
+            return (parts[1], parts[2])
+        return (parts[1] if len(parts) >= 2 else "unknown", "unknown")
+    if clade.startswith("Class_II/"):
+        parts = clade.split("/")
+        if len(parts) >= 4:
+            return (parts[2], parts[3])
+        return (parts[2] if len(parts) >= 3 else "unknown", "unknown")
+    if clade.startswith("NA"):
+        return ("LTR", "Retrovirus")
+    return ("unknown", "unknown")
+
+
+def _classify_from_clade_paths(clade_paths: List[str]) -> Optional[Tuple[str, str, str]]:
+    """Majority-vote classification from a list of full rexdb clade paths.
+
+    Mirrors TEsorter's identify_rexdb but uses Counter.most_common() so the
+    result is order-independent (TEsorter's insertion-order comparison can
+    flip a clear majority to 'mixture' when strand is '-').
+
+    Returns (order, superfamily, clade) or None if clade_paths is empty.
+    """
+    if not clade_paths:
+        return None
+    clade_count = Counter(clade_paths)
+    ranked = clade_count.most_common()
+    max_clade_path, max_n = ranked[0]
+    order, superfamily = _parse_rexdb_path(max_clade_path)
+    if len(ranked) == 1 or max_n > ranked[1][1]:
+        clade = max_clade_path.split("/")[-1]
+    else:
+        clade = "mixture"
+        sfams = {_parse_rexdb_path(p)[1] for p in clade_paths}
+        if len(sfams) > 1:
+            superfamily = "mixture"
+            orders = {_parse_rexdb_path(p)[0] for p in clade_paths}
+            if len(orders) > 1:
+                order = "mixture"
+    # TEsorter post-filters: only Copia/Gypsy keep a concrete clade label.
+    if superfamily not in {"Copia", "Gypsy"}:
+        clade = "unknown"
+    if clade.startswith("Ty"):
+        clade = "unknown"
+    return (order, superfamily, clade)
+
+
 def dedup_kmer2ltr_tsv(kmer2ltr_tsv: str, out_tsv: str, threshold: float,
                        tsd_names: Optional[Dict[str, str]] = None,
                        gff3_domains: Optional[Dict[str, list]] = None,
                        ltr_bounds: Optional[Dict[str, Tuple[int, int, int, int]]] = None,
+                       rename_map: Optional[Dict[str, str]] = None,
                        ) -> None:
     """
     Dedup a Kmer2LTR output TSV (main output file), keeping the lowest p-distance (col7).
@@ -1941,6 +2008,52 @@ def dedup_kmer2ltr_tsv(kmer2ltr_tsv: str, out_tsv: str, threshold: float,
             parts.append(f"{d['gene']}|{d['clade']}@{d['start']}-{d['end']}")
         return ";".join(parts) if parts else "."
 
+    def _reclassify_from_domains(key, inner_ranges):
+        """Re-derive a record's class from its TEsorter domain hits using an
+        order-independent majority vote (Counter.most_common instead of
+        TEsorter's insertion-order counts[0] > counts[1] test).
+
+        inner_ranges: list of (start, end) for detected nest-inners. Domains
+        fully inside any inner range are excluded from the vote, so a
+        nest-outer is labeled by its own domains rather than the inner's.
+        Pass an empty list for non-nest-outer records.
+
+        Returns 'order/superfamily/clade' or None when no evaluation is
+        possible (no TEsorter run, no gff3 entry, no usable clade paths).
+        Returns 'LTR/unknown/unknown' when the record had domains but every
+        one of them belongs to a nested inner (only reachable when
+        inner_ranges is non-empty).
+        """
+        if gff3_domains is None:
+            return None
+        entries = gff3_domains.get(key, [])
+        if not entries:
+            return None
+        total_paths = 0
+        filtered_paths = []
+        for d in entries:
+            cp = d.get("clade_path", "")
+            if not cp:
+                continue
+            total_paths += 1
+            inside = False
+            if inner_ranges:
+                for ex_s, ex_e in inner_ranges:
+                    if d["start"] >= ex_s and d["end"] <= ex_e:
+                        inside = True
+                        break
+            if not inside:
+                filtered_paths.append(cp)
+        if total_paths == 0:
+            return None
+        if not filtered_paths:
+            return "LTR/unknown/unknown"
+        result = _classify_from_clade_paths(filtered_paths)
+        if result is None:
+            return None
+        order, superfamily, clade = result
+        return f"{order}/{superfamily}/{clade}"
+
     def _write_enriched(rec, handle, nest_rels):
         """Write a record with tsd, domains, nest_status columns appended."""
         key = _rec_key(rec)
@@ -1963,6 +2076,24 @@ def dedup_kmer2ltr_tsv(kmer2ltr_tsv: str, out_tsv: str, threshold: float,
             key, excluded_ranges=inner_ranges if inner_ranges else None)
 
         line = rec["line"].rstrip("\n")
+
+        # Re-derive class from TEsorter domains using order-independent
+        # majority vote (fixes TEsorter's insertion-order bug). For
+        # nest-outers we additionally drop domains inside the inner so
+        # the outer is labeled by its own identity rather than mixing
+        # in the nested inner's domains.
+        new_class = _reclassify_from_domains(key, inner_ranges)
+        if new_class is not None:
+            cols = line.split("\t")
+            if cols and "#" in cols[0]:
+                te_only, old_class = cols[0].split("#", 1)
+                if old_class != new_class:
+                    old_col1 = cols[0]
+                    cols[0] = f"{te_only}#{new_class}"
+                    line = "\t".join(cols)
+                    if rename_map is not None:
+                        rename_map[old_col1] = cols[0]
+
         handle.write(f"{line}\t{tsd_val}\t{dom_val}\t{nest_val}\n")
 
     def flush_cluster(out_handle):
@@ -2239,15 +2370,21 @@ def dedup_kmer2ltr_tsv(kmer2ltr_tsv: str, out_tsv: str, threshold: float,
         pass
 
 
-def subset_fasta_by_name_set(in_fa: str, out_fa: str, keep_names: set) -> None:
+def subset_fasta_by_name_set(in_fa: str, out_fa: str, keep_names: set,
+                             rename_map: Optional[Dict[str, str]] = None) -> None:
     """
-    Keep FASTA records whose header token (up to whitespace, without '>') is in keep_names.
+    Keep FASTA records whose header token (up to whitespace, without '>') is
+    in keep_names. If rename_map is provided, each input header is first
+    remapped (rename_map[old] -> new) before membership is tested, and output
+    headers use the new names. This keeps the FASTA library consistent with
+    TSV names rewritten elsewhere (e.g. re-classified nest-outer elements).
     """
     n_written = 0
     with open(out_fa, "w") as out:
         for name, seq in iter_fasta(in_fa):
-            if name in keep_names:
-                out.write(f">{name}\n")
+            out_name = rename_map[name] if (rename_map and name in rename_map) else name
+            if out_name in keep_names:
+                out.write(f">{out_name}\n")
                 for i in range(0, len(seq), 60):
                     out.write(seq[i:i+60] + "\n")
                 n_written += 1
@@ -3320,9 +3457,16 @@ def main():
             print(f"[Step9b] loaded GFF3 domain data: "
                   f"{len(gff3_dom_data)} TEs with domain annotations")
 
+    nest_rename_map: Dict[str, str] = {}
     dedup_kmer2ltr_tsv(k2l_main, k2l_dedup_out, threshold=args.dedup_threshold,
                        tsd_names=combined_tsd, gff3_domains=gff3_dom_data,
-                       ltr_bounds=ltr_bounds)
+                       ltr_bounds=ltr_bounds,
+                       rename_map=nest_rename_map)
+
+    if nest_rename_map:
+        print(f"[Step9b] reclassified {len(nest_rename_map)} element(s) from TEsorter "
+              f"domain hits (order-independent majority vote; nest-outers additionally "
+              f"exclude domains inside detected inner-nested boundaries)")
 
     _t_kmer2ltr = time.monotonic() - _t0
 
@@ -3331,11 +3475,13 @@ def main():
     if args.use_tesorter:
         tesorter_lib_fa_dedup = f"{out_prefix}_ltr.fa"
         print(f"[Step9b] subsetting full-length FASTA by dedup list -> {tesorter_lib_fa_dedup}")
-        subset_fasta_by_name_set(k2l_in_fa, tesorter_lib_fa_dedup, keep_names)
+        subset_fasta_by_name_set(k2l_in_fa, tesorter_lib_fa_dedup, keep_names,
+                                 rename_map=nest_rename_map)
     else:
         intact_dedup_fa = f"{out_prefix}.ltrtools.intact.dedup.fa"
         print(f"[Step9b] subsetting intact FASTA by dedup list -> {intact_dedup_fa}")
-        subset_fasta_by_name_set(intact_fa, intact_dedup_fa, keep_names)
+        subset_fasta_by_name_set(intact_fa, intact_dedup_fa, keep_names,
+                                 rename_map=nest_rename_map)
 
     _t_total = time.monotonic() - _t_total_start
     print("\nDone.")

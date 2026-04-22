@@ -11,6 +11,10 @@
 # - Runs Round 1 on the original genome, then masks the ORIGINAL genome each round to build genome_r{N}.fa for next round.
 # - Stops when: detected LTR-RTs < terminate_count, max-rounds reached, or ltrharvest5.py exits early
 #   (e.g. no LTR-RT candidates found) -- early exits are handled gracefully.
+# - After the loop, reconcile_nests.py pools all rounds, detects cross-round containment,
+#   and writes depth-bucketed {OUT_PREFIX}_depth{N}_ltr.{tsv,fa} files. The raw per-round
+#   {OUT_PREFIX}_r{N}_ltr.* files are preserved. depth{N} = elements with N layers of
+#   LTR-RT nested inside (depth0 = no inner, i.e. "unnested"; depth1 = single-nested; etc.).
 # - Uses IUPAC ambiguity codes for masking letters; excludes 'V' because far-character uses V.
 # - At each next round:
 #     scn-max-ret-len, -maxdistltr, -D  += 15000
@@ -251,8 +255,10 @@ fi
 
 LTRHARVEST="${SCRIPT_PATH}/ltrharvest5.py"
 MASKLTR="${SCRIPT_PATH}/mask_ltr.py"
+RECONCILER="${SCRIPT_PATH}/reconcile_nests.py"
 [[ -f "$LTRHARVEST" ]] || die "Missing: $LTRHARVEST"
 [[ -f "$MASKLTR" ]] || die "Missing: $MASKLTR"
+[[ -f "$RECONCILER" ]] || die "Missing: $RECONCILER"
 
 # ----------------------------
 # Config: IUPAC codes to use for successive rounds (exclude V)
@@ -337,6 +343,8 @@ temp_lib="temp_ltr_2pass_lib.fa"
 # Main loop
 # ----------------------------
 libs=()
+# Tracks every round that produced a non-empty lib (used for the reconciler at the end)
+completed_round_prefixes=()
 
 for (( round=1; round<=MAX_ROUNDS; round++ )); do
   round_tag="r${round}"
@@ -454,6 +462,9 @@ for (( round=1; round<=MAX_ROUNDS; round++ )); do
   n_hits="$(count_fasta_headers "$lib")"
   echo "Round ${round}: detected ${n_hits} LTR-RTs in ${lib}"
 
+  # Record this successful round for the post-loop reconciler
+  completed_round_prefixes+=( "$out_prefix_round" )
+
   if [[ "$n_hits" -lt "$TERMINATE_COUNT" ]]; then
     echo "Terminate: ${n_hits} < ${TERMINATE_COUNT}. No further rounds will be run."
     break
@@ -502,6 +513,34 @@ for (( round=1; round<=MAX_ROUNDS; round++ )); do
   echo "Rebuilding ${temp_lib} from ${#libs[@]} libraries..."
   clean_and_concat_libs "$temp_lib" "${libs[@]}"
 done
+
+# ----------------------------
+# Reconcile nested-status across rounds into depth-bucketed outputs.
+# Each element's inward-chain depth (how many LTR-RT layers are nested inside
+# it) determines which {OUT_PREFIX}_depth{N}_ltr.{tsv,fa} file it lands in.
+# The raw per-round {OUT_PREFIX}_r{N}_ltr.* files are left untouched.
+# ----------------------------
+if (( ${#completed_round_prefixes[@]} > 0 )); then
+  recon_tsv_args=()
+  recon_fa_args=()
+  recon_scn_args=()
+  for prefix in "${completed_round_prefixes[@]}"; do
+    recon_tsv_args+=( "${prefix}_ltr.tsv" )
+    recon_fa_args+=(  "${prefix}_ltr.fa"  )
+    recon_scn_args+=( "${prefix}.work/${prefix}.ltrtools.stitched.scn" )
+  done
+
+  echo ""
+  echo "============================================================"
+  echo "Reconciling ${#completed_round_prefixes[@]} round(s) into depth-bucketed outputs..."
+  set -x
+  python "$RECONCILER" \
+    --out-prefix "$OUT_PREFIX" \
+    --tsv "${recon_tsv_args[@]}" \
+    --fa  "${recon_fa_args[@]}" \
+    --scn "${recon_scn_args[@]}"
+  set +x
+fi
 
 # Cleanup
 rm -f "$temp_lib" 2>/dev/null || true

@@ -44,6 +44,12 @@ from ltrharvest5 import (  # noqa: E402
 
 COORD_RE = re.compile(r"^([^:]+):(\d+)-(\d+)")
 
+# Depth -> IUPAC mask char. Must match ltrharvest_wrapper2.sh's IUPAC_SEQ so a
+# cross-round N from a round-1 element (already embedded in the extracted outer
+# sequence) lines up with depth0's char here, depth1 -> R, depth2 -> D, etc.
+# V is reserved for the wrapper's far-character and is NOT in this list.
+IUPAC_DEPTH_SEQ = ("N", "R", "D", "Y", "S", "W", "K", "M", "B", "H")
+
 
 def parse_tsv(path: str, round_idx: int) -> Tuple[Optional[str], List[dict]]:
     """Return (header_line_or_None, list_of_record_dicts)."""
@@ -182,6 +188,51 @@ def build_updated_nest_status(key: str,
     return ";".join(f"{role}:{k}" for role, k in uniq)
 
 
+def apply_depth_masking(outer_seq: str,
+                        outer_rec: dict,
+                        direct_children: Dict[str, List[str]],
+                        rec_by_key: Dict[str, dict],
+                        depth_map: Dict[str, int]) -> str:
+    """Return outer_seq with every descendant region overwritten by the IUPAC
+    char corresponding to that descendant's depth.
+
+    The traversal is parent-first / grandchild-after so deeper descendants
+    overwrite the shallower marks placed by their ancestors, producing the
+    depth-indexed pattern:
+        depth-1 outer  -> ...N... (direct child at depth 0)
+        depth-2 outer  -> ...R..N..R... (direct child at depth 1 with its own
+                                         depth-0 grandchild inside)
+    """
+    outer_s = outer_rec["s"]
+    outer_chrom = outer_rec["chrom"]
+    outer_len = len(outer_seq)
+    chars = list(outer_seq)
+
+    def paint(parent_key: str) -> None:
+        for child_key in direct_children.get(parent_key, []):
+            if child_key == parent_key:
+                continue
+            child = rec_by_key.get(child_key)
+            if child is None or child["chrom"] != outer_chrom:
+                continue
+            cd = depth_map.get(child_key, 0)
+            if 0 <= cd < len(IUPAC_DEPTH_SEQ):
+                ch = IUPAC_DEPTH_SEQ[cd]
+            else:
+                ch = "X"
+            # 1-based inclusive coords -> 0-based half-open relative to outer
+            rel_s = max(0, child["s"] - outer_s)
+            rel_e = min(outer_len, child["e"] - outer_s + 1)
+            if rel_e <= rel_s:
+                continue
+            for p in range(rel_s, rel_e):
+                chars[p] = ch
+            paint(child_key)
+
+    paint(outer_rec["key"])
+    return "".join(chars)
+
+
 def cross_round_dedup(pool: List[dict],
                       ltr_bounds: Dict[str, Tuple[int, int, int, int]]
                       ) -> Tuple[List[dict], int]:
@@ -297,6 +348,8 @@ def main() -> None:
     keys = [e["key"] for e in survivors]
     depth = compute_chain_inward(keys, children)
 
+    rec_by_key: Dict[str, dict] = {e["key"]: e for e in survivors}
+
     # 6. Bucket survivors; rewrite nest_status col with cross-round view
     buckets: Dict[int, List[dict]] = defaultdict(list)
     for e in survivors:
@@ -316,6 +369,7 @@ def main() -> None:
     # 8. Write outputs
     out_prefix = args.out_prefix
     any_written = False
+    n_repainted = 0
     for d in sorted(buckets):
         recs = buckets[d]
         tsv_out = f"{out_prefix}_depth{d}_ltr.tsv"
@@ -330,12 +384,18 @@ def main() -> None:
                 seq = fa_seqs.get(r["col1"])
                 if seq is None:
                     continue
+                if d > 0:
+                    seq = apply_depth_masking(seq, r, children, rec_by_key, depth)
+                    n_repainted += 1
                 fout.write(f">{r['col1']}\n")
                 for i in range(0, len(seq), 60):
                     fout.write(seq[i:i + 60] + "\n")
         any_written = True
         print(f"[reconcile] depth{d}: {len(recs)} -> {tsv_out}, {fa_out}",
               file=sys.stderr)
+    if n_repainted:
+        print(f"[reconcile] depth-indexed IUPAC masking applied to {n_repainted} "
+              f"outer sequence(s)", file=sys.stderr)
     if not any_written:
         print("[reconcile] no records to write", file=sys.stderr)
 

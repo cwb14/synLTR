@@ -363,6 +363,13 @@ for (( round=1; round<=MAX_ROUNDS; round++ )); do
   scn_max_int=$((base_scn_max_int * round))
   overlap="$(overlap_for_round "$round")"
 
+  # Same-round nested inners get rewritten with this round's own IUPAC char so
+  # the per-round _ltr.fa stays consistent with cross-round nesting (where the
+  # inner is already IUPAC-masked via the masked input genome). Without this,
+  # same-round outers feed chimeric references (inner seq embedded) into the
+  # next round's temp_lib -> TEsorter pass-2.
+  this_round_char="${IUPAC_SEQ[$((round-1))]}"
+
   ltrharvest_args="-mindistltr ${LTR_MINDISTLTR} -minlenltr ${LTR_MINLENLTR} -maxlenltr ${LTR_MAXLENLTR} -mintsd ${LTR_MINTSD} -maxtsd ${LTR_MAXTSD} -similar ${LTR_SIMILAR} -vic ${LTR_VIC} -seed ${LTR_SEED} -seqids yes -xdrop ${LTR_XDROP} -maxdistltr ${maxdistltr}"
   ltrfinder_args="-w ${LTRF_W} ${LTRF_C} -D ${ltrf_D} -d ${LTRF_d} -L ${LTRF_L} -l ${LTRF_l} -p ${LTRF_p} -M ${LTRF_M} -S ${LTRF_S}"
 
@@ -432,6 +439,7 @@ for (( round=1; round<=MAX_ROUNDS; round++ )); do
     --tesorter-eval "$TESORTER_EVAL" \
     --nested-flank-min "$NESTED_FLANK_MIN" \
     --nested-base-min "$NESTED_BASE_MIN" \
+    --same-round-inner-char "$this_round_char" \
     "${pass2_opts[@]}" \
     "${WFA_OPTS[@]}" \
     "${extra_round_args[@]}" \

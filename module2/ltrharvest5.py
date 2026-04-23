@@ -2392,6 +2392,110 @@ def subset_fasta_by_name_set(in_fa: str, out_fa: str, keep_names: set,
         Path(out_fa).touch()
 
 
+_NEST_COORD_RE = re.compile(r"^([^:]+):(\d+)-(\d+)")
+
+
+def _parse_nest_outer_inners_from_tsv(tsv_path: str) -> Dict[str, List[Tuple[str, int, int]]]:
+    """Read a dedup-enriched TSV (col1 = chrom:s-e#class, final col = nest_status).
+    Return {col1 -> [(inner_chrom, inner_s, inner_e), ...]} for every row that is
+    a nest-outer (nest_status contains one or more 'nest-outer:<chrom:s-e>' entries).
+    Same-round only: the reconciler rewrites this column later with the cross-round view.
+    """
+    out: Dict[str, List[Tuple[str, int, int]]] = {}
+    with open(tsv_path) as f:
+        for line in f:
+            if not line.strip() or line.startswith("#"):
+                continue
+            cols = line.rstrip("\n").split("\t")
+            if len(cols) < 2:
+                continue
+            nest_status = cols[-1]
+            if nest_status in (".", ""):
+                continue
+            inners: List[Tuple[str, int, int]] = []
+            for rel in nest_status.split(";"):
+                rel = rel.strip()
+                if not rel.startswith("nest-outer:"):
+                    continue
+                partner = rel.split(":", 1)[1]
+                m = _NEST_COORD_RE.match(partner)
+                if not m:
+                    continue
+                inners.append((m.group(1), int(m.group(2)), int(m.group(3))))
+            if inners:
+                out[cols[0]] = inners
+    return out
+
+
+def mask_same_round_inners_in_fa(fa_path: str, tsv_path: str,
+                                 mask_char: str, wrap: int = 60) -> Tuple[int, int]:
+    """In-place rewrite of fa_path: for each record whose header matches a
+    nest-outer row in tsv_path, overwrite every listed inner interval (1-based
+    inclusive in genome coords) with mask_char. Returns (n_outers_masked,
+    n_inner_intervals_applied).
+    """
+    outer_to_inners = _parse_nest_outer_inners_from_tsv(tsv_path)
+    if not outer_to_inners:
+        return 0, 0
+
+    headers: List[str] = []
+    seqs: List[str] = []
+    with open(fa_path) as f:
+        cur_h: Optional[str] = None
+        cur: List[str] = []
+        for line in f:
+            if line.startswith(">"):
+                if cur_h is not None:
+                    headers.append(cur_h)
+                    seqs.append("".join(cur))
+                cur_h = line[1:].rstrip("\n")
+                cur = []
+            else:
+                cur.append(line.strip())
+        if cur_h is not None:
+            headers.append(cur_h)
+            seqs.append("".join(cur))
+
+    n_outers = 0
+    n_intervals = 0
+    for idx, hdr in enumerate(headers):
+        inners = outer_to_inners.get(hdr)
+        if not inners:
+            continue
+        m = _NEST_COORD_RE.match(hdr)
+        if not m:
+            continue
+        o_chrom = m.group(1)
+        o_s = int(m.group(2))
+        chars = list(seqs[idx])
+        n_here = 0
+        for i_chrom, i_s, i_e in inners:
+            if i_chrom != o_chrom:
+                continue
+            # 1-based inclusive in genome -> 0-based half-open in outer seq
+            rel_s = max(0, i_s - o_s)
+            rel_e = min(len(chars), i_e - o_s + 1)
+            if rel_e <= rel_s:
+                continue
+            for p in range(rel_s, rel_e):
+                chars[p] = mask_char
+            n_here += 1
+        if n_here:
+            seqs[idx] = "".join(chars)
+            n_outers += 1
+            n_intervals += n_here
+
+    with open(fa_path, "w") as out:
+        for hdr, seq in zip(headers, seqs):
+            out.write(f">{hdr}\n")
+            if wrap and wrap > 0:
+                for i in range(0, len(seq), wrap):
+                    out.write(seq[i:i + wrap] + "\n")
+            else:
+                out.write(seq + "\n")
+    return n_outers, n_intervals
+
+
 def names_from_kmer2ltr_dedup(dedup_tsv: str) -> set:
     keep = set()
     with open(dedup_tsv, "r") as f:
@@ -2955,6 +3059,17 @@ def main():
     )
 
     ap.add_argument(
+        "--same-round-inner-char",
+        default=None,
+        help="Single character: after dedup, overwrite every nest-outer element's inner "
+             "coord region(s) in the output {prefix}_ltr.fa with this character. "
+             "Lets same-round nested pairs be represented the same way cross-round "
+             "nested pairs already are (inner region IUPAC-masked). Intended to be "
+             "driven by the wrapper: pass the round's feature IUPAC char (N, R, D, ...). "
+             "Omit for raw ATCG (legacy behaviour)."
+    )
+
+    ap.add_argument(
         "--ltr-timeout",
         type=int,
         default=0,
@@ -2984,6 +3099,15 @@ def main():
         if len(c) != 1:
             ap.error("--exclude-run-char expects a single character")
         exclude_run_char = c
+
+    same_round_inner_char = None
+    if args.same_round_inner_char:
+        c = args.same_round_inner_char.strip()
+        if len(c) != 1:
+            ap.error("--same-round-inner-char expects a single character")
+        if c.upper() in ("A", "T", "C", "G"):
+            ap.error("--same-round-inner-char must not be A/T/C/G")
+        same_round_inner_char = c.upper()
 
     workdir = Path(args.workdir or f"{out_prefix}.work")
     mkdirp(workdir)
@@ -3477,11 +3601,24 @@ def main():
         print(f"[Step9b] subsetting full-length FASTA by dedup list -> {tesorter_lib_fa_dedup}")
         subset_fasta_by_name_set(k2l_in_fa, tesorter_lib_fa_dedup, keep_names,
                                  rename_map=nest_rename_map)
+        fa_to_mask_same_round = tesorter_lib_fa_dedup
     else:
         intact_dedup_fa = f"{out_prefix}.ltrtools.intact.dedup.fa"
         print(f"[Step9b] subsetting intact FASTA by dedup list -> {intact_dedup_fa}")
         subset_fasta_by_name_set(intact_fa, intact_dedup_fa, keep_names,
                                  rename_map=nest_rename_map)
+        fa_to_mask_same_round = intact_dedup_fa
+
+    if same_round_inner_char:
+        n_outers, n_intervals = mask_same_round_inners_in_fa(
+            fa_to_mask_same_round, k2l_dedup_out, same_round_inner_char
+        )
+        if n_outers:
+            print(f"[Step9c] masked same-round inners with '{same_round_inner_char}' in "
+                  f"{n_outers} outer(s) ({n_intervals} inner interval(s)) "
+                  f"-> {fa_to_mask_same_round}")
+        else:
+            print(f"[Step9c] no same-round nest-outer relationships found in {k2l_dedup_out}")
 
     _t_total = time.monotonic() - _t_total_start
     print("\nDone.")

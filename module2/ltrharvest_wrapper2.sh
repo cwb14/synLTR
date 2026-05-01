@@ -59,6 +59,7 @@ THREADS=20
 OUT_PREFIX="ltrs"
 RUN_TRF=false
 WFA_ALIGN=false
+KEEP_WEAK_HMM_PASS2=false
 
 # Storage for extra ltrharvest5.py arg directives
 # Each entry is tab-separated: "FROMROUND\tKEY\tVALUE\tIS_BOOL"
@@ -89,6 +90,10 @@ Optional:
   --out_prefix          Output prefix (default ltrs)
   --run-trf             Enable TRF instead of default --no-trf
   --wfa-align           Use WFA instead of mafft for Kmer2LTR pairwise alignment (~30-50x faster)
+  --keep-weak-hmm-pass2-matches
+                        Include in cls.lib.fa the pass-2 matches whose target is a weak-HMM
+                        candidate (had HMM hits but no clade -> LTR/unknown/unknown via augment).
+                        By default these matches are dropped. Default: off.
 
 Extra ltrharvest5.py options:
   --ltrharvest5-args "KEY=VALUE [KEY2=VALUE2 ...]"
@@ -227,6 +232,7 @@ while [[ $# -gt 0 ]]; do
     --out_prefix) OUT_PREFIX="${2:-}"; shift 2;;
     --run-trf) RUN_TRF=true; shift;;
     --wfa-align) WFA_ALIGN=true; shift;;
+    --keep-weak-hmm-pass2-matches) KEEP_WEAK_HMM_PASS2=true; shift;;
     --ltrharvest5-args)
       parse_kv_string 1 "${2:-}"
       shift 2;;
@@ -316,11 +322,14 @@ if [[ "$WFA_ALIGN" == true ]]; then
   WFA_OPTS=(--wfa-align)
 fi
 
+WEAK_HMM_OPTS=()
+if [[ "$KEEP_WEAK_HMM_PASS2" == true ]]; then
+  WEAK_HMM_OPTS=(--keep-weak-hmm-pass2-matches)
+fi
+
 SIZE=500000
 TESORTER_RULE="70-70-80"
 TSD_PASS2="--tsd-pass2"
-TESORTER_COV=20
-TESORTER_EVAL="1e-2"
 NESTED_FLANK_MIN=10
 NESTED_BASE_MIN=800
 FAR_CHARACTER="V"
@@ -435,13 +444,12 @@ for (( round=1; round<=MAX_ROUNDS; round++ )); do
     --tesorter-use-ret \
     --tesorter-rule "$TESORTER_RULE" \
     $TSD_PASS2 \
-    --tesorter-cov "$TESORTER_COV" \
-    --tesorter-eval "$TESORTER_EVAL" \
     --nested-flank-min "$NESTED_FLANK_MIN" \
     --nested-base-min "$NESTED_BASE_MIN" \
     --same-round-inner-char "$this_round_char" \
     "${pass2_opts[@]}" \
     "${WFA_OPTS[@]}" \
+    "${WEAK_HMM_OPTS[@]}" \
     "${extra_round_args[@]}" \
     || ltrharvest_exit=$?
   set +x

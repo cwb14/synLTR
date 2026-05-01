@@ -1239,7 +1239,8 @@ def load_tesorter_te_to_annotation(cls_tsv_path: str) -> Dict[str, str]:
 
             if not header_seen:
                 header_seen = True
-                if line.startswith("TE\t") or line.lower().startswith("te\t"):
+                low = line.lower()
+                if low.startswith("te\t") or low.startswith("#te\t"):
                     continue
 
             cols = line.split("\t")
@@ -1315,6 +1316,188 @@ def load_tesorter_gff3_domains(gff3_path: str) -> Dict[str, list]:
                 "coverage": attrs.get("coverage", ""),
             }
             result.setdefault(te_name, []).append(domain_entry)
+
+    return result
+
+
+def load_tebinsorter_domains_from_db(db_path: str, pipeline_py_path: str,
+                                     db_name: str = "rexdb") -> Dict[str, list]:
+    """Reproduce TEsorter's .dom.gff3 dictionary view from a TEBinSorter
+    SQLite db.
+
+    The original .dom.gff3 had two properties this code depends on:
+      1. ONE deconflicted hit per (sequence, gene), not the raw HMM hit
+         set. TEBinSorter's legacy_hits is the raw set; deconfliction is
+         done in-process via classifier.hmm2best + apply_filters.
+      2. Coordinates in GENOME space (chrom + offset), not element space.
+         The element name 'chrom:gs-ge' encodes the offset; we add (gs-1)
+         after projecting AA envelope coords back to nucleotide.
+
+    Returns the same Dict[str, list] shape as load_tesorter_gff3_domains
+    so dedup_kmer2ltr_tsv can keep using it without changes.
+    """
+    import sqlite3, sys
+    import numpy as np
+
+    result: Dict[str, list] = {}
+    p = Path(db_path)
+    if not p.exists() or p.stat().st_size == 0:
+        return result
+
+    src_dir = str(Path(pipeline_py_path).resolve().parent)
+    if src_dir not in sys.path:
+        sys.path.insert(0, src_dir)
+    from classifier import (hmm2best, apply_filters, parse_clade_rexdb,
+                             parse_clade_gydb, DB_CONFIGS)
+
+    config = DB_CONFIGS.get(db_name)
+    if config is None:
+        return result
+
+    conn = sqlite3.connect(str(p))
+    seq_lengths: Dict[str, int] = dict(
+        conn.execute("SELECT name, length FROM sequences"))
+
+    rows = []
+    for tbl in ("legacy_hits", "facet_hits"):
+        rows.extend(conn.execute(f"""
+            SELECT target_name, query_name, dom_score, i_evalue, acc,
+                   hmm_from, hmm_to, query_len, env_from, env_to,
+                   base_seq, domain_type, strand, frame
+            FROM {tbl}
+            WHERE database = ?
+        """, (db_name,)).fetchall())
+    conn.close()
+
+    if not rows:
+        return result
+
+    target    = np.array([r[0]  for r in rows])
+    model     = np.array([r[1]  for r in rows])
+    score     = np.array([r[2]  for r in rows], dtype=np.float64)
+    evalue    = np.array([r[3]  for r in rows], dtype=np.float64)
+    acc       = np.array([r[4]  for r in rows], dtype=np.float64)
+    hmm_from  = np.array([r[5]  for r in rows], dtype=np.int32)
+    hmm_to    = np.array([r[6]  for r in rows], dtype=np.int32)
+    model_len = np.array([r[7]  for r in rows], dtype=np.int32)
+    env_from  = np.array([r[8]  for r in rows], dtype=np.int32)
+    env_to    = np.array([r[9]  for r in rows], dtype=np.int32)
+    base_seq  = np.array([r[10] for r in rows])
+    family    = np.array([r[11] for r in rows])
+    strand    = np.array([r[12] for r in rows])
+    frame     = np.array([r[13] for r in rows], dtype=np.int32)
+    hmm_cov   = 100.0 * (hmm_to - hmm_from + 1) / model_len
+    norm_score = score / model_len
+
+    # Strand-lock per base_seq: pick the strand whose hits sum to the
+    # highest norm_score and discard all minority-strand rows before
+    # deconfliction. TEsorter's classifier did this implicitly so its
+    # .dom.gff3 was always single-strand; TEBinSorter's hmm2best is
+    # strand-agnostic and otherwise lets rev-strand high-scoring hits
+    # sneak into elements whose true ORF runs on the fwd strand. Without
+    # this, downstream nest-outer voting can flip a clear winner like
+    # Copia/Ale to a noise-driven Gypsy/Retand.
+    keep = np.ones(len(rows), dtype=bool)
+    strand_score: Dict[Tuple[str, str], float] = {}
+    for i in range(len(rows)):
+        key = (str(base_seq[i]), str(strand[i]))
+        strand_score[key] = strand_score.get(key, 0.0) + float(norm_score[i])
+    dominant_strand: Dict[str, str] = {}
+    for (bs, sd), sc in strand_score.items():
+        prev = dominant_strand.get(bs)
+        if prev is None or sc > strand_score[(bs, prev)]:
+            dominant_strand[bs] = sd
+    for i in range(len(rows)):
+        if str(strand[i]) != dominant_strand[str(base_seq[i])]:
+            keep[i] = False
+
+    if not keep.all():
+        target    = target[keep]
+        model     = model[keep]
+        score     = score[keep]
+        evalue    = evalue[keep]
+        acc       = acc[keep]
+        hmm_from  = hmm_from[keep]
+        hmm_to    = hmm_to[keep]
+        model_len = model_len[keep]
+        env_from  = env_from[keep]
+        env_to    = env_to[keep]
+        base_seq  = base_seq[keep]
+        family    = family[keep]
+        strand    = strand[keep]
+        frame     = frame[keep]
+        hmm_cov   = hmm_cov[keep]
+        norm_score = norm_score[keep]
+
+    hits = {
+        "target": target, "model": model, "score": score,
+        "evalue": evalue, "acc": acc,
+        "hmm_from": hmm_from, "hmm_to": hmm_to, "model_len": model_len,
+        "env_from": env_from, "env_to": env_to,
+        "base_seq": base_seq, "family": family,
+        "hmm_cov": hmm_cov, "norm_score": norm_score,
+    }
+
+    best_idx = hmm2best(hits, config)
+    filtered_idx = apply_filters(hits, best_idx)
+
+    remap = config.get("domain_remap", {})
+    clade_parser = config.get("clade_parser", "rexdb")
+
+    for i in filtered_idx:
+        bs = str(base_seq[i])
+        m  = str(model[i])
+        ef = int(env_from[i])
+        et = int(env_to[i])
+        sd = str(strand[i])
+        fr = int(frame[i])
+        dt = str(family[i])
+
+        if clade_parser == "rexdb":
+            _, _, clade, _gene = parse_clade_rexdb(m)
+            clade_path = m.split(":", 1)[0] if ":" in m else m
+        elif clade_parser == "gydb":
+            _, clade = parse_clade_gydb(m)
+            clade_path = clade
+        else:
+            clade = "SINE"
+            clade_path = m
+
+        # Match TEsorter's .dom.gff3, which kept raw domain names ("aRH",
+        # "TPase") in the gene attribute. The remap (aRH->RH, TPase->INT)
+        # only applies inside hmm2best for grouping; it should NOT
+        # rewrite the display name.
+        gene_display = dt
+
+        elem_len = seq_lengths.get(bs, 0)
+        if sd == "+":
+            rel_start = (ef - 1) * 3 + fr + 1
+            rel_end   = et * 3 + fr
+        elif sd == "-":
+            rel_start = elem_len - (et * 3 + fr) + 1
+            rel_end   = elem_len - ((ef - 1) * 3 + fr)
+        else:
+            rel_start, rel_end = ef, et
+
+        # Element name encodes genome offset: "chrom:gs-ge".
+        genome_offset = 1
+        if ":" in bs and "-" in bs.split(":", 1)[1]:
+            try:
+                genome_offset = int(bs.split(":", 1)[1].split("-", 1)[0])
+            except ValueError:
+                genome_offset = 1
+        nuc_start = rel_start + genome_offset - 1
+        nuc_end   = rel_end   + genome_offset - 1
+
+        result.setdefault(bs, []).append({
+            "gene": gene_display,
+            "clade": clade,
+            "clade_path": clade_path,
+            "start": nuc_start,
+            "end": nuc_end,
+            "evalue": float(evalue[i]),
+            "coverage": f"{float(hmm_cov[i]):.1f}",
+        })
 
     return result
 
@@ -1478,45 +1661,44 @@ def ensure_tools(tools_dir: Path) -> Tuple[str, str]:
 # Step 9: TEsorter
 # -----------------------------
 
-def tool_usable_tesorter(te_dir: Path) -> bool:
-    if not te_dir.exists():
+def tool_usable_tebinsorter(tb_dir: Path) -> bool:
+    pipeline_py = tb_dir / "src" / "pipeline.py"
+    if not pipeline_py.exists():
         return False
     try:
-        env = dict(os.environ)
-        env["PYTHONPATH"] = str(te_dir)
         r = subprocess.run(
-            ["python3", "-m", "TEsorter", "-h"],
+            ["python3", str(pipeline_py), "-h"],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
-            env=env,
         )
         txt = (r.stdout or "") + "\n" + (r.stderr or "")
-        return ("usage: TEsorter" in txt) or (r.returncode == 0)
+        return ("usage: TEBinSorter" in txt) or (r.returncode == 0)
     except Exception:
         return False
 
-def ensure_tesorter(tools_dir: Path) -> str:
+def ensure_tebinsorter(tools_dir: Path) -> str:
+    """Clone TEBinSorter (feat/minimap2 branch) and return path to src/pipeline.py."""
     tools_dir = mkdirp(tools_dir)
-    te_dir = tools_dir / "TEsorter"
+    tb_dir = tools_dir / "TEBinSorter"
 
-    if not tool_usable_tesorter(te_dir):
-        if not te_dir.exists():
+    if not tool_usable_tebinsorter(tb_dir):
+        if not tb_dir.exists():
             run([
                 "git", "clone",
-                "--branch", "my-new-idea2",
+                "--branch", "feat/minimap2",
                 "--single-branch",
-                "https://github.com/cwb14/TEsorter.git",
-                str(te_dir)
+                "https://github.com/cwb14/TEBinSorter.git",
+                str(tb_dir)
             ], check=True)
 
-        if not tool_usable_tesorter(te_dir):
+        if not tool_usable_tebinsorter(tb_dir):
             raise RuntimeError(
-                f"TEsorter appears unusable in: {te_dir}\n"
-                f"Try: PYTHONPATH={te_dir} python3 -m TEsorter -h"
+                f"TEBinSorter appears unusable in: {tb_dir}\n"
+                f"Try: python3 {tb_dir}/src/pipeline.py -h"
             )
 
-    return str(te_dir.resolve())
+    return str((tb_dir / "src" / "pipeline.py").resolve())
 
 def tool_usable_trfmod(bin_path: Path) -> bool:
     if not bin_path.exists() or not os.access(str(bin_path), os.X_OK):
@@ -1549,36 +1731,34 @@ def ensure_trfmod(tools_dir: Path) -> str:
 
     return str(trf_bin)
 
-def run_tesorter(stitched_fa: str, tesorter_py_path: str, outdir: Path,
-                 db: str, cov: int, evalue: str, rule: str, threads: int,
-                 pass2_classified_fasta: Optional[str] = None,
-                 no_cleanup: bool = False,
-                 verbose: bool = False) -> Tuple[str, str, str]:
+def run_tebinsorter(stitched_fa: str, pipeline_py_path: str, outdir: Path,
+                    db: str, rule: str, threads: int,
+                    pass2_classified_fasta: Optional[str] = None,
+                    keep_weak_hmm_pass2_matches: bool = False,
+                    minimap2_extra: str = "",
+                    verbose: bool = False) -> Tuple[str, str]:
     """
-    Runs TEsorter in outdir so outputs land in {prefix}.work/.
+    Run TEBinSorter (pipeline.py) into outdir. Output files use the input FASTA
+    basename as the file prefix to mirror TEsorter's `{base}.{db}.cls.tsv`
+    naming, keeping downstream consumers unchanged.
+
+    Returns (cls_tsv_path, sqlite_db_path).
     """
     mkdirp(outdir)
 
-    env = dict(os.environ)
-
-    te_abs = str(Path(tesorter_py_path).resolve())
-    env_py = env.get("PYTHONPATH", "")
-    env["PYTHONPATH"] = te_abs if not env_py else (te_abs + os.pathsep + env_py)
-
     stitched_fa_abs = str(Path(stitched_fa).resolve())
+    base = Path(stitched_fa_abs).name
 
     cmd = [
-        "python3", "-m", "TEsorter",
+        "python3", str(Path(pipeline_py_path).resolve()),
         stitched_fa_abs,
-        "-db", db,
+        "-d", db,
         "-p", str(threads),
-        "-cov", str(cov),
-        "-eval", str(evalue),
         "-rule", str(rule),
+        "-o", str(Path(outdir).resolve()),
+        "--prefix", base,
+        "--compat-tesorter-output",
     ]
-
-    if no_cleanup:
-        cmd.append("--no-cleanup")
 
     if pass2_classified_fasta:
         p2 = Path(pass2_classified_fasta).resolve()
@@ -1586,19 +1766,247 @@ def run_tesorter(stitched_fa: str, tesorter_py_path: str, outdir: Path,
             raise RuntimeError(f"--pass2-classified-fasta provided but missing/empty: {p2}")
         cmd += ["--pass2-classified-fasta", str(p2)]
 
+    if minimap2_extra:
+        cmd += ["--minimap2-extra", minimap2_extra]
+
     if verbose:
         label = f"  $ {' '.join(cmd)}\n    (cwd: {outdir})"
         print(label, file=sys.stderr)
 
-    r = subprocess.run(cmd, cwd=str(outdir), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env)
+    r = subprocess.run(cmd, cwd=str(outdir), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     if r.returncode != 0:
-        raise RuntimeError(f"TEsorter failed:\n{(r.stderr or '').strip()}")
+        raise RuntimeError(f"TEBinSorter failed:\n{(r.stderr or '').strip()}")
 
-    base = Path(stitched_fa_abs).name
-    cls_lib = str(outdir / f"{base}.{db}.cls.lib")
-    cls_pep = str(outdir / f"{base}.{db}.cls.pep")
-    cls_tsv = str(outdir / f"{base}.{db}.cls.tsv")
-    return cls_lib, cls_pep, cls_tsv
+    # Read the COMBINED cls.tsv ({base}.cls.tsv), not the per-database one
+    # ({base}.{db}.cls.tsv). The per-DB file only contains rexdb HMM
+    # classifications; the combined file additionally includes pass-2
+    # minimap2 rescues (sequences with no HMM hit that minimap2 matched
+    # to the --pass2-classified-fasta pool). With --compat-tesorter-output
+    # the combined file is in TEsorter's 7-column format.
+    cls_tsv = str(outdir / f"{base}.cls.tsv")
+    sqlite_db = str(outdir / f"{base}.db")
+
+    # The old TEsorter wrote a row in cls.tsv for every input sequence
+    # that had >=1 HMM hit (even if no clade could be assigned); those
+    # placeholder rows look like
+    # `LTR\tunknown\tunknown\tnone\t?\tnone`. TEBinSorter only emits
+    # rows for classified sequences, which silently drops the
+    # has-HMM-hits-but-unclassified ones from
+    # build_tesorter_full_length_ltr_fasta_from_cls_tsv (and therefore
+    # from Kmer2LTR + the final depth-bucketed outputs). Append ghost
+    # rows for missing inputs that match TEsorter's emit gate (HMM
+    # signal present). Also append rows for pass-2 source candidates
+    # (e.g. --tsd-pass2 anchors) that are in input_fa but classify_from_blast
+    # skipped self-classifying because they were pre-loaded into the
+    # classifications map -- without the rescue, the anchor rows are
+    # silently dropped from cls.lib.fa even though their pass-2 matches
+    # are kept.
+    weak_hmm_ids = _augment_cls_tsv_with_unknowns(
+        cls_tsv, stitched_fa_abs, sqlite_db,
+        pass2_fa=pass2_classified_fasta,
+    )
+
+    if keep_weak_hmm_pass2_matches and weak_hmm_ids:
+        pass2_tsv_path = Path(outdir) / "minimap2_pass2" / "pass2.tsv"
+        n_rescued = _rescue_weak_hmm_pass2_matches(
+            cls_tsv, str(pass2_tsv_path), weak_hmm_ids,
+        )
+        if n_rescued:
+            print(f"[run_tebinsorter] rescued {n_rescued} pass-2 matches "
+                  f"against {len(weak_hmm_ids)} weak-HMM target(s) into "
+                  f"{Path(cls_tsv).name}")
+
+    return cls_tsv, sqlite_db
+
+
+def _augment_cls_tsv_with_unknowns(
+    cls_tsv: str,
+    input_fa: str,
+    sqlite_db: str,
+    pass2_fa: Optional[str] = None,
+) -> Set[str]:
+    """Append cls.tsv rows for input_fa headers that lack a row.
+
+    Two augmentation paths, applied per unique input_fa header that is
+    not already in cls.tsv:
+
+    - **Pass-2 source** (priority): if pass2_fa is provided and the header
+      also appears in pass2_fa, append a row using the classification
+      parsed from the pass2 FASTA header (`>id#Order/Superfamily/Clade`).
+      Without this, TSD-pass2 anchor candidates with no HMM signal end up
+      being used as pass-2 targets but never themselves appear in cls.tsv
+      (their pass-2 matches inherit the anchor's classification, but the
+      anchor row itself is missing -> the anchor is silently dropped from
+      the final cls.lib.fa).
+
+    - **Weak HMM**: if the header has >=1 HMM hit (legacy_hits /
+      facet_hits) and didn't take the pass-2 source path, append a
+      `LTR\\tunknown\\tunknown\\tnone\\t?\\tnone` row. Mirrors TEsorter's
+      "emit a row when there's any HMM signal" behavior so weak-HMM
+      candidates aren't silently dropped.
+
+    Inputs with neither HMM hits nor a pass2_fa entry are intentionally
+    left dropped.
+
+    Returns the set of IDs augmented via the **weak-HMM** path
+    (excluding pass-2 source augmentations). Callers can use this to
+    rescue pass-2 matches whose target was a weak-HMM augment -- those
+    matches were skipped by classify_from_blast at TEBinSorter time
+    because the weak-HMM target wasn't yet in the live `classifications`
+    map.
+    """
+    weak_hmm_augmented: Set[str] = set()
+
+    if not Path(cls_tsv).exists():
+        return weak_hmm_augmented
+
+    classified: Set[str] = set()
+    with open(cls_tsv) as fin:
+        header_seen = False
+        for line in fin:
+            line = line.rstrip("\n")
+            if not line:
+                continue
+            if not header_seen:
+                header_seen = True
+                low = line.lower()
+                if low.startswith("te\t") or low.startswith("#te\t"):
+                    continue
+            cols = line.split("\t")
+            if cols and cols[0]:
+                classified.add(cols[0])
+
+    had_hmm_hits: Set[str] = set()
+    if Path(sqlite_db).exists():
+        import sqlite3
+        conn = sqlite3.connect(sqlite_db)
+        try:
+            for tbl in ("legacy_hits", "facet_hits"):
+                try:
+                    for (bs,) in conn.execute(
+                            f"SELECT DISTINCT base_seq FROM {tbl}"):
+                        had_hmm_hits.add(bs)
+                except sqlite3.OperationalError:
+                    pass
+        finally:
+            conn.close()
+
+    input_headers: List[str] = []
+    seen_input: Set[str] = set()
+    with open(input_fa) as fin:
+        for line in fin:
+            if line.startswith(">"):
+                h = line[1:].split()[0].rstrip()
+                if h not in seen_input:
+                    seen_input.add(h)
+                    input_headers.append(h)
+
+    pass2_id_to_cls: Dict[str, Tuple[str, str, str]] = {}
+    if pass2_fa and Path(pass2_fa).exists():
+        with open(pass2_fa) as fin:
+            for line in fin:
+                if not line.startswith(">"):
+                    continue
+                hdr = line[1:].split()[0].rstrip()
+                if "#" not in hdr:
+                    continue
+                rid, cls_str = hdr.split("#", 1)
+                parts = cls_str.split("/")
+                if len(parts) < 2:
+                    continue
+                order = parts[0] or "Unknown"
+                superfam = parts[1] or "unknown"
+                clade = parts[2] if len(parts) >= 3 and parts[2] else "unknown"
+                pass2_id_to_cls.setdefault(rid, (order, superfam, clade))
+
+    rows_to_append: List[Tuple[str, str, str, str]] = []
+    for h in input_headers:
+        if h in classified:
+            continue
+        if h in pass2_id_to_cls:
+            order, sfam, clade = pass2_id_to_cls[h]
+            rows_to_append.append((h, order, sfam, clade))
+            classified.add(h)
+        elif h in had_hmm_hits:
+            rows_to_append.append((h, "LTR", "unknown", "unknown"))
+            classified.add(h)
+            weak_hmm_augmented.add(h)
+
+    if rows_to_append:
+        with open(cls_tsv, "a") as out:
+            for name, order, sfam, clade in rows_to_append:
+                out.write(f"{name}\t{order}\t{sfam}\t{clade}\tnone\t?\tnone\n")
+
+    return weak_hmm_augmented
+
+
+def _rescue_weak_hmm_pass2_matches(
+    cls_tsv: str,
+    pass2_tsv: str,
+    weak_hmm_ids: Set[str],
+) -> int:
+    """Append `LTR/unknown/unknown` rows for pass-2 queries whose best
+    target is a weak-HMM augment.
+
+    classify_from_blast (TEBinSorter) skips matches whose target isn't in
+    the live `classifications` map at pass-2 time. Weak-HMM candidates
+    have HMM hits but no classification, so they aren't in
+    `classifications` and their pass-2 matches are dropped. With this
+    rescue, those queries inherit `LTR/unknown/unknown` from the
+    weak-HMM target and appear in cls.lib.fa alongside the source.
+
+    Returns number of rows appended.
+    """
+    if not weak_hmm_ids:
+        return 0
+    if not Path(pass2_tsv).exists() or not Path(cls_tsv).exists():
+        return 0
+
+    classified: Set[str] = set()
+    with open(cls_tsv) as fin:
+        header_seen = False
+        for line in fin:
+            line = line.rstrip("\n")
+            if not line:
+                continue
+            if not header_seen:
+                header_seen = True
+                low = line.lower()
+                if low.startswith("te\t") or low.startswith("#te\t"):
+                    continue
+            cols = line.split("\t")
+            if cols and cols[0]:
+                classified.add(cols[0])
+
+    rescue: List[str] = []
+    rescued: Set[str] = set()
+    with open(pass2_tsv) as fin:
+        for line in fin:
+            line = line.rstrip("\n")
+            if not line:
+                continue
+            cols = line.split("\t")
+            if len(cols) < 6:
+                continue
+            qname, pass_str = cols[0], cols[1]
+            tname = cols[5]
+            if pass_str != "pass":
+                continue
+            if tname not in weak_hmm_ids:
+                continue
+            if qname in classified or qname in rescued:
+                continue
+            rescued.add(qname)
+            rescue.append(qname)
+
+    if not rescue:
+        return 0
+
+    with open(cls_tsv, "a") as out:
+        for name in rescue:
+            out.write(f"{name}\tLTR\tunknown\tunknown\tnone\t?\tnone\n")
+
+    return len(rescue)
     
 def run_kmer2ltr(kmer2ltr_py: str, in_fa: str, out_prefix: str, outdir: Path,
                 threads: int, max_win_overdisp: float, min_retained_fraction: float,
@@ -2538,7 +2946,8 @@ def build_tesorter_full_length_ltr_fasta_from_cls_tsv(cls_tsv_path: str, genome_
 
             if not header_seen:
                 header_seen = True
-                if line.startswith("TE\t") or line.lower().startswith("te\t"):
+                low = line.lower()
+                if low.startswith("te\t") or low.startswith("#te\t"):
                     continue
 
             cols = line.split("\t")
@@ -2949,46 +3358,53 @@ def main():
         help="Do not pass a domain file to Kmer2LTR"
     )
 
-    # TEsorter
+    # TEBinSorter (drop-in replacement for TEsorter; --tesorter-* flag names
+    # retained for backward compatibility with callers/wrappers).
     ap.add_argument(
         "--tesorter",
         dest="use_tesorter",
         action="store_true",
         default=True,
-        help="Use TEsorter filtering + cls annotation (default: enabled)."
+        help="Use TEBinSorter filtering + cls annotation (default: enabled)."
     )
     ap.add_argument(
         "--no-tesorter",
         dest="use_tesorter",
         action="store_false",
-        help="Skip TEsorter entirely; build intact FASTA from SCN and feed directly to Kmer2LTR."
+        help="Skip TEBinSorter entirely; build intact FASTA from SCN and feed directly to Kmer2LTR."
     )
 
     ap.add_argument(
         "--tesorter-use-ret",
         action="store_true",
-        help="For the FASTA fed into TEsorter, extract full-length LTR-RT using s(ret)/e(ret) instead of internal (default: internal)."
+        help="For the FASTA fed into TEBinSorter, extract full-length LTR-RT using s(ret)/e(ret) instead of internal (default: internal)."
     )
 
-    ap.add_argument("--tesorter-db", default="rexdb-plant",
-                    help="TEsorter HMM database (-db)")
-    ap.add_argument("--tesorter-cov", type=int, default=20,
-                    help="TEsorter min coverage (-cov)")
-    ap.add_argument("--tesorter-eval", default="1e-2",
-                    help="TEsorter max E-value (-eval)")
-    ap.add_argument("--tesorter-rule", default="80-80-80",
-                    help="TEsorter pass2 rule (-rule)")
-    ap.add_argument(
-        "--tesorter-no-cleanup",
-        action="store_true",
-        help="Pass --no-cleanup to TEsorter (keep intermediate files)."
-    )
+    ap.add_argument("--tesorter-db", default="rexdb",
+                    help="TEBinSorter HMM database alias (-d). "
+                         "Aliases: rexdb, gydb, line, tir, sine, sine-so. Default: rexdb.")
+    ap.add_argument("--tesorter-rule", default="70-70-80",
+                    help="TEBinSorter pass-2 rule I-C-L (-rule). "
+                         "I -> --min-pid; C -> --min-qcov AND --min-tcov; L parsed but unused.")
+    ap.add_argument("--tesorter-minimap2-extra", default="",
+                    help="Extra flags forwarded to TEBinSorter's --minimap2-extra (advanced).")
 
     ap.add_argument(
         "--pass2-classified-fasta",
         default=None,
-        help="Optional FASTA of previously-classified elements to augment TEsorter pass-2 database. "
+        help="Optional FASTA of previously-classified elements to augment TEBinSorter pass-2 database. "
              "Headers must be like: >id#Order/Superfamily/Clade"
+    )
+
+    ap.add_argument(
+        "--keep-weak-hmm-pass2-matches",
+        action="store_true",
+        help="Include in cls.lib.fa the pass-2 minimap2 matches whose target is a weak-HMM "
+             "candidate (had HMM hits but no clade -> classified as LTR/unknown/unknown via "
+             "augment). By default these matches are dropped because TEBinSorter's "
+             "classify_from_blast skips targets that aren't in the live `classifications` map "
+             "at pass-2 time. With this flag enabled, the matches inherit "
+             "LTR/unknown/unknown from their weak-HMM target. Default: off."
     )
 
     ap.add_argument(
@@ -3025,7 +3441,7 @@ def main():
     ap.add_argument(
         "--tsd-pass2",
         action="store_true",
-        help="Scan all SCN candidates for TSDs BEFORE TEsorter and feed TSD+ full-length sequences into TEsorter via --pass2-classified-fasta (default: off)."
+        help="Scan all SCN candidates for TSDs BEFORE TEBinSorter and feed TSD+ full-length sequences into TEBinSorter via --pass2-classified-fasta (default: off)."
     )
     ap.add_argument(
         "--tsd-min-len",
@@ -3114,9 +3530,9 @@ def main():
 
     tools_dir = Path("./tools")
     minimap2_path, miniprot_path = ensure_tools(tools_dir)
-    tesorter_py_path = None
+    tebinsorter_py_path = None
     if args.use_tesorter:
-        tesorter_py_path = ensure_tesorter(tools_dir)
+        tebinsorter_py_path = ensure_tebinsorter(tools_dir)
 
     kmer2ltr_py = ensure_kmer2ltr(tools_dir)
     trfmod_path = None
@@ -3149,7 +3565,7 @@ def main():
         print(f"  workdir:       {workdir}", file=sys.stderr)
         print(f"  threads:       {args.threads}", file=sys.stderr)
         print(f"  ltr_tools:     {args.ltr_tools}", file=sys.stderr)
-        print(f"  tesorter:      {args.use_tesorter}", file=sys.stderr)
+        print(f"  tebinsorter:   {args.use_tesorter}", file=sys.stderr)
         print(f"  trf masking:   {args.use_trf}", file=sys.stderr)
         if exclude_run_char:
             print(f"  exclude_run:   {exclude_run_char} (>=10bp run)", file=sys.stderr)
@@ -3448,14 +3864,15 @@ def main():
     # Load LTR boundaries from SCN for nesting validation
     ltr_bounds = load_scn_ltr_boundaries(merged_scn)
 
-    # Step 9: TEsorter
+    # Step 9: TEBinSorter
     cls_tsv_path = None
+    tebinsorter_db_path = None
     tesorter_lib_fa = None
 
     if args.use_tesorter:
-        tesorter_outdir = workdir
+        tebinsorter_outdir = workdir
 
-        pass2_for_tesorter = args.pass2_classified_fasta
+        pass2_for_tebinsorter = args.pass2_classified_fasta
 
         if args.use_tesorter and args.tsd_pass2:
             tsd_pass2_fa = str(workdir / f"{out_prefix}.tsd_pass2.full_length.fa")
@@ -3476,12 +3893,12 @@ def main():
             merged_pass2 = str(workdir / f"{out_prefix}.pass2_classified.merged.fa")
             merged_path = merge_pass2_fastas(args.pass2_classified_fasta, tsd_pass2_fa, merged_pass2)
 
-            pass2_for_tesorter = merged_path if merged_path else None
+            pass2_for_tebinsorter = merged_path if merged_path else None
 
             # --- Step 8.9b: pre-purge TSD-dominated candidates ---
             # Non-TSD candidates that overlap a TSD+ candidate at >= dedup
             # threshold would be eliminated by Layer-1 of dedup anyway.
-            # Removing them now shrinks the TEsorter + Kmer2LTR input.
+            # Removing them now shrinks the TEBinSorter + Kmer2LTR input.
             # Contained candidates with distinct LTRs are protected
             # (putative nested TEs).
             tsd_names_early = _tsd_names_from_fasta(tsd_pass2_fa)
@@ -3508,19 +3925,18 @@ def main():
                           f"({n_before - n_after} TSD-dominated removed)")
                     tesorter_in_fa = prepurge_fa
 
-        print(f"[Step9] running TEsorter on stitched FASTA (outputs -> {tesorter_outdir})")
+        print(f"[Step9] running TEBinSorter on stitched FASTA (outputs -> {tebinsorter_outdir})")
 
-        cls_lib_path, cls_pep_path, cls_tsv_path = run_tesorter(
+        cls_tsv_path, tebinsorter_db_path = run_tebinsorter(
             stitched_fa=tesorter_in_fa,
-            tesorter_py_path=tesorter_py_path,
-            outdir=tesorter_outdir,
+            pipeline_py_path=tebinsorter_py_path,
+            outdir=tebinsorter_outdir,
             db=args.tesorter_db,
-            cov=args.tesorter_cov,
-            evalue=args.tesorter_eval,
             rule=args.tesorter_rule,
             threads=args.threads,
-            pass2_classified_fasta=pass2_for_tesorter,
-            no_cleanup=args.tesorter_no_cleanup,
+            pass2_classified_fasta=pass2_for_tebinsorter,
+            keep_weak_hmm_pass2_matches=args.keep_weak_hmm_pass2_matches,
+            minimap2_extra=args.tesorter_minimap2_extra,
             verbose=verbose,
         )
 
@@ -3572,14 +3988,19 @@ def main():
         print(f"[Step9b] WFA-guided TSD recovery: {len(wfa_recovered)} additional TSDs")
     combined_tsd = {**tsd_seq_dict, **wfa_recovered} if (tsd_seq_dict or wfa_recovered) else None
 
-    # Load GFF3 domain positions for nesting diagnostics
+    # Load per-domain hit positions for nesting diagnostics. TEBinSorter's
+    # pipeline.py does not emit a TEsorter-style .dom.gff3, but the same
+    # per-domain rows live in {prefix}.db (legacy_hits / facet_hits). The
+    # loader runs TEBinSorter's hmm2best+apply_filters so we get one
+    # deconflicted hit per (sequence, gene) — matching what TEsorter's
+    # original .dom.gff3 contained — and projects coordinates from element
+    # space into genome space.
     gff3_dom_data = None
-    if cls_tsv_path:
-        gff3_path = cls_tsv_path.replace(".cls.tsv", ".dom.gff3")
-        if Path(gff3_path).exists():
-            gff3_dom_data = load_tesorter_gff3_domains(gff3_path)
-            print(f"[Step9b] loaded GFF3 domain data: "
-                  f"{len(gff3_dom_data)} TEs with domain annotations")
+    if tebinsorter_db_path and Path(tebinsorter_db_path).exists() and tebinsorter_py_path:
+        gff3_dom_data = load_tebinsorter_domains_from_db(
+            tebinsorter_db_path, tebinsorter_py_path, db_name=args.tesorter_db)
+        print(f"[Step9b] loaded TEBinSorter domain data from sqlite: "
+              f"{len(gff3_dom_data)} TEs with deconflicted domain annotations")
 
     nest_rename_map: Dict[str, str] = {}
     dedup_kmer2ltr_tsv(k2l_main, k2l_dedup_out, threshold=args.dedup_threshold,
@@ -3588,7 +4009,7 @@ def main():
                        rename_map=nest_rename_map)
 
     if nest_rename_map:
-        print(f"[Step9b] reclassified {len(nest_rename_map)} element(s) from TEsorter "
+        print(f"[Step9b] reclassified {len(nest_rename_map)} element(s) from TEBinSorter "
               f"domain hits (order-independent majority vote; nest-outers additionally "
               f"exclude domains inside detected inner-nested boundaries)")
 
@@ -3625,7 +4046,7 @@ def main():
     print("Runtimes:")
     print(f"  Miniprot/masking:   {_format_hms(_t_miniprot)}")
     print(f"  LTR annotation:    {_format_hms(_t_ltr_annotation)}")
-    print(f"  TEsorter:          {_format_hms(_t_tesorter)}")
+    print(f"  TEBinSorter:       {_format_hms(_t_tesorter)}")
     print(f"  Kmer2LTR:          {_format_hms(_t_kmer2ltr)}")
     print(f"  Total:             {_format_hms(_t_total)}")
     print("")

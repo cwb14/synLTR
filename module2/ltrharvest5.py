@@ -2075,6 +2075,75 @@ def _parse_interval_from_kmer2ltr_col1(col1: str) -> Optional[Tuple[str, int, in
     return chrom, start, end
 
 
+def filter_kmer2ltr_in_place(kmer2ltr_tsv: str,
+                             min_ltr_len: int = 100,
+                             min_aln_len: int = 90,
+                             min_len_ratio: float = 0.65,
+                             min_ltrrt_len: int = 300) -> Tuple[int, int, int]:
+    """
+    Drop low-quality rows from a Kmer2LTR main output file in place.
+
+    Row layout (tab-separated): col1 'chrom:start-end#class', col2 LTR_len, col3 aln_len.
+    A row is kept iff:
+        LTR_len   >= min_ltr_len
+        aln_len   >= min_aln_len
+        len_ratio >= min_len_ratio    (len_ratio = min(LTR_len, aln_len) / max(LTR_len, aln_len))
+        LTRRT_len >= min_ltrrt_len    (LTRRT_len = end - start from col1)
+
+    Rows whose col1 interval or col2/col3 cannot be parsed are dropped (and
+    counted as malformed). Returns (n_kept, n_dropped, n_malformed).
+    """
+    in_path = Path(kmer2ltr_tsv)
+    if not in_path.exists() or in_path.stat().st_size == 0:
+        return (0, 0, 0)
+
+    tmp_path = in_path.parent / (in_path.name + ".filt.tmp")
+    n_kept = 0
+    n_dropped = 0
+    n_malformed = 0
+
+    with open(in_path) as fin, open(tmp_path, "w") as fout:
+        for raw in fin:
+            if not raw.strip():
+                continue
+            parts = raw.rstrip("\n").split("\t")
+            if len(parts) < 3:
+                n_malformed += 1
+                continue
+
+            parsed = _parse_interval_from_kmer2ltr_col1(parts[0])
+            if parsed is None:
+                n_malformed += 1
+                continue
+            _, s, e = parsed
+            ltrrt_len = e - s
+
+            try:
+                ltr_len = int(float(parts[1]))
+                aln_len = int(float(parts[2]))
+            except ValueError:
+                n_malformed += 1
+                continue
+
+            hi = max(ltr_len, aln_len)
+            if hi <= 0:
+                n_dropped += 1
+                continue
+            len_ratio = min(ltr_len, aln_len) / hi
+
+            if (ltr_len   >= min_ltr_len   and
+                aln_len   >= min_aln_len   and
+                len_ratio >= min_len_ratio and
+                ltrrt_len >= min_ltrrt_len):
+                fout.write(raw)
+                n_kept += 1
+            else:
+                n_dropped += 1
+
+    os.replace(tmp_path, in_path)
+    return (n_kept, n_dropped, n_malformed)
+
+
 def _tsd_names_from_fasta(fa_path: str) -> Set[str]:
     """Return set of 'chrom:start-end' keys parsed from TSD-positive FASTA headers.
 
@@ -3975,6 +4044,14 @@ def main():
         wfa_align=args.wfa_align,
         verbose=verbose,
     )
+
+    # Drop low-quality rows before dedup. Hardcoded thresholds for now.
+    n_kept, n_dropped, n_malformed = filter_kmer2ltr_in_place(k2l_main)
+    msg = (f"[Step9b] kmer2ltr length filter (LTR_len>=100, aln_len>=90, "
+           f"len_ratio>=0.65, LTRRT_len>=300): kept {n_kept}, dropped {n_dropped}")
+    if n_malformed:
+        msg += f", malformed {n_malformed}"
+    print(msg)
 
     k2l_dedup_out = f"{out_prefix}_ltr.tsv"
     print(f"[Step9b] deduping Kmer2LTR output -> {k2l_dedup_out}")

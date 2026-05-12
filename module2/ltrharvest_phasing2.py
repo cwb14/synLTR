@@ -894,20 +894,23 @@ def compute_window_enrichment(per_ltr_counts, ltrs, chrom_to_sg, n_sg,
 # -------------------------
 
 def run_mmseqs_easy_cluster(ltr_fasta, outdir_cluster, threads,
-                           min_seq_id=0.75, cov=0.8, cov_mode=1,
-                           cluster_reassign=1, seq_id_mode=1, cluster_mode=2,
-                           mmseqs_bin="mmseqs"):
+                           min_seq_id=0.60, cov=0.6, cov_mode=1,
+                           cluster_mode=1, mask=0, sensitivity=7.5,
+                           mmseqs_bin="mmseqs", run_label=None):
     """
     Runs mmseqs easy-cluster and returns path to produced cluster.tsv.
-    Stores only the cluster TSV in outdir_cluster and deletes the large FASTAs.
+    Stores only the cluster TSV in outdir_cluster and deletes the large FASTAs
+    plus the mmseqs tmp dir. `run_label` disambiguates outputs when sweeping
+    multiple parameter values into the same outdir.
     """
     outdir_cluster = Path(outdir_cluster)
     outdir_cluster.mkdir(parents=True, exist_ok=True)
 
     ltr_fasta = str(ltr_fasta)
     base = Path(ltr_fasta).name
-    prefix = outdir_cluster / f"{base}_mmseqs"
-    tmpdir = outdir_cluster / f"{base}_mmseqs_tmp"
+    tag = run_label if run_label is not None else f"id{min_seq_id:.2f}"
+    prefix = outdir_cluster / f"{base}_mmseqs_{tag}"
+    tmpdir = outdir_cluster / f"{base}_mmseqs_tmp_{tag}"
 
     cmd = [
         mmseqs_bin, "easy-cluster",
@@ -917,10 +920,10 @@ def run_mmseqs_easy_cluster(ltr_fasta, outdir_cluster, threads,
         "--min-seq-id", str(min_seq_id),
         "-c", str(cov),
         "--cov-mode", str(cov_mode),
-        "--cluster-reassign", str(cluster_reassign),
-        "--threads", str(threads),
-        "--seq-id-mode", str(seq_id_mode),
         "--cluster-mode", str(cluster_mode),
+        "--mask", str(mask),
+        "-s", str(sensitivity),
+        "--threads", str(threads),
     ]
     run(cmd)
 
@@ -936,6 +939,7 @@ def run_mmseqs_easy_cluster(ltr_fasta, outdir_cluster, threads,
             os.remove(p)
         except FileNotFoundError:
             pass
+    shutil.rmtree(tmpdir, ignore_errors=True)
 
     if not os.path.exists(cluster_tsv):
         raise RuntimeError(f"MMseqs finished but cluster TSV not found: {cluster_tsv}")
@@ -1285,7 +1289,16 @@ def build_cluster_pair_constraints(clusters, homoeolog_sets, allowed_chroms,
             tests.append((rep, i, w, float(p), ca, cb))
 
     if not tests:
-        return [], {"clusters_total": len(clusters), "clusters_used": 0, "tests": 0, "sig_calls": 0, "edges": 0}
+        return [], {
+            "clusters_total": len(clusters),
+            "clusters_used": 0,
+            "tests": 0,
+            "sig_calls": 0,
+            "edges": 0,
+            "sig_qs": [],
+            "edge_weights": [],
+            "used_cluster_sizes": [],
+        }
 
     pvals = np.array([t[3] for t in tests], dtype=np.float64)
     _, qvals, _, _ = multipletests(pvals, alpha=q_thresh, method="fdr_bh")
@@ -1319,14 +1332,78 @@ def build_cluster_pair_constraints(clusters, homoeolog_sets, allowed_chroms,
                 "details": {"w0": w0, "wj": wj, "q0": q0, "qj": qj}
             })
 
+    used_sig_reps = {rep for rep, calls in sig_by_cluster.items()
+                     if len(calls) >= min_pairs_per_cluster}
+    used_cluster_sizes = [int(cluster_sizes.get(rep, 0)) for rep in used_sig_reps]
+
     stats = {
         "clusters_total": len(clusters),
         "clusters_used": used,
         "tests": len(tests),
         "sig_calls": sum(len(v) for v in sig_by_cluster.values()),
         "edges": len(edges),
+        "sig_qs": [q for calls in sig_by_cluster.values()
+                   for (_, _, q, _, _) in calls],
+        "edge_weights": [float(e["weight"]) for e in edges],
+        "used_cluster_sizes": used_cluster_sizes,
     }
     return edges, stats
+
+
+def bootstrap_pair_phasing(pair_edges, n_pair_vars, canonical_color,
+                           n_reps, sample_frac=0.5, seed=1):
+    """
+    Per-pair-variable color stability under edge subsampling. Analogous to the k-mer
+    bootstrap_percent: subsample pair-edges (without replacement) at `sample_frac`,
+    re-solve the parity graph, align each replicate component to the canonical
+    color by choosing the global flip that maximizes agreement within the
+    component (the 2-color analogue of Hungarian relabel), then count per-pair
+    matches.
+
+    Returns: dict pair_i -> bootstrap_percent in [0, 100] for pair-variables that
+    are assigned in canonical_color. Pair-variables absent from canonical_color
+    are returned as NaN.
+    """
+    rng = np.random.default_rng(int(seed))
+    n_edges = len(pair_edges)
+    out = {i: float("nan") for i in range(n_pair_vars)}
+    if n_edges == 0 or n_reps <= 0 or not canonical_color:
+        return out
+
+    sample_size = max(1, min(n_edges, int(round(sample_frac * n_edges))))
+    same_counts = {i: 0 for i in canonical_color}
+
+    for _ in range(int(n_reps)):
+        idx = rng.choice(n_edges, size=sample_size, replace=False)
+        sub_edges = [pair_edges[int(j)] for j in idx]
+        rep_color, rep_comp, _ = solve_parity_graph(list(range(n_pair_vars)), sub_edges)
+
+        comp_to_pairs = defaultdict(list)
+        for i, comp_id in rep_comp.items():
+            comp_to_pairs[comp_id].append(i)
+
+        rep_color_aligned = {}
+        for _comp_id, members in comp_to_pairs.items():
+            agree_no_flip = 0
+            agree_flip = 0
+            for i in members:
+                if i not in canonical_color:
+                    continue
+                if rep_color[i] == canonical_color[i]:
+                    agree_no_flip += 1
+                else:
+                    agree_flip += 1
+            flip = agree_flip > agree_no_flip
+            for i in members:
+                rep_color_aligned[i] = (rep_color[i] ^ 1) if flip else rep_color[i]
+
+        for i in canonical_color:
+            if i in rep_color_aligned and rep_color_aligned[i] == canonical_color[i]:
+                same_counts[i] += 1
+
+    for i in canonical_color:
+        out[i] = (same_counts[i] / float(n_reps)) * 100.0
+    return out
 
 
 def assign_chroms_from_pair_solution(hsets, pair_color):
@@ -1375,11 +1452,21 @@ def main():
     # Cluster-based approach (MMseqs)
     ap.add_argument("--run_cluster", action="store_true", help="Also run cluster-based phasing (mmseqs easy-cluster).")
     ap.add_argument("--mmseqs_bin", default="mmseqs", help="mmseqs executable (default 'mmseqs')")
-    ap.add_argument("--cluster_min_seq_id", type=float, default=0.7)
-    ap.add_argument("--cluster_cov", type=float, default=0.3)
+    ap.add_argument("--cluster_min_seq_id_start", type=float, default=0.60,
+                    help="Lowest mmseqs --min-seq-id to test (default 0.60; mmseqs clustering breaks below this).")
+    ap.add_argument("--cluster_min_seq_id_end", type=float, default=1.00,
+                    help="Highest mmseqs --min-seq-id to test, inclusive (default 1.00).")
+    ap.add_argument("--cluster_min_seq_id_step", type=float, default=0.05,
+                    help="Step size for the --min-seq-id sweep (default 0.05).")
+    ap.add_argument("--cluster_cov", type=float, default=0.6,
+                    help="mmseqs -c coverage threshold (default 0.6).")
     ap.add_argument("--cluster_q", type=float, default=0.3, help="BH q threshold for homoeolog-pair enrichment within clusters")
     ap.add_argument("--cluster_min_size", type=int, default=2, help="Minimum cluster size to test")
     ap.add_argument("--cluster_min_pairs", type=int, default=2, help="Minimum significant homoeolog pairs in a cluster to emit constraints")
+    ap.add_argument("--cluster_boot_reps", type=int, default=None,
+                    help="Bootstrap reps for cluster-based phasing confidence (default: inherit --boot_reps; 0 disables).")
+    ap.add_argument("--cluster_boot_frac", type=float, default=0.5,
+                    help="Fraction of pair-edges to subsample per cluster bootstrap rep (default 0.5).")
     ap.add_argument("--skip_kmer", action="store_true",
                     help="Skip k-mer-based phasing and only run cluster-based approach.")
 
@@ -1755,62 +1842,240 @@ def main():
                 print(f"[WARN] Cluster-based phasing currently implemented for N=2; inferred N={N}. Skipping.",
                       file=sys.stderr)
             else:
-                print("[INFO] Running MMseqs easy-cluster for cluster-based phasing...", file=sys.stderr)
+                # Build the --min-seq-id sweep grid: [start, start+step, ..., <= end].
+                # mmseqs easy-cluster breaks below ~0.60, so refuse anything lower.
+                seq_id_start = float(args.cluster_min_seq_id_start)
+                seq_id_end = float(args.cluster_min_seq_id_end)
+                seq_id_step = float(args.cluster_min_seq_id_step)
+                if seq_id_step <= 0:
+                    raise SystemExit("--cluster_min_seq_id_step must be > 0")
+                if seq_id_start < 0.60 - 1e-9:
+                    raise SystemExit("--cluster_min_seq_id_start must be >= 0.60 (mmseqs lower bound)")
+                if seq_id_end > 1.0 + 1e-9:
+                    raise SystemExit("--cluster_min_seq_id_end must be <= 1.0")
+                if seq_id_end < seq_id_start - 1e-9:
+                    raise SystemExit("--cluster_min_seq_id_end must be >= --cluster_min_seq_id_start")
+                n_steps = int(round((seq_id_end - seq_id_start) / seq_id_step)) + 1
+                seq_id_grid = []
+                for i in range(n_steps):
+                    v = round(seq_id_start + i * seq_id_step, 6)
+                    if v <= seq_id_end + 1e-9:
+                        seq_id_grid.append(min(v, 1.0))
 
-                cluster_tsv = run_mmseqs_easy_cluster(
-                    ltr_fasta=args.ltr_fasta,
-                    outdir_cluster=out_cluster,
-                    threads=args.threads,
-                    min_seq_id=args.cluster_min_seq_id,
-                    cov=args.cluster_cov,
-                    mmseqs_bin=args.mmseqs_bin,
-                )
-
-                # parse clusters
-                clusters = parse_mmseqs_cluster_tsv(cluster_tsv)
-
-                pair_edges, stats = build_cluster_pair_constraints(
-                    clusters=clusters,
-                    homoeolog_sets=hsets,
-                    allowed_chroms=allowed_chroms,
-                    q_thresh=args.cluster_q,
-                    min_cluster_size=args.cluster_min_size,
-                    min_pairs_per_cluster=args.cluster_min_pairs,
-                )
-
-                # Solve on pair indices (0..num_pairs-1)
                 pairs = [tuple(s) for s in hsets if len(s) == 2]
                 pair_nodes = list(range(len(pairs)))
 
-                pair_color, pair_comp, conflicts = solve_parity_graph(pair_nodes, pair_edges)
+                print(f"[INFO] MMseqs --min-seq-id sweep: {seq_id_grid}", file=sys.stderr)
+
+                sweep_records = []  # one dict per attempted seq-id
+                best = None         # winning attempt by clusters_used
+
+                for sid in seq_id_grid:
+                    label = f"id{sid:.2f}"
+                    print(f"[INFO] Running MMseqs easy-cluster (--min-seq-id {sid:.2f})...", file=sys.stderr)
+                    cluster_tsv = run_mmseqs_easy_cluster(
+                        ltr_fasta=args.ltr_fasta,
+                        outdir_cluster=out_cluster,
+                        threads=args.threads,
+                        min_seq_id=sid,
+                        cov=args.cluster_cov,
+                        mmseqs_bin=args.mmseqs_bin,
+                        run_label=label,
+                    )
+
+                    clusters_i = parse_mmseqs_cluster_tsv(cluster_tsv)
+                    pair_edges_i, stats_i = build_cluster_pair_constraints(
+                        clusters=clusters_i,
+                        homoeolog_sets=hsets,
+                        allowed_chroms=allowed_chroms,
+                        q_thresh=args.cluster_q,
+                        min_cluster_size=args.cluster_min_size,
+                        min_pairs_per_cluster=args.cluster_min_pairs,
+                    )
+
+                    # Solve the parity graph for this run too — we want per-run
+                    # conflict counts (and other downstream metrics) in
+                    # run_metrics.tsv, not only for the eventual best run.
+                    pair_color_i, pair_comp_i, conflicts_i = solve_parity_graph(pair_nodes, pair_edges_i)
+
+                    sig_qs_i = stats_i.get("sig_qs", []) or []
+                    edge_weights_i = stats_i.get("edge_weights", []) or []
+                    used_sizes_i = stats_i.get("used_cluster_sizes", []) or []
+                    n_edges_i = int(stats_i.get("edges", 0))
+                    n_conflicts_i = len(conflicts_i)
+                    metrics_i = {
+                        "clusters_total": int(stats_i.get("clusters_total", 0)),
+                        "clusters_used": int(stats_i.get("clusters_used", 0)),
+                        "tests": int(stats_i.get("tests", 0)),
+                        "sig_calls": int(stats_i.get("sig_calls", stats_i.get("significant_calls", 0))),
+                        "edges": n_edges_i,
+                        "conflicts": n_conflicts_i,
+                        "n_components": len(set(pair_comp_i.values())) if pair_comp_i else 0,
+                        "n_pair_vars_assigned": len(pair_color_i),
+                        "frac_conflict": (n_conflicts_i / n_edges_i) if n_edges_i > 0 else float("nan"),
+                        "median_sig_q": float(np.median(sig_qs_i)) if sig_qs_i else float("nan"),
+                        "mean_sig_q": float(np.mean(sig_qs_i)) if sig_qs_i else float("nan"),
+                        "mean_edge_weight": float(np.mean(edge_weights_i)) if edge_weights_i else float("nan"),
+                        "median_used_cluster_size": float(np.median(used_sizes_i)) if used_sizes_i else float("nan"),
+                    }
+
+                    rec = {
+                        "min_seq_id": sid,
+                        "cluster_tsv": cluster_tsv,
+                        "clusters": clusters_i,
+                        "edges": pair_edges_i,
+                        "stats": stats_i,
+                        "pair_color": pair_color_i,
+                        "pair_comp": pair_comp_i,
+                        "conflicts": conflicts_i,
+                        "metrics": metrics_i,
+                    }
+                    sweep_records.append(rec)
+                    print(f"[INFO]   clusters_total={metrics_i['clusters_total']} "
+                          f"clusters_used={metrics_i['clusters_used']} "
+                          f"tests={metrics_i['tests']} "
+                          f"sig_calls={metrics_i['sig_calls']} "
+                          f"edges={metrics_i['edges']} "
+                          f"conflicts={metrics_i['conflicts']}", file=sys.stderr)
+
+                    # Tie-break: prefer the lower seq-id (more inclusive, encountered first).
+                    if best is None or metrics_i["clusters_used"] > best["metrics"]["clusters_used"]:
+                        best = rec
+
+                # Per-run metrics file (replaces the old cluster_sweep.tsv).
+                metrics_tsv = os.path.join(out_cluster, "run_metrics.tsv")
+
+                def _fmt_float(x, fmt):
+                    if x is None:
+                        return "NA"
+                    if isinstance(x, float) and not np.isfinite(x):
+                        return "NA"
+                    return fmt.format(x)
+
+                with open(metrics_tsv, "w", encoding="utf-8") as out:
+                    cols = [
+                        "min_seq_id", "clusters_total", "clusters_used", "tests", "sig_calls",
+                        "edges", "conflicts", "n_components", "n_pair_vars_assigned",
+                        "frac_conflict", "median_sig_q", "mean_sig_q",
+                        "mean_edge_weight", "median_used_cluster_size",
+                        "selected", "cluster_tsv",
+                    ]
+                    out.write("\t".join(cols) + "\n")
+                    for rec in sweep_records:
+                        m = rec["metrics"]
+                        selected = "1" if rec is best else "0"
+                        fields = [
+                            f"{rec['min_seq_id']:.2f}",
+                            str(m["clusters_total"]),
+                            str(m["clusters_used"]),
+                            str(m["tests"]),
+                            str(m["sig_calls"]),
+                            str(m["edges"]),
+                            str(m["conflicts"]),
+                            str(m["n_components"]),
+                            str(m["n_pair_vars_assigned"]),
+                            _fmt_float(m["frac_conflict"], "{:.4f}"),
+                            _fmt_float(m["median_sig_q"], "{:.3g}"),
+                            _fmt_float(m["mean_sig_q"], "{:.3g}"),
+                            _fmt_float(m["mean_edge_weight"], "{:.3f}"),
+                            _fmt_float(m["median_used_cluster_size"], "{:.1f}"),
+                            selected,
+                            rec["cluster_tsv"],
+                        ]
+                        out.write("\t".join(fields) + "\n")
+
+                print(f"[INFO] Best --min-seq-id = {best['min_seq_id']:.2f} "
+                      f"(clusters_used={best['metrics']['clusters_used']})", file=sys.stderr)
+
+                # Use the best run for downstream phasing.
+                clusters = best["clusters"]
+                pair_edges = best["edges"]
+                stats = best["stats"]
+                cluster_tsv = best["cluster_tsv"]
+                pair_color = best["pair_color"]
+                pair_comp = best["pair_comp"]
+                conflicts = best["conflicts"]
+
+                # Bootstrap pair-variable color stability (analogous to the k-mer
+                # bootstrap_percent). Inherits --boot_reps if --cluster_boot_reps
+                # was not set; pass 0 to disable.
+                boot_reps_cluster = (args.cluster_boot_reps
+                                     if args.cluster_boot_reps is not None
+                                     else args.boot_reps)
+                if boot_reps_cluster and boot_reps_cluster > 0 and pair_edges:
+                    print(f"[INFO] Cluster bootstrap: {boot_reps_cluster} reps "
+                          f"@ frac={args.cluster_boot_frac:.2f} over {len(pair_edges)} edges...",
+                          file=sys.stderr)
+                    pair_boot = bootstrap_pair_phasing(
+                        pair_edges=pair_edges,
+                        n_pair_vars=len(pair_nodes),
+                        canonical_color=pair_color,
+                        n_reps=int(boot_reps_cluster),
+                        sample_frac=float(args.cluster_boot_frac),
+                        seed=int(args.seed),
+                    )
+                else:
+                    pair_boot = {i: float("nan") for i in pair_color}
 
                 chrom_to_sg = assign_chroms_from_pair_solution(hsets, pair_color)
 
-                # write chromosome_phasing.tsv in cluster/
-                out_path = os.path.join(out_cluster, "chromosome_phasing.tsv")
+                # Per-pair-variable constraint accounting from the canonical solution.
+                conflict_set = set(id(e) for e in conflicts)
+                incident = defaultdict(list)
+                for e in pair_edges:
+                    incident[e["u"]].append(e)
+                    incident[e["v"]].append(e)
+
+                def _pair_stats(i):
+                    inc = incident.get(i, [])
+                    sat = 0
+                    conf = 0
+                    supports = []
+                    for e in inc:
+                        if id(e) in conflict_set:
+                            conf += 1
+                            continue
+                        u, v, p = e["u"], e["v"], int(e["parity"])
+                        if u in pair_color and v in pair_color and (pair_color[u] ^ pair_color[v]) == p:
+                            sat += 1
+                            supports.append(float(e.get("weight", 0.0)))
+                    mean_sup = (sum(supports) / len(supports)) if supports else float("nan")
+                    return len(inc), sat, conf, mean_sup
+
+                # write chromosome_phasing_clust.tsv in cluster/
+                out_path = os.path.join(out_cluster, "chromosome_phasing_clust.tsv")
                 with open(out_path, "w", encoding="utf-8") as out:
-                    out.write("chromosome\tsubgenome\tpair_id\tcomponent_id\tconstraints_conflicting\n")
+                    out.write("chromosome\tsubgenome\tpair_id\tcomponent_id\t"
+                              "constraints_incident\tconstraints_satisfied\tconstraints_conflicting\t"
+                              "mean_support\tbootstrap_percent\n")
                     for i, (A, B) in enumerate(pairs):
                         xi = pair_color.get(i, None)
                         cid = pair_comp.get(i, "NA")
-                        conf_n = sum(1 for e in conflicts if (e["u"] == i or e["v"] == i))
+                        inc_n, sat_n, conf_n, mean_sup = _pair_stats(i)
+                        mean_sup_str = f"{mean_sup:.3f}" if np.isfinite(mean_sup) else "NA"
+                        boot_v = pair_boot.get(i, float("nan"))
+                        boot_str = f"{boot_v:.2f}" if np.isfinite(boot_v) else "NA"
                         if xi is None:
-                            out.write(f"{A}\tNA\t{i}\t{cid}\t{conf_n}\n")
-                            out.write(f"{B}\tNA\t{i}\t{cid}\t{conf_n}\n")
+                            sg_a = sg_b = "NA"
                         else:
-                            sgA = "SG1" if chrom_to_sg[A] == 0 else "SG2"
-                            sgB = "SG1" if chrom_to_sg[B] == 0 else "SG2"
-                            out.write(f"{A}\t{sgA}\t{i}\t{cid}\t{conf_n}\n")
-                            out.write(f"{B}\t{sgB}\t{i}\t{cid}\t{conf_n}\n")
-            
+                            sg_a = "SG1" if chrom_to_sg[A] == 0 else "SG2"
+                            sg_b = "SG1" if chrom_to_sg[B] == 0 else "SG2"
+                        out.write(f"{A}\t{sg_a}\t{i}\t{cid}\t{inc_n}\t{sat_n}\t{conf_n}\t{mean_sup_str}\t{boot_str}\n")
+                        out.write(f"{B}\t{sg_b}\t{i}\t{cid}\t{inc_n}\t{sat_n}\t{conf_n}\t{mean_sup_str}\t{boot_str}\n")
+
                 # Write a concise run summary
                 with open(os.path.join(out_cluster, "run_summary.txt"), "w", encoding="utf-8") as out:
                     out.write("Cluster-based phasing summary\n")
+                    out.write(f"selected_min_seq_id\t{best['min_seq_id']:.2f}\n")
+                    out.write(f"selected_cluster_tsv\t{cluster_tsv}\n")
                     for k, v in stats.items():
+                        if k in ("sig_qs", "edge_weights", "used_cluster_sizes"):
+                            continue
                         out.write(f"{k}\t{v}\n")
                     out.write(f"conflicts\t{len(conflicts)}\n")
+                    out.write(f"run_metrics.tsv\t{metrics_tsv}\n")
                     cluster_phase_tsv = out_path
-                    out.write(f"chromosome_phasing.tsv\t{cluster_phase_tsv}\n")
+                    out.write(f"chromosome_phasing_clust.tsv\t{cluster_phase_tsv}\n")
 
                 print(f"[INFO] Cluster-based phasing done: {cluster_phase_tsv}", file=sys.stderr)
 
@@ -1835,7 +2100,8 @@ def main():
 
         if args.run_cluster and N == 2:
             print(f"[CLUSTER] Outdir: {out_cluster}")
-            print(f"[CLUSTER] Chromosome phasing: {os.path.join(out_cluster, 'chromosome_phasing.tsv')}")
+            print(f"[CLUSTER] Chromosome phasing: {os.path.join(out_cluster, 'chromosome_phasing_clust.tsv')}")
+            print(f"[CLUSTER] Run metrics: {os.path.join(out_cluster, 'run_metrics.tsv')}")
             print(f"[CLUSTER] Summary: {os.path.join(out_cluster, 'run_summary.txt')}")
                         
     finally:

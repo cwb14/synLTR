@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 """
+# For mmseqs clustering approach, consider switching from max(clusters_used) to something else. maybe minimize frac_conflict or median_sig_q. Also, each chromosome pair may benifit from using its own min-seq-id. Ie, for each pair, maybe take the min-seq-id that gives highest bootstrap support to SG assignment. 
+
 Note 'ltrharvest_phasing.py' and 'ltrharvest_phasing2.py' use slightly different approaches and give slightly different results. Im not sure which is better, so theyre both included. 
 
 Someone tried something similar here: https://www.pnas.org/doi/10.1073/pnas.2502814122

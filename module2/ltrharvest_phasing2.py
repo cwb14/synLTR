@@ -896,7 +896,7 @@ def compute_window_enrichment(per_ltr_counts, ltrs, chrom_to_sg, n_sg,
 # -------------------------
 
 def run_mmseqs_easy_cluster(ltr_fasta, outdir_cluster, threads,
-                           min_seq_id=0.60, cov=0.6, cov_mode=1,
+                           min_seq_id=0.60, cov=0.5, cov_mode=0,
                            cluster_mode=1, mask=0, sensitivity=7.5,
                            mmseqs_bin="mmseqs", run_label=None):
     """
@@ -1460,8 +1460,8 @@ def main():
                     help="Highest mmseqs --min-seq-id to test, inclusive (default 1.00).")
     ap.add_argument("--cluster_min_seq_id_step", type=float, default=0.05,
                     help="Step size for the --min-seq-id sweep (default 0.05).")
-    ap.add_argument("--cluster_cov", type=float, default=0.6,
-                    help="mmseqs -c coverage threshold (default 0.6).")
+    ap.add_argument("--cluster_cov", type=float, default=0.5,
+                    help="mmseqs -c coverage threshold (default 0.5).")
     ap.add_argument("--cluster_q", type=float, default=0.3, help="BH q threshold for homoeolog-pair enrichment within clusters")
     ap.add_argument("--cluster_min_size", type=int, default=2, help="Minimum cluster size to test")
     ap.add_argument("--cluster_min_pairs", type=int, default=2, help="Minimum significant homoeolog pairs in a cluster to emit constraints")

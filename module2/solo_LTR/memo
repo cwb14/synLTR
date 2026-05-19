@@ -1,0 +1,34 @@
+# Solo-LTR detection.
+# gen5400000_final.fasta is PrinTE genome with LTR-RTs only (intact, solo-, and fragmented).
+# gen5400000_final.fasta_r1_ltr.fa are re-detected non-nest LTR-RTs with 'ltrharvest_wrapper2.sh'.
+# I used Kmer2LTR to create the LTR consensus file (Kmer2LTR_run.consensus.fa) of gen5400000_final.fasta_r1_ltr.fa.
+bash synLTR/module2/solo_LTR/solo_ltr_pipeline.sh -g gen5400000_final.fasta -i gen5400000_final.fasta_r1_ltr.fa -q Kmer2LTR_run.consensus.fa -o solo_ltr_test_minimap -p solo_ltr_test_minimap2 -a minimap22 -f 10 -M 50 -C 0.9 -T 5 -W 1 -X 0 -t 132 -v
+
+# The ground truth is:
+python PrinTE/util/solo_intact_count.py gen5400000_final.bed 
+gen5400000_final.bed  [generation 5400000]
+  SoloLTR (clean) : 179
+  Intact LTR-RT   : 11695
+  solo:intact     : 0.0153
+
+| aligner / params                | pred | P | R | F1 |
+|---|--:|--:|--:|--:|
+| mmseqs -s7.5 -e1e-3 (default)   |  96 | 0.79 | 0.39 | **0.524** |
+| mmseqs -s8.5 -e1e-1 -m2e4       |  96 | 0.79 | 0.39 | 0.524 |
+| minimap2 asm5  -N100 -p.1       |  19 | 0.95 | 0.10 | 0.17 |
+| minimap2 asm20 -N100..500 -p0   |  51 | 0.84 | 0.23 | 0.36 |
+| minimap2 map-ont -N300 -p0 f10  |  88 | 0.81 | 0.37 | 0.511 |
+| minimap2 map-ont -N300 -p0 f20  |  89 | 0.81 | 0.38 | 0.517 |
+| minimap2 map-ont f30/f50, W2    | 94–135 | 0.59–0.78 | 0.39–0.42 | ≤0.515 |
+
+# mmseqs easy-search is already IUPAC aware, i think. 
+# minimap2 is not, but the forked version used here is. 
+
+# Probably a more systematic benchmark is necissary. 
+# A limitation: PrinTE/bin/shared_ltr_inserter_parallel creates fragmented LTR-RTs by chopping between 50% and 90% from one end. THis will create some solo-LTR lookalikes if fragmentation happens to chop near the LTR. They wont have TSDs though. Maybe its a minimal issue not worth adjusting. 
+
+# Im not exactly happy with the minimap2 parameters. A more systmentic parameter sweep of those may be helpful in recovering additional F1 gain. 
+# Currently, using TSD appears to be give the best result, although this sucks, since its based on LTR-RT boundary detection, so error at the LTR-RT detection step leads to error at solo-LTR step. These are compounding errors where solo-LTR detection can only be as strong as the boundary determination during LTR-RT detection. 
+# A better benchmark would decouple LTR-RT detection from solo-LTR bencmarking. ie, assume LTR-RT detection was perfect and boundaries were perfect. Just LTR-RTs and LTRs without detection de novo and use this theorretical perfect annotion to benchmark solo-LTR parameters. This will give better granularity of the strengths of this apprach specifically without seeing the compounded error in my metrocs. 
+
+ 

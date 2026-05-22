@@ -32,12 +32,16 @@ gen5400000_final.bed  [generation 5400000]
 ##############################################################################
 
 # I made an alternative blast-based approach.
-python synLTR/module2/solo_LTR/solo_ltr.py --consensus LTRs.alns.consensus.fa --internal LTRs.alns.internal.fa --genome gen5400000_final.fasta --outdir work --threads 48 --truth gen5400000_final.bed --force
+python synLTR/module2/solo_LTR/solo_ltr.py --consensus LTRs.alns.consensus.fa --internal LTRs.alns.internal.fa --genome gen5400000_final.fasta --outdir work --threads 48 --truth gen5400000_final.bed --force --no-nested
 # The blast one is very similar conceptually, but requires LTR consensus and LTR-RT internal sequence. The mmseqs and minimap2 approach requires full length LTR-RTs..not just the internal. 
 [solo_ltr] vs truth: detected 75/179  TP=75 FP=4 FN=104  P=0.9494 R=0.4190 F1=0.5814
 # This approach is slower. 4 minutes in total. 
 
+# I added support for detecting solo-LTRs from LTR-RT internal sequence. This one is challanging.
+python synLTR/module2/solo_LTR/solo_ltr.py --consensus LTRs.alns.consensus.fa --internal LTRs.alns.internal.fa --genome gen5400000_final.fasta --outdir work --threads 48 --truth gen5400000_final.bed --force
+[solo_ltr] vs truth: detected 84/179  TP=84 FP=9 FN=95  P=0.9032 R=0.4693 F1=0.6176
+
 ##########################################################################
 # Notes for both simulations.
-# (1) Some solo-LTRs are intra-LTR-RT, thus getting masked. They appear as false negatives, but im okay losing them for now. Intra-LTR-RT solo-LTRs might be more easily detected if I blast the internal sequence against the consensus and scan for TSD. 
-# (2) Recall is capped low-ish because the LTR-RT library used during simulation is too large reletive to the size of the genome. This means theres lots of singletons (ie, only one member per family). If a singleton gets reduced to solo-LTR, its kinda undetectiable since theres no matches for it in the LTR consensus.
+# (1) Recall is capped low-ish because the LTR-RT library used during simulation is too large reletive to the size of the genome. This means theres lots of singletons (ie, only one member per family). If a singleton gets reduced to solo-LTR, its kinda undetectiable since theres no matches for it in the LTR consensus.
+# (2) Blast parameters and cutoffs for the '--no-nested' path are fairly thoroughly vetted. Parameters and cutoffs for detection from LTR-RT intenral sequence not vetted in quite such a deep way. 

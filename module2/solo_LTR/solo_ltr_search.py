@@ -119,13 +119,18 @@ def cmd_mask(args):
 # --------------------------------------------------------------------------- #
 def cmd_db(args):
     t0 = time.time()
-    expect = Path(str(args.fasta) + ".nhr")
+    out_prefix = args.out if getattr(args, "out", None) else args.fasta
+    expect = Path(str(out_prefix) + ".nhr")
     if expect.exists() and not args.force:
-        log(f"blast db exists for {args.fasta} (use --force to redo)")
+        log(f"blast db exists for {out_prefix} (use --force to redo)")
         return
-    log(f"makeblastdb on {args.fasta}")
-    run(["makeblastdb", "-in", args.fasta, "-dbtype", "nucl",
-         "-parse_seqids"])
+    cmd = ["makeblastdb", "-in", args.fasta, "-dbtype", "nucl"]
+    if not getattr(args, "no_parse_seqids", False):
+        cmd.append("-parse_seqids")
+    if getattr(args, "out", None):
+        cmd += ["-out", str(args.out)]
+    log(f"makeblastdb on {args.fasta} -> {out_prefix}")
+    run(cmd)
     log("makeblastdb done", t0)
 
 
@@ -208,6 +213,11 @@ def main():
 
     pd = sub.add_parser("db", help="makeblastdb on a FASTA")
     pd.add_argument("--fasta", required=True)
+    pd.add_argument("--out", default=None,
+                    help="DB prefix (default: alongside --fasta)")
+    pd.add_argument("--no-parse-seqids", action="store_true",
+                    help="Build DB without -parse_seqids (needed when sequence "
+                         "IDs exceed BLAST's 50-char local-id limit)")
     pd.add_argument("--force", action="store_true")
     pd.set_defaults(func=cmd_db)
 

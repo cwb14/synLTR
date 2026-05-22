@@ -39,5 +39,5 @@ python synLTR/module2/solo_LTR/solo_ltr.py --consensus LTRs.alns.consensus.fa --
 
 ##########################################################################
 # Notes for both simulations.
-# (1) Some solo-LTRs are intra-LTR-RT, thus getting masked. They appear as false negatives, but im okay losing them for now. Intra-LTR-RT solo-LTRs might be more easily detected if I input an LTR-masked LTR-RT library instead of the genome. 
+# (1) Some solo-LTRs are intra-LTR-RT, thus getting masked. They appear as false negatives, but im okay losing them for now. Intra-LTR-RT solo-LTRs might be more easily detected if I blast the internal sequence against the consensus and scan for TSD. 
 # (2) Recall is capped low-ish because the LTR-RT library used during simulation is too large reletive to the size of the genome. This means theres lots of singletons (ie, only one member per family). If a singleton gets reduced to solo-LTR, its kinda undetectiable since theres no matches for it in the LTR consensus.

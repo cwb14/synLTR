@@ -28,7 +28,16 @@ gen5400000_final.bed  [generation 5400000]
 # A limitation: PrinTE/bin/shared_ltr_inserter_parallel creates fragmented LTR-RTs by chopping between 50% and 90% from one end. THis will create some solo-LTR lookalikes if fragmentation happens to chop near the LTR. They wont have TSDs though. Maybe its a minimal issue not worth adjusting. 
 
 # Im not exactly happy with the minimap2 parameters. A more systmentic parameter sweep of those may be helpful in recovering additional F1 gain. 
-# Currently, using TSD appears to be give the best result, although this sucks, since its based on LTR-RT boundary detection, so error at the LTR-RT detection step leads to error at solo-LTR step. These are compounding errors where solo-LTR detection can only be as strong as the boundary determination during LTR-RT detection. 
-# A better benchmark would decouple LTR-RT detection from solo-LTR bencmarking. ie, assume LTR-RT detection was perfect and boundaries were perfect. Just LTR-RTs and LTRs without detection de novo and use this theorretical perfect annotion to benchmark solo-LTR parameters. This will give better granularity of the strengths of this apprach specifically without seeing the compounded error in my metrocs. 
 
- 
+##############################################################################
+
+# I made an alternative blast-based approach.
+python synLTR/module2/solo_LTR/solo_ltr.py --consensus LTRs.alns.consensus.fa --internal LTRs.alns.internal.fa --genome gen5400000_final.fasta --outdir work --threads 48 --truth gen5400000_final.bed --force
+# The blast one is very similar conceptually, but requires LTR consensus and LTR-RT internal sequence. The mmseqs and minimap2 approach requires full length LTR-RTs..not just the internal. 
+[solo_ltr] vs truth: detected 75/179  TP=75 FP=4 FN=104  P=0.9494 R=0.4190 F1=0.5814
+# This approach is slower. 4 minutes in total. 
+
+##########################################################################
+# Notes for both simulations.
+# (1) Some solo-LTRs are intra-LTR-RT, thus getting masked. They appear as false negatives, but im okay losing them for now. Intra-LTR-RT solo-LTRs might be more easily detected if I input an LTR-masked LTR-RT library instead of the genome. 
+# (2) Recall is capped low-ish because the LTR-RT library used during simulation is too large reletive to the size of the genome. This means theres lots of singletons (ie, only one member per family). If a singleton gets reduced to solo-LTR, its kinda undetectiable since theres no matches for it in the LTR consensus.

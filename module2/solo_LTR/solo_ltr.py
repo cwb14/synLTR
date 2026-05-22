@@ -95,6 +95,17 @@ def main():
 
     p.add_argument("--truth", default=None, help="PrinTE BED -> report P/R/F1")
     p.add_argument("--force", action="store_true", help="Redo cached mask/blast")
+    p.add_argument("--no-nested", action="store_true",
+                   help="Disable intra-LTR-RT (nested) solo-LTR recovery "
+                        "(consensus vs internal FASTA). Default: enabled.")
+    p.add_argument("--nested-min-pident", type=float, default=95.0,
+                   help="pident floor for nested (intra-LTR-RT) calls "
+                        "(default 95; the main path uses --min-pident)")
+    p.add_argument("--no-nested-guard", action="store_true",
+                   help="Disable the nested-intact guard (which drops nested calls "
+                        "abutting a different internal region's edge)")
+    p.add_argument("--nested-guard-flank", type=int, default=25,
+                   help="Abutment distance (bp) for the nested-intact guard")
     args = p.parse_args()
 
     t0 = time.time()
@@ -120,9 +131,9 @@ def main():
         db_cmd.append("--force")
     run(db_cmd)
 
-    def do_blast(query):
+    def do_blast(query, db):
         cmd = [sys.executable, str(SEARCH), "blast",
-               "--query", query, "--db", str(masked), "--out-dir", str(blast_dir),
+               "--query", query, "--db", str(db), "--out-dir", str(blast_dir),
                "--task", args.task, "--word-size", str(args.word_size),
                "--dust", args.dust, "--evalue", str(args.evalue),
                "--threads", str(args.threads)]
@@ -131,8 +142,8 @@ def main():
         out = subprocess.check_output([str(x) for x in cmd]).decode().strip().splitlines()
         return out[-1]  # last line = path
 
-    cons_tsv = do_blast(args.consensus)
-    int_tsv = do_blast(args.internal)
+    cons_tsv = do_blast(args.consensus, masked)
+    int_tsv = do_blast(args.internal, masked)
 
     # 3. filter
     log("stage 3/3: TSD + internal filter")
@@ -151,6 +162,45 @@ def main():
             min_pident=args.int_min_pident, min_qcov=args.int_min_qcov_hsp,
             min_length=args.int_min_length, max_evalue=args.int_max_evalue,
             flank=args.flank)
+
+    # 3b. nested (intra-LTR-RT) solo recovery: consensus vs internal FASTA
+    if not args.no_nested:
+        log("stage 3b: nested (intra-LTR-RT) solo recovery")
+        internal_db = blast_dir / "internal_db"
+        db_cmd = [sys.executable, str(SEARCH), "db",
+                  "--fasta", args.internal, "--out", str(internal_db),
+                  "--no-parse-seqids"]
+        if args.force:
+            db_cmd.append("--force")
+        run(db_cmd)
+
+        nested_tsv = do_blast(args.consensus, internal_db)
+
+        # restrict orientation detection to subjects that actually got a hit
+        hit_ids = set()
+        with open(nested_tsv) as fh:
+            for line in fh:
+                if not line or line[0] == "#":
+                    continue
+                f = line.rstrip("\n").split("\t")
+                if len(f) > core.COL["sseqid"]:
+                    hit_ids.add(f[core.COL["sseqid"]])
+
+        orient_map = core.build_orient_map(args.internal, genome, only=hit_ids)
+        nested_hsps = core.load_internal_blast(nested_tsv, orient_map)
+        nested = core.make_candidates(
+            nested_hsps, genome,
+            min_pident=args.nested_min_pident, min_qcov=args.min_qcov_hsp,
+            min_length=args.min_length, max_evalue=args.max_evalue,
+            use_tsd=not args.no_tsd, tsd_k=args.tsd_k, tsd_slop=args.tsd_slop,
+            merge_slop=args.merge_slop)
+        if not args.no_nested_guard:
+            intervals = core.load_internal_intervals(args.internal)
+            nested = core.drop_ltr_of_nested_intact(
+                nested, intervals, args.nested_guard_flank)
+        nb = core.write_bed(nested, str(outdir / "nested_solo.bed"))
+        log(f"nested recovery: {nb} calls -> {outdir / 'nested_solo.bed'}")
+        cands = core.union_candidates(cands, nested, merge_slop=args.merge_slop)
 
     out_bed = outdir / "solo_ltr.bed"
     n = core.write_bed(cands, str(out_bed))

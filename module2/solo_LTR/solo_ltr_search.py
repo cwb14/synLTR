@@ -32,10 +32,11 @@ import sys
 import time
 from pathlib import Path
 
-# Custom outfmt-6 columns: enough for full filtering downstream.
+# Custom outfmt-6 columns: enough for full filtering + divergence downstream.
 BLAST_COLS = (
     "qseqid sseqid pident length qlen slen "
-    "qstart qend sstart send evalue bitscore qcovs qcovhsp mismatch gapopen"
+    "qstart qend sstart send evalue bitscore qcovs qcovhsp mismatch gapopen "
+    "btop"
 ).split()
 
 # Standard BED is 0-based half-open. The chr:start-end in our FASTA

@@ -45,3 +45,42 @@ python synLTR/module2/solo_LTR/solo_ltr.py --consensus LTRs.alns.consensus.fa --
 # Notes for both simulations.
 # (1) Recall is capped low-ish because the LTR-RT library used during simulation is too large reletive to the size of the genome. This means theres lots of singletons (ie, only one member per family). If a singleton gets reduced to solo-LTR, its kinda undetectiable since theres no matches for it in the LTR consensus.
 # (2) Blast parameters and cutoffs for the '--no-nested' path are fairly thoroughly vetted. Parameters and cutoffs for detection from LTR-RT intenral sequence not vetted in quite such a deep way. 
+
+
+# ===========================================================================
+# All commands for gen5400000 (resolved from run_solo_ltr_batch.sh)
+# Run from: /data2/chris/fungi/best/soloLTR/v2/ltrharvest_wrapper4
+# Env:      mamba activate synLTR
+# THREADS defaults to 250; per-gen log is logs/gen5400000.log
+# ===========================================================================
+
+# --- step 1/3: merge + normalize depth FASTAs -> gen5400000_all_ltr.fa ---
+# We'll use 'gen5400000_all_ltr.fa' to hardmask all LTR-RTs, nested and non-nested, which hopefully reduces false positives. 
+# Converting nest nomenclature to N to preserve their positional info for easier coordinate extraction later on.
+awk '/^>/ {if (seq) print seq; print; seq=""; next} {gsub(/[^ATCGatcg]/,"N"); seq=seq toupper($0)} END {if (seq) print seq}' \
+    gen5400000_depth0_ltr.fa \
+    gen5400000_depth1_ltr.fa \
+    gen5400000_depth2_ltr.fa \
+    gen5400000_depth3_ltr.fa \
+    > gen5400000_all_ltr.fa 2>>logs/gen5400000.log
+
+# --- step 2/3: Kmer2LTR -> consensus + internal FASTAs ---
+python Kmer2LTR/Kmer2LTR.py \
+    -i gen5400000_all_ltr.fa \
+    -o gen5400000_Kmer2LTR \
+    --ltr-consensus \
+    --internal-fasta \
+    -p 250 \
+    >>logs/gen5400000.log 2>&1
+
+# --- step 3/3: solo_ltr -> gen5400000_work/solo_ltr.tsv (+ P/R/F1 vs truth) ---
+# Uses consensus homology and TSD hunting to find solo-LTRs outside of existing LTR-RTs (nested and non-nested).
+# Uses the consensus homology and TSD hunting to find solo-LTRs in the internal sequence of exisiting LTR-RTs (nested and non-nested).
+python synLTR/module2/solo_LTR/solo_ltr.py \
+    --consensus gen5400000_Kmer2LTR.consensus.fa \
+    --internal  gen5400000_Kmer2LTR.internal.fa \
+    --genome    ../gen5400000_final.fasta \
+    --outdir    gen5400000_work \
+    --threads   250 \
+    --truth     ../gen5400000_final.bed \
+    >>logs/gen5400000.log 2>&1

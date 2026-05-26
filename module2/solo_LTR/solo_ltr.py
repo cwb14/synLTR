@@ -15,7 +15,11 @@ Inputs
 
 Output
 ------
-  <outdir>/solo_ltr.bed                   predicted solo-LTR loci
+  <outdir>/solo_ltr.tsv      predicted solo-LTR loci (rich TSV; cols 1-3 = BED)
+  <outdir>/nested_solo.tsv   intra-LTR-RT (nested) solo-LTR subset
+
+Intermediates (masked genome, BLAST db, blast/, full_length_ltr.bed) are
+deleted after a successful run; pass --keep-intermediates to retain them.
 
 Stages are cached: re-running with the same inputs skips the mask/db/blast
 work and only re-does the (fast) filter.  Use --threads for blastn.
@@ -24,7 +28,9 @@ Defaults are the grid-search F1 optimum on the PrinTE benchmark
 (blastn word_size 11, pident>=85, qcov>=95, TSD 5bp slop 2, internal flank 25).
 """
 import argparse
+import glob
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -52,14 +58,25 @@ def run(cmd):
         raise SystemExit(f"command failed (rc={rc}): {cmd}")
 
 
-def blast_out(out_dir, query, task, ws, dust, evalue):
-    """Recreate solo_ltr_search.blast_cache_path for a known config."""
-    import importlib.util
-    spec = importlib.util.spec_from_file_location("ss", SEARCH)
-    ss = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(ss)
-    return ss.blast_cache_path(out_dir, query, str(Path(out_dir).parent / "genome.masked.fasta"),
-                               task, ws, dust, evalue, "")
+def cleanup_intermediates(masked, full_bed, blast_dir):
+    """Delete the bulky intermediates a successful run no longer needs.
+
+    Removes the masked genome + its BLAST db sidecars (glob masked*),
+    full_length_ltr.bed, and the blast/ directory. The original --genome is
+    never touched. Cleanup failures warn but do not fail the run.
+    """
+    for path in glob.glob(str(masked) + "*") + [str(full_bed)]:
+        try:
+            p = Path(path)
+            if p.is_file():
+                p.unlink()
+        except OSError as ex:
+            log(f"cleanup: could not remove {path}: {ex}")
+    try:
+        if blast_dir.exists():
+            shutil.rmtree(blast_dir)
+    except OSError as ex:
+        log(f"cleanup: could not remove {blast_dir}: {ex}")
 
 
 def main():
@@ -95,6 +112,10 @@ def main():
 
     p.add_argument("--truth", default=None, help="PrinTE BED -> report P/R/F1")
     p.add_argument("--force", action="store_true", help="Redo cached mask/blast")
+    p.add_argument("--keep-intermediates", action="store_true",
+                   help="Keep the masked genome, BLAST db, blast/ dir, and "
+                        "full_length_ltr.bed (default: delete them after a "
+                        "successful run)")
     p.add_argument("--no-nested", action="store_true",
                    help="Disable intra-LTR-RT (nested) solo-LTR recovery "
                         "(consensus vs internal FASTA). Default: enabled.")
@@ -193,18 +214,19 @@ def main():
             min_pident=args.nested_min_pident, min_qcov=args.min_qcov_hsp,
             min_length=args.min_length, max_evalue=args.max_evalue,
             use_tsd=not args.no_tsd, tsd_k=args.tsd_k, tsd_slop=args.tsd_slop,
-            merge_slop=args.merge_slop)
+            merge_slop=args.merge_slop, source="nested")
         if not args.no_nested_guard:
             intervals = core.load_internal_intervals(args.internal)
             nested = core.drop_ltr_of_nested_intact(
                 nested, intervals, args.nested_guard_flank)
-        nb = core.write_bed(nested, str(outdir / "nested_solo.bed"))
-        log(f"nested recovery: {nb} calls -> {outdir / 'nested_solo.bed'}")
+        nb = core.write_tsv(nested, str(outdir / "nested_solo.tsv"),
+                            name_prefix="nsolo")
+        log(f"nested recovery: {nb} calls -> {outdir / 'nested_solo.tsv'}")
         cands = core.union_candidates(cands, nested, merge_slop=args.merge_slop)
 
-    out_bed = outdir / "solo_ltr.bed"
-    n = core.write_bed(cands, str(out_bed))
-    log(f"wrote {n} solo-LTR calls -> {out_bed}", t0)
+    out_tsv = outdir / "solo_ltr.tsv"
+    n = core.write_tsv(cands, str(out_tsv), name_prefix="solo")
+    log(f"wrote {n} solo-LTR calls -> {out_tsv}", t0)
 
     if args.truth:
         solo_idx = core.load_truth_solo(args.truth)
@@ -212,6 +234,10 @@ def main():
         log(f"vs truth: detected {m['detected']}/{m['n_solo']}  "
             f"TP={m['tp']} FP={m['fp']} FN={m['fn']}  "
             f"P={m['precision']:.4f} R={m['recall']:.4f} F1={m['f1']:.4f}")
+
+    if not args.keep_intermediates:
+        log("cleaning intermediates (use --keep-intermediates to retain)")
+        cleanup_intermediates(masked, full_bed, blast_dir)
 
 
 if __name__ == "__main__":

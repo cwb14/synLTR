@@ -60,6 +60,8 @@ OUT_PREFIX="ltrs"
 RUN_TRF=false
 WFA_ALIGN=false
 KEEP_WEAK_HMM_PASS2=false
+PASS2_ALIGNER="minimap2"
+TEBINSORTER_PATH=""
 
 # Storage for extra ltrharvest5.py arg directives
 # Each entry is tab-separated: "FROMROUND\tKEY\tVALUE\tIS_BOOL"
@@ -94,6 +96,8 @@ Optional:
                         Include in cls.lib.fa the pass-2 matches whose target is a weak-HMM
                         candidate (had HMM hits but no clade -> LTR/unknown/unknown via augment).
                         By default these matches are dropped. Default: off.
+  --pass2-aligner       TEBinSorter pass-2 aligner: minimap2 (default) or blast.
+  --tebinsorter-path    Local TEBinSorter checkout to use instead of cloning.
 
 Extra ltrharvest5.py options:
   --ltrharvest5-args "KEY=VALUE [KEY2=VALUE2 ...]"
@@ -233,6 +237,8 @@ while [[ $# -gt 0 ]]; do
     --run-trf) RUN_TRF=true; shift;;
     --wfa-align) WFA_ALIGN=true; shift;;
     --keep-weak-hmm-pass2-matches) KEEP_WEAK_HMM_PASS2=true; shift;;
+    --pass2-aligner) PASS2_ALIGNER="${2:-}"; shift 2;;
+    --tebinsorter-path) TEBINSORTER_PATH="${2:-}"; shift 2;;
     --ltrharvest5-args)
       parse_kv_string 1 "${2:-}"
       shift 2;;
@@ -325,6 +331,11 @@ fi
 WEAK_HMM_OPTS=()
 if [[ "$KEEP_WEAK_HMM_PASS2" == true ]]; then
   WEAK_HMM_OPTS=(--keep-weak-hmm-pass2-matches)
+fi
+PASS2_ALIGNER_OPTS=(--pass2-aligner "$PASS2_ALIGNER")
+TEBINSORTER_PATH_OPTS=()
+if [[ -n "$TEBINSORTER_PATH" ]]; then
+  TEBINSORTER_PATH_OPTS=(--tebinsorter-path "$TEBINSORTER_PATH")
 fi
 
 SIZE=500000
@@ -450,6 +461,8 @@ for (( round=1; round<=MAX_ROUNDS; round++ )); do
     "${pass2_opts[@]}" \
     "${WFA_OPTS[@]}" \
     "${WEAK_HMM_OPTS[@]}" \
+    "${PASS2_ALIGNER_OPTS[@]}" \
+    "${TEBINSORTER_PATH_OPTS[@]}" \
     "${extra_round_args[@]}" \
     || ltrharvest_exit=$?
   set +x

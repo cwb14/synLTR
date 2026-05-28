@@ -1677,8 +1677,22 @@ def tool_usable_tebinsorter(tb_dir: Path) -> bool:
     except Exception:
         return False
 
-def ensure_tebinsorter(tools_dir: Path) -> str:
-    """Clone TEBinSorter (feat/minimap2 branch) and return path to src/pipeline.py."""
+def ensure_tebinsorter(tools_dir: Path, local_path: Optional[str] = None) -> str:
+    """Return path to TEBinSorter src/pipeline.py.
+
+    If local_path (or env TEBINSORTER_SRC) is set, use that checkout instead of
+    cloning the feat/minimap2 branch from GitHub.
+    """
+    local = local_path or os.environ.get("TEBINSORTER_SRC")
+    if local:
+        tb_dir = Path(local).expanduser().resolve()
+        if not tool_usable_tebinsorter(tb_dir):
+            raise RuntimeError(
+                f"--tebinsorter-path given but unusable: {tb_dir}\n"
+                f"Try: python3 {tb_dir}/src/pipeline.py -h"
+            )
+        return str((tb_dir / "src" / "pipeline.py").resolve())
+
     tools_dir = mkdirp(tools_dir)
     tb_dir = tools_dir / "TEBinSorter"
 
@@ -1736,6 +1750,7 @@ def run_tebinsorter(stitched_fa: str, pipeline_py_path: str, outdir: Path,
                     pass2_classified_fasta: Optional[str] = None,
                     keep_weak_hmm_pass2_matches: bool = False,
                     minimap2_extra: str = "",
+                    pass2_aligner: str = "minimap2",
                     verbose: bool = False) -> Tuple[str, str]:
     """
     Run TEBinSorter (pipeline.py) into outdir. Output files use the input FASTA
@@ -1760,6 +1775,11 @@ def run_tebinsorter(stitched_fa: str, pipeline_py_path: str, outdir: Path,
         "--compat-tesorter-output",
     ]
 
+    # Only append for non-default to stay compatible with older TEBinSorter
+    # checkouts that predate --pass2-aligner.
+    if pass2_aligner != "minimap2":
+        cmd += ["--pass2-aligner", pass2_aligner]
+
     if pass2_classified_fasta:
         p2 = Path(pass2_classified_fasta).resolve()
         if not p2.exists() or p2.stat().st_size == 0:
@@ -1776,6 +1796,17 @@ def run_tebinsorter(stitched_fa: str, pipeline_py_path: str, outdir: Path,
     r = subprocess.run(cmd, cwd=str(outdir), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     if r.returncode != 0:
         raise RuntimeError(f"TEBinSorter failed:\n{(r.stderr or '').strip()}")
+
+    # [benchmark instrumentation] Surface TEBinSorter's pass-2 timing/substep
+    # lines into the parent log (TEBinSorter logs to stderr; otherwise these are
+    # captured and dropped on success, hiding per-round pass-2 cost).
+    _tbs_log = (r.stderr or "") + "\n" + (r.stdout or "")
+    for _ln in _tbs_log.splitlines():
+        if any(k in _ln for k in (
+            "pass-2", "pass2", "alignment:", "BLAST search", "BLAST database built",
+            "total BLAST hits", "sequences classified", "classified sequences as targets",
+        )):
+            print(f"  [TBS:{base}] {_ln.strip()}", file=sys.stderr)
 
     # Read the COMBINED cls.tsv ({base}.cls.tsv), not the per-database one
     # ({base}.{db}.cls.tsv). The per-DB file only contains rexdb HMM
@@ -3457,6 +3488,14 @@ def main():
                          "I -> --min-pid; C -> --min-qcov AND --min-tcov; L parsed but unused.")
     ap.add_argument("--tesorter-minimap2-extra", default="",
                     help="Extra flags forwarded to TEBinSorter's --minimap2-extra (advanced).")
+    ap.add_argument("--pass2-aligner", choices=["minimap2", "blast"],
+                    default="minimap2",
+                    help="TEBinSorter pass-2 aligner: minimap2 (default) or blast "
+                         "(reproduces TEBinSorter master's blastn pass-2).")
+    ap.add_argument("--tebinsorter-path", default=None,
+                    help="Path to a local TEBinSorter checkout; uses its "
+                         "src/pipeline.py instead of cloning feat/minimap2 from "
+                         "GitHub. Falls back to env TEBINSORTER_SRC.")
 
     ap.add_argument(
         "--pass2-classified-fasta",
@@ -3601,7 +3640,7 @@ def main():
     minimap2_path, miniprot_path = ensure_tools(tools_dir)
     tebinsorter_py_path = None
     if args.use_tesorter:
-        tebinsorter_py_path = ensure_tebinsorter(tools_dir)
+        tebinsorter_py_path = ensure_tebinsorter(tools_dir, local_path=args.tebinsorter_path)
 
     kmer2ltr_py = ensure_kmer2ltr(tools_dir)
     trfmod_path = None
@@ -4006,6 +4045,7 @@ def main():
             pass2_classified_fasta=pass2_for_tebinsorter,
             keep_weak_hmm_pass2_matches=args.keep_weak_hmm_pass2_matches,
             minimap2_extra=args.tesorter_minimap2_extra,
+            pass2_aligner=args.pass2_aligner,
             verbose=verbose,
         )
 

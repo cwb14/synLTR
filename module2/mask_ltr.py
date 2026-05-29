@@ -37,11 +37,22 @@ Critical rule (fixed):
 """
 
 import argparse
+import gzip
 import re
 import sys
 from typing import Dict, List, Tuple, Iterator, Optional
 
 COORD_RE = re.compile(r"^([^:]+):(\d+)-(\d+)(?:#.*)?$")
+
+def open_text_auto(path: str):
+    """Open `path` for text reading, transparently decompressing gzip/bgzip
+    input. Detection is by the gzip magic bytes (0x1f 0x8b), not the file
+    extension, so .fa.gz, bgzip, and mislabeled .gz files all work."""
+    with open(path, "rb") as fh:
+        is_gz = fh.read(2) == b"\x1f\x8b"
+    if is_gz:
+        return gzip.open(path, "rt", encoding="utf-8")
+    return open(path, "r", encoding="utf-8")
 
 def fasta_iter(fp) -> Iterator[Tuple[str, str]]:
     """Yield (header, sequence) from a FASTA file handle."""
@@ -103,7 +114,7 @@ def parse_features_fasta_headers_only(features_fa: str) -> Dict[str, List[Tuple[
     Sequences are ignored.
     """
     feats: Dict[str, List[Tuple[int, int]]] = {}
-    with open(features_fa, "r", encoding="utf-8") as f:
+    with open_text_auto(features_fa) as f:
         for header, _seq in fasta_iter(f):
             m = COORD_RE.match(header)
             if not m:
@@ -135,7 +146,7 @@ def parse_features_fasta_with_overrides(features_fa: str) -> Tuple[
     feats: Dict[str, List[Tuple[int, int]]] = {}
     overrides: Dict[str, Dict[int, str]] = {}
 
-    with open(features_fa, "r", encoding="utf-8") as f:
+    with open_text_auto(features_fa) as f:
         for header, seq in fasta_iter(f):
             m = COORD_RE.match(header)
             if not m:
@@ -434,7 +445,7 @@ def main():
     if args.extra_features_fasta:
         extra_by_contig = parse_features_fasta_headers_only(args.extra_features_fasta)
 
-    with open(args.genome, "r", encoding="utf-8") as gf:
+    with open_text_auto(args.genome) as gf:
         for header, seq in fasta_iter(gf):
             feats = feats_by_contig.get(header, [])
             ov = overrides_by_contig.get(header, None)

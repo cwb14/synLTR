@@ -4,7 +4,7 @@
 #
 # Usage:
 #   bash nest_ltr_detector.sh --genome genome.fa [--proteins prot.fa] [--terminate_count 100]
-#       [--max-rounds N] [--script_path ./synLTR/module2/] [--threads 20] [--out_prefix ltrs]
+#       [--max-rounds N] [--script_path ./synLTR/module2/] [--threads 20] [--out_prefix PREFIX]
 #       [--wfa-align] [--ltrharvest5-args "KEY=VALUE ..."] [--ltrharvest5-args-from-round N "KEY=VALUE ..."]
 #
 # Notes:
@@ -56,12 +56,11 @@ TERMINATE_COUNT=100
 MAX_ROUNDS_OVERRIDE=""   # empty = use IUPAC_SEQ length (10)
 SCRIPT_PATH=""
 THREADS=20
-OUT_PREFIX="ltrs"
-RUN_TRF=false
+OUT_PREFIX=""
+RUN_TRF=true
 WFA_ALIGN=false
 KEEP_WEAK_HMM_PASS2=false
 PASS2_ALIGNER="minimap2"
-TEBINSORTER_PATH=""
 
 # Storage for extra ltrharvest5.py arg directives
 # Each entry is tab-separated: "FROMROUND\tKEY\tVALUE\tIS_BOOL"
@@ -76,7 +75,7 @@ usage() {
   cat >&2 <<'USAGE_EOF'
 Usage:
   bash nest_ltr_detector.sh --genome genome.fa [--proteins prot.fa] [--terminate_count 100]
-      [--max-rounds N] [--script_path ./synLTR/module2/] [--threads 20] [--out_prefix ltrs]
+      [--max-rounds N] [--script_path ./synLTR/module2/] [--threads 20] [--out_prefix PREFIX]
       [--wfa-align] [--ltrharvest5-args "KEY=VALUE ..."] [--ltrharvest5-args-from-round N "KEY=VALUE ..."]
 
 Required:
@@ -89,15 +88,15 @@ Optional:
                         Use 1 for non-nested only, 2 for single-level nesting, etc.
   --script_path         Path containing ltrharvest5.py and mask_ltr.py (default: same dir as this script)
   --threads             Threads for ltrharvest5.py (default 20)
-  --out_prefix          Output prefix (default ltrs)
-  --run-trf             Enable TRF instead of default --no-trf
+  --out_prefix          Output prefix (default: <genome_prefix>_LTRs)
+  --run-trf             Run TRF tandem-repeat masking (default: on)
+  --no-trf              Disable TRF tandem-repeat masking
   --wfa-align           Use WFA instead of mafft for Kmer2LTR pairwise alignment (~30-50x faster)
   --keep-weak-hmm-pass2-matches
                         Include in cls.lib.fa the pass-2 matches whose target is a weak-HMM
                         candidate (had HMM hits but no clade -> LTR/unknown/unknown via augment).
                         By default these matches are dropped. Default: off.
   --pass2-aligner       TEBinSorter pass-2 aligner: minimap2 (default) or blast.
-  --tebinsorter-path    Local TEBinSorter checkout to use instead of cloning.
 
 Extra ltrharvest5.py options:
   --ltrharvest5-args "KEY=VALUE [KEY2=VALUE2 ...]"
@@ -235,10 +234,10 @@ while [[ $# -gt 0 ]]; do
     --threads) THREADS="${2:-}"; shift 2;;
     --out_prefix) OUT_PREFIX="${2:-}"; shift 2;;
     --run-trf) RUN_TRF=true; shift;;
+    --no-trf) RUN_TRF=false; shift;;
     --wfa-align) WFA_ALIGN=true; shift;;
     --keep-weak-hmm-pass2-matches) KEEP_WEAK_HMM_PASS2=true; shift;;
     --pass2-aligner) PASS2_ALIGNER="${2:-}"; shift 2;;
-    --tebinsorter-path) TEBINSORTER_PATH="${2:-}"; shift 2;;
     --ltrharvest5-args)
       parse_kv_string 1 "${2:-}"
       shift 2;;
@@ -258,6 +257,35 @@ done
 if [[ -n "$PROTEINS" ]]; then
   [[ -f "$PROTEINS" ]] || die "Proteins not found: $PROTEINS"
 fi
+
+# ----------------------------
+# Derived names
+# ----------------------------
+# Genome prefix = basename minus a trailing .gz and one FASTA extension.
+# e.g. Athal_tair10_chr2.fa.gz -> Athal_tair10_chr2
+genome_base="$(basename "$GENOME")"
+genome_base="${genome_base%.gz}"
+genome_prefix="${genome_base%.*}"
+[[ -n "$genome_prefix" ]] || die "Could not derive a genome prefix from: $GENOME"
+
+# Tools-dir basename: user's --out_prefix if given, else the genome prefix.
+# (Captured before OUT_PREFIX is defaulted below so the no-prefix case keeps
+#  the historic ./<genome_prefix>_tools name.)
+if [[ -n "$OUT_PREFIX" ]]; then
+  tools_base="$OUT_PREFIX"
+else
+  tools_base="$genome_prefix"
+fi
+
+# Default output prefix to <genome_prefix>_LTRs unless the user set --out_prefix.
+[[ -z "$OUT_PREFIX" ]] && OUT_PREFIX="${genome_prefix}_LTRs"
+
+# Per-tools directory for cloned helper tools
+# (e.g. ./minimap2_tools when --out_prefix minimap2, else ./Athal_tair10_chr2_tools).
+TOOLS_DIR="./${tools_base}_tools"
+
+echo "Output prefix:   ${OUT_PREFIX}"
+echo "Tools directory: ${TOOLS_DIR}"
 
 if [[ -z "$SCRIPT_PATH" ]]; then
   SCRIPT_PATH="$(abspath_dir "${BASH_SOURCE[0]}")"
@@ -333,10 +361,6 @@ if [[ "$KEEP_WEAK_HMM_PASS2" == true ]]; then
   WEAK_HMM_OPTS=(--keep-weak-hmm-pass2-matches)
 fi
 PASS2_ALIGNER_OPTS=(--pass2-aligner "$PASS2_ALIGNER")
-TEBINSORTER_PATH_OPTS=()
-if [[ -n "$TEBINSORTER_PATH" ]]; then
-  TEBINSORTER_PATH_OPTS=(--tebinsorter-path "$TEBINSORTER_PATH")
-fi
 
 SIZE=500000
 TESORTER_RULE="70-75-80"
@@ -442,6 +466,7 @@ for (( round=1; round<=MAX_ROUNDS; round++ )); do
     "${protein_opts[@]}" \
     --threads "$THREADS" \
     --out-prefix "$out_prefix_round" \
+    --tools-dir "$TOOLS_DIR" \
     --scn-min-ltr-len "$SCN_MIN_LTR_LEN" \
     --scn-min-ret-len "$SCN_MIN_RET_LEN" \
     --scn-max-ret-len "$scn_max_ret" \
@@ -462,7 +487,6 @@ for (( round=1; round<=MAX_ROUNDS; round++ )); do
     "${WFA_OPTS[@]}" \
     "${WEAK_HMM_OPTS[@]}" \
     "${PASS2_ALIGNER_OPTS[@]}" \
-    "${TEBINSORTER_PATH_OPTS[@]}" \
     "${extra_round_args[@]}" \
     || ltrharvest_exit=$?
   set +x
@@ -573,7 +597,7 @@ fi
 
 # Cleanup
 rm -f "$temp_lib" 2>/dev/null || true
-rm -rf ./tools/ 2>/dev/null || true
+rm -rf "$TOOLS_DIR" 2>/dev/null || true
 
 WRAPPER_ELAPSED=$((SECONDS - WRAPPER_START))
 WRAPPER_H=$((WRAPPER_ELAPSED / 3600))

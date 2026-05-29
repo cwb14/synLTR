@@ -39,6 +39,7 @@ Line 2 (inner) is nested in line 1 (outer). Line 2 inner looks like Bianca. Line
 """
 
 import argparse
+import gzip
 import os
 import re
 import shutil
@@ -111,10 +112,20 @@ def _format_hms(seconds: float) -> str:
 # FASTA helpers
 # -----------------------------
 
+def open_text_auto(path: str):
+    """Open `path` for text reading, transparently decompressing gzip/bgzip
+    input. Detection is by the gzip magic bytes (0x1f 0x8b), not the file
+    extension, so .fa.gz, bgzip, and mislabeled .gz-content-in-a-.fa files all
+    work. Returns a text-mode file object the caller should close (or use in a
+    `with`)."""
+    with open(path, "rb") as fh:
+        is_gz = fh.read(2) == b"\x1f\x8b"
+    return gzip.open(path, "rt") if is_gz else open(path, "r")
+
 def iter_fasta(path: str) -> Iterable[Tuple[str, str]]:
     name = None
     seq_chunks: List[str] = []
-    with open(path, "r") as f:
+    with open_text_auto(path) as f:
         for line in f:
             line = line.rstrip("\n")
             if not line:
@@ -3396,7 +3407,11 @@ def main():
     ap.add_argument("--workdir", default=None, help="Working directory (default: {out_prefix}.work)")
     ap.add_argument("--gt", default="gt", help="Path to GenomeTools 'gt' executable")
 
-    ap.add_argument("--clean", action="store_true", help="Remove {out_prefix}.work and ./tools after success")
+    ap.add_argument("--tools-dir", default="./tools",
+                    help="Directory for cloned helper tools (minimap2, miniprot, "
+                         "Kmer2LTR, TEBinSorter, TRF-mod). Default: ./tools")
+
+    ap.add_argument("--clean", action="store_true", help="Remove {out_prefix}.work and the tools dir (--tools-dir) after success")
 
     ap.add_argument("--verbose", action="store_true",
                     help="Print subcommands and additional progress details to stderr")
@@ -3636,7 +3651,7 @@ def main():
     workdir = Path(args.workdir or f"{out_prefix}.work")
     mkdirp(workdir)
 
-    tools_dir = Path("./tools")
+    tools_dir = Path(args.tools_dir)
     minimap2_path, miniprot_path = ensure_tools(tools_dir)
     tebinsorter_py_path = None
     if args.use_tesorter:

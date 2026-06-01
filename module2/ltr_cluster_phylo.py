@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """Per-cluster LTR-RT phylogenies with structure glyphs at the tips.
 
+# Note, it clusters using mmseqs eas-clust in '--cluster-mode 1', which means it builds a graph and connected components in the graph become a cluster.  
+
 Inputs : Kmer2LTR consensus LTR FASTA, an mmseqs cluster TSV, and one or more
          depth*_ltr.tsv annotation files. Output: one tree+glyph figure per
          non-singleton cluster. See docs/superpowers/specs/2026-05-29-*.md.
-
 
 Pipeline : 
 # De novo LTR-RT annotation.

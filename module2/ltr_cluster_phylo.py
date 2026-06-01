@@ -313,6 +313,28 @@ def write_fasta(seqs: Dict[str, str], label_map: "LabelMap", path: str) -> None:
             fh.write(f">{label_map.to_safe(full)}\n{seq.upper()}\n")
 
 
+def ensure_consensus_index(consensus_fa: str) -> None:
+    """Build the pyfastx .fxi index once, in this single process, up front.
+
+    pyfastx builds the index lazily on first open. With --jobs>1 the worker
+    processes all open the FASTA at once, and if the index does not exist yet
+    they race to create the same SQLite .fxi and corrupt it (the
+    'get seq count and length error' / 'returned a result with an exception
+    set' crash). Building it here, before any pool dispatch, makes every worker
+    a read-only consumer of a finished index (concurrent reads are safe). Also
+    self-heals a corrupt/partial .fxi left behind by an interrupted or raced run.
+    """
+    import pyfastx
+    try:
+        pyfastx.Fasta(consensus_fa, build_index=True)
+    except Exception:
+        # stale/corrupt index (e.g. from a previously raced run): drop & rebuild
+        idx = consensus_fa + ".fxi"
+        if os.path.exists(idx):
+            os.remove(idx)
+        pyfastx.Fasta(consensus_fa, build_index=True)
+
+
 # ---------------------------------------------------------------------------
 # Alignment + trimming
 # ---------------------------------------------------------------------------
@@ -385,7 +407,11 @@ def _read_alignment(path: str) -> List[Tuple[str, str]]:
 
 def run_iqtree(aln: str, prefix: str, n: int, model: str, ufboot: int,
                threads: int) -> Tuple[str, str]:
-    cmd = ["iqtree", "-s", aln, "-m", model, "-nt", str(threads),
+    # -st DNA is REQUIRED: the consensus LTRs are IUPAC-rich (R/Y/S/W/K/M),
+    # whose letters overlap amino-acid codes, so IQ-TREE's auto-detection can
+    # misclassify a short/ambiguity-dense alignment as protein -> GTR becomes
+    # invalid -> "File not found GTR" -> exit 2. Forcing DNA prevents that.
+    cmd = ["iqtree", "-s", aln, "-st", "DNA", "-m", model, "-nt", str(threads),
            "-keep-ident", "-redo", "-quiet", "-pre", prefix]
     support = "none"
     if n >= 4:
@@ -733,19 +759,41 @@ def main(argv: Optional[List[str]] = None) -> int:
         sys.stderr.write(f"[info] {len(clusters)} clusters >= size "
                          f"{opts.min_cluster_size}; {len(annot)} annotated elements\n")
 
+    # Build the pyfastx index ONCE here; worker processes (--jobs>1) must not
+    # race to build it concurrently (that corrupts the shared .fxi).
+    ensure_consensus_index(opts.consensus)
+
     rows: List[dict] = []
+    n_failed = 0
+
+    def _record_failure(c: Cluster, e: Exception) -> None:
+        nonlocal n_failed
+        n_failed += 1
+        sys.stderr.write(f"[warn] cluster {cluster_basename(c)} failed, skipping: "
+                         f"{type(e).__name__}: {e}\n")
+        rows.append({"cluster": cluster_basename(c), "status": "failed"})
+
     if opts.jobs > 1:
         from concurrent.futures import ProcessPoolExecutor, as_completed
         with ProcessPoolExecutor(max_workers=opts.jobs) as ex:
             futs = {ex.submit(process_cluster, c, opts.consensus, annot,
                               opts.out_dir, opts): c for c in clusters}
             for fut in as_completed(futs):
-                r = fut.result()
+                c = futs[fut]
+                try:
+                    r = fut.result()       # one cluster failing must not abort the batch
+                except Exception as e:
+                    _record_failure(c, e)
+                    continue
                 if r:
                     rows.append(r)
     else:
         for c in clusters:
-            r = process_cluster(c, opts.consensus, annot, opts.out_dir, opts)
+            try:
+                r = process_cluster(c, opts.consensus, annot, opts.out_dir, opts)
+            except Exception as e:
+                _record_failure(c, e)
+                continue
             if r:
                 rows.append(r)
             if opts.verbose:
@@ -756,6 +804,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     if opts.combined_pdf:
         _write_combined_pdf(rows, os.path.join(opts.out_dir, "all_clusters_trees.pdf"))
     _write_memo(opts, rows)
+    if n_failed:
+        sys.stderr.write(f"[warn] {n_failed} of {len(clusters)} cluster(s) failed "
+                         f"(status=failed in manifest.tsv); the rest completed\n")
     return 0
 
 

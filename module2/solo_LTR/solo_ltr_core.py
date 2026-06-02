@@ -232,13 +232,23 @@ def load_genome(path):
 # --------------------------------------------------------------------------- #
 # BLAST loading
 # --------------------------------------------------------------------------- #
-def load_blast(path):
+def load_blast(path, *, min_pident=0.0, min_qcov=0.0, min_length=0,
+               max_evalue=float("inf")):
     """Parse tabular BLAST -> dict chrom -> list of HSP (main path; host=None).
 
     (s0, e1) is a 0-based half-open SUBJECT interval. strand is '+' when the
     subject alignment runs forward (sstart < send) else '-'. Lists are NOT
     sorted here. Warns if every data line is too narrow (a stale pre-btop
     cache), which would otherwise silently yield zero candidates.
+
+    HSPs failing any of min_pident / min_qcov (qcovhsp) / min_length /
+    max_evalue are skipped DURING the read (streaming prefilter), so peak memory
+    is bounded by the number of SURVIVING hits, not the file size -- essential
+    for genome-scale outputs that can reach terabytes (a 2.1 Gb maize genome
+    with permissive blastn produced a 2 TB TSV; slurping it all OOM-killed the
+    run). These are the SAME comparisons make_candidates() applies, so the
+    prefilter is lossless: the dropped HSPs would be discarded there anyway.
+    Defaults (keep everything) preserve the original load-all behaviour.
     """
     by = collections.defaultdict(list)
     n_lines = n_narrow = 0
@@ -251,6 +261,13 @@ def load_blast(path):
             if len(f) < len(BLAST_COLS):
                 n_narrow += 1
                 continue
+            pident = float(f[COL["pident"]])
+            qcovhsp = float(f[COL["qcovhsp"]])
+            length = int(f[COL["length"]])
+            evalue = float(f[COL["evalue"]])
+            if (pident < min_pident or qcovhsp < min_qcov
+                    or length < min_length or evalue > max_evalue):
+                continue
             chrom = f[COL["sseqid"]]
             s = int(f[COL["sstart"]]); e = int(f[COL["send"]])
             strand = "+" if s < e else "-"
@@ -258,8 +275,7 @@ def load_blast(path):
                 s, e = e, s
             by[chrom].append(HSP(
                 s - 1, e,
-                float(f[COL["pident"]]), float(f[COL["qcovhsp"]]),
-                int(f[COL["length"]]), float(f[COL["evalue"]]),
+                pident, qcovhsp, length, evalue,
                 float(f[COL["bitscore"]]), int(f[COL["mismatch"]]),
                 int(f[COL["gapopen"]]), strand,
                 f[COL["qseqid"]], f[COL["btop"]], None))
@@ -271,7 +287,8 @@ def load_blast(path):
     return by
 
 
-def load_internal_blast(path, orient_map):
+def load_internal_blast(path, orient_map, *, min_pident=0.0, min_qcov=0.0,
+                        min_length=0, max_evalue=float("inf")):
     """Parse consensus-vs-internal blastn -> dict chrom -> list of HSP with
     SUBJECT coords mapped to GENOMIC coords, host = internal-record sseqid.
 
@@ -279,6 +296,10 @@ def load_internal_blast(path, orient_map):
     whose sseqid is absent is skipped. Subject mapping (lo=min, hi=max of
     sstart/send): '+' -> [g0+(lo-1), g0+hi); '-' -> [g1-hi, g1-(lo-1)). The
     genomic strand combines the record orientation with the hit orientation.
+
+    Like load_blast(), HSPs failing min_pident / min_qcov / min_length /
+    max_evalue are skipped DURING the read (streaming prefilter, lossless w.r.t.
+    the downstream make_candidates filter). Defaults keep everything.
     """
     by = collections.defaultdict(list)
     n_lines = n_narrow = 0
@@ -290,6 +311,13 @@ def load_internal_blast(path, orient_map):
             f = line.rstrip("\n").split("\t")
             if len(f) < len(BLAST_COLS):
                 n_narrow += 1
+                continue
+            pident = float(f[COL["pident"]])
+            qcovhsp = float(f[COL["qcovhsp"]])
+            length = int(f[COL["length"]])
+            evalue = float(f[COL["evalue"]])
+            if (pident < min_pident or qcovhsp < min_qcov
+                    or length < min_length or evalue > max_evalue):
                 continue
             sseqid = f[COL["sseqid"]]
             rec = orient_map.get(sseqid)
@@ -305,8 +333,7 @@ def load_internal_blast(path, orient_map):
             genomic_strand = "+" if (orient == "+") == (ss <= se) else "-"
             by[chrom].append(HSP(
                 s0, e1,
-                float(f[COL["pident"]]), float(f[COL["qcovhsp"]]),
-                int(f[COL["length"]]), float(f[COL["evalue"]]),
+                pident, qcovhsp, length, evalue,
                 float(f[COL["bitscore"]]), int(f[COL["mismatch"]]),
                 int(f[COL["gapopen"]]), genomic_strand,
                 f[COL["qseqid"]], f[COL["btop"]], sseqid))

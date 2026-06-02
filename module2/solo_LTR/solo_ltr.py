@@ -169,8 +169,16 @@ def main():
     # 3. filter
     log("stage 3/3: TSD + internal filter")
     genome = core.load_genome(args.genome)
-    cons = core.load_blast(cons_tsv)
-    intn = core.load_blast(int_tsv)
+    # Streaming prefilter at load time (bounds memory by survivors, not file
+    # size): pass each path's own downstream thresholds so a genome-scale,
+    # multi-TB BLAST TSV is never held whole in RAM. Lossless -- make_candidates
+    # / filter_internal apply the identical cutoffs.
+    cons = core.load_blast(
+        cons_tsv, min_pident=args.min_pident, min_qcov=args.min_qcov_hsp,
+        min_length=args.min_length, max_evalue=args.max_evalue)
+    intn = core.load_blast(
+        int_tsv, min_pident=args.int_min_pident, min_qcov=args.int_min_qcov_hsp,
+        min_length=args.int_min_length, max_evalue=args.int_max_evalue)
     cands = core.make_candidates(
         cons, genome,
         min_pident=args.min_pident, min_qcov=args.min_qcov_hsp,
@@ -208,7 +216,10 @@ def main():
                     hit_ids.add(f[core.COL["sseqid"]])
 
         orient_map = core.build_orient_map(args.internal, genome, only=hit_ids)
-        nested_hsps = core.load_internal_blast(nested_tsv, orient_map)
+        nested_hsps = core.load_internal_blast(
+            nested_tsv, orient_map,
+            min_pident=args.nested_min_pident, min_qcov=args.min_qcov_hsp,
+            min_length=args.min_length, max_evalue=args.max_evalue)
         nested = core.make_candidates(
             nested_hsps, genome,
             min_pident=args.nested_min_pident, min_qcov=args.min_qcov_hsp,

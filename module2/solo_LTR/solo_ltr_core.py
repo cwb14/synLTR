@@ -230,6 +230,31 @@ def load_genome(path):
 
 
 # --------------------------------------------------------------------------- #
+# BLAST-level prefilter (bounds on-disk TSV size)
+# --------------------------------------------------------------------------- #
+def blast_prefilter(min_pident, min_qcov, max_evalue, *,
+                    pident_margin=2.0, qcov_margin=2.0, evalue_factor=10.0):
+    """Derive blastn -evalue / -perc_identity / -qcov_hsp_perc from the
+    downstream filter so the on-disk TSV holds ~survivors, not every permissive
+    hit. The disk analogue of load_blast()'s streaming RAM prefilter: a
+    genome-scale permissive blastn can write a multi-TB TSV before Python ever
+    reads it, and the streaming reader only bounds memory.
+
+    Returns (evalue, perc_identity, qcov_hsp_perc). Each is kept strictly LOOSER
+    than the authoritative downstream cutoff -- e-value one decade higher,
+    pident/qcov a couple points lower -- so boundary HSPs are decided by the
+    Python filter on blastn's *formatted* (3 dp) output, never dropped early by
+    blastn's full-precision internal comparison. qcov_hsp_perc is 0 (disabled)
+    when the downstream qcov floor is 0. Lossless w.r.t. load_blast /
+    make_candidates for any margin >= blastn's output rounding.
+    """
+    evalue = max_evalue * evalue_factor
+    perc_identity = max(0.0, min_pident - pident_margin)
+    qcov_hsp_perc = max(0.0, min_qcov - qcov_margin) if min_qcov > 0 else 0.0
+    return evalue, perc_identity, qcov_hsp_perc
+
+
+# --------------------------------------------------------------------------- #
 # BLAST loading
 # --------------------------------------------------------------------------- #
 def load_blast(path, *, min_pident=0.0, min_qcov=0.0, min_length=0,

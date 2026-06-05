@@ -12,10 +12,14 @@ are not repeated across a parameter sweep:
 
   3. blast:  blastn -query <consensus|internal> -db <masked db>
              with a defined task/word_size/dust/evalue. We dump tabular
-             results with all the fields the downstream filter needs;
-             per-HSP percent-identity and qcov filters are applied
-             POST-HOC in solo_ltr_filter.py so one blast run feeds many
-             filter combinations.
+             results with all the fields the downstream filter needs.
+             pident/qcov/evalue cutoffs are pushed into blastn (kept looser
+             than the downstream filter, so still lossless) to bound the
+             on-disk TSV; the query is split into (threads // chunk-threads)
+             length-balanced chunks run concurrently against the shared DB,
+             scaling past blastn's internal threading ceiling on many-core
+             hosts. Per-HSP filters are also re-applied POST-HOC in
+             solo_ltr_core.py so one cached blast feeds many filter runs.
 
 Heng Li-style: streaming where it matters, no shell-quoting tricks, and
 nothing depends on absolute paths.
@@ -29,6 +33,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -138,24 +143,139 @@ def cmd_db(args):
 # --------------------------------------------------------------------------- #
 # Step 3 -- blastn with permissive cutoffs (filter post-hoc)
 # --------------------------------------------------------------------------- #
-def blast_cache_path(out_dir, query_fa, db_fa, task, word_size, dust, evalue, extra):
+def blast_cache_path(out_dir, query_fa, db_fa, task, word_size, dust, evalue,
+                     extra, perc_identity=None, qcov_hsp_perc=None):
     """Stable filename for a (query, db, blast-params) tuple."""
     key = json.dumps({
         "query": str(Path(query_fa).resolve()),
         "db": str(Path(db_fa).resolve()),
         "task": task, "word_size": word_size,
         "dust": dust, "evalue": evalue, "extra": extra,
+        "perc_identity": perc_identity, "qcov_hsp_perc": qcov_hsp_perc,
     }, sort_keys=True)
     h = hashlib.sha1(key.encode()).hexdigest()[:12]
     qstem = Path(query_fa).stem
     return Path(out_dir) / f"{qstem}.{task}.ws{word_size}.dust{dust}.e{evalue}.{h}.tsv"
 
 
+def build_blast_cmd(args, query, out_path, threads):
+    """Assemble one blastn command. Shared by the single and chunked paths so
+    the prefilter/format flags never drift between them.
+    """
+    outfmt = "6 " + " ".join(BLAST_COLS)
+    cmd = ["blastn",
+           "-query", str(query),
+           "-db", args.db,
+           "-task", args.task,
+           "-word_size", str(args.word_size),
+           "-dust", args.dust,
+           "-evalue", str(args.evalue),
+           "-outfmt", outfmt,
+           "-num_threads", str(threads),
+           "-mt_mode", str(args.mt_mode),
+           "-max_target_seqs", str(args.max_target_seqs),
+           "-soft_masking", "false",
+           "-out", str(out_path)]
+    # Blast-level prefilter: bound the on-disk TSV to ~survivors (disk analogue
+    # of the downstream streaming filter). Omitted flag == no filter at this
+    # threshold; kept looser than the downstream cutoff so it stays lossless.
+    if args.perc_identity is not None:
+        cmd += ["-perc_identity", str(args.perc_identity)]
+    if args.qcov_hsp_perc is not None and args.qcov_hsp_perc > 0:
+        cmd += ["-qcov_hsp_perc", str(args.qcov_hsp_perc)]
+    # task-specific extras only added when meaningful
+    if args.extra:
+        cmd += args.extra.split()
+    return cmd
+
+
+def _iter_fasta(path):
+    """Stream a FASTA, yielding (header_line, sequence) one record at a time.
+
+    header_line keeps the leading '>' and everything after it (so the query's
+    qseqid / '#'-classification survive verbatim); sequence is the joined,
+    case-preserved residues. Holds a single record at a time -- never the whole
+    library. Supports .gz.
+    """
+    opener = gzip.open if str(path).endswith(".gz") else open
+    header = None
+    chunks = []
+    with opener(path, "rt") as fh:
+        for line in fh:
+            if line.startswith(">"):
+                if header is not None:
+                    yield header, "".join(chunks)
+                header = line.rstrip("\n")
+                chunks = []
+            else:
+                chunks.append(line.strip())
+    if header is not None:
+        yield header, "".join(chunks)
+
+
+def chunk_query_by_length(query_fa, n_chunks, out_dir):
+    """Bin-pack query records into <= n_chunks FASTA files balanced by total bp.
+
+    Online greedy: each record is appended to the currently-lightest bin in a
+    single streaming pass (one record held at a time -- no whole-library load),
+    which keeps the parallel blastn processes finishing at about the same time
+    instead of one straggler holding up the rest. Empty bins (when records <
+    n_chunks) are dropped. Returns the list of non-empty chunk paths.
+    """
+    paths = [os.path.join(out_dir, f"chunk_{i}.fa") for i in range(n_chunks)]
+    handles = [open(p, "w") for p in paths]
+    loads = [0] * n_chunks
+    try:
+        for header, seq in _iter_fasta(query_fa):
+            i = loads.index(min(loads))
+            handles[i].write(f"{header}\n{seq}\n")
+            loads[i] += len(seq)
+    finally:
+        for h in handles:
+            h.close()
+    return [p for p in paths if os.path.getsize(p) > 0]
+
+
+def _run_blast_chunks(args, chunks, scratch, tmp_path):
+    """Run one blastn per chunk concurrently, then concatenate -> tmp_path.
+
+    blastn's own -num_threads parallelism plateaus well below a many-core host's
+    capacity; splitting the query and running (threads // chunk-threads)
+    processes against the shared DB uses the cores it leaves idle. Results are
+    identical to a single blast (same query, DB, params -- only HSP line order
+    differs, which the order-independent downstream filter ignores).
+    """
+    log(f"blastn x{len(chunks)} chunks ({args.chunk_threads} threads each) "
+        f"-> {tmp_path.with_suffix('')}")
+    procs = []
+    for i, chunk in enumerate(chunks):
+        cout = Path(scratch) / f"part_{i}.tsv"
+        cerr = open(Path(scratch) / f"part_{i}.err", "w")
+        cmd = build_blast_cmd(args, chunk, cout, args.chunk_threads)
+        p = subprocess.Popen([str(x) for x in cmd], stderr=cerr)
+        procs.append((p, cerr, cmd, cout))
+    failure = None
+    for p, cerr, cmd, cout in procs:
+        rc = p.wait()
+        cerr.close()
+        if rc != 0 and failure is None:
+            failure = (rc, cmd, Path(cerr.name).read_text()[-2000:])
+    if failure is not None:
+        rc, cmd, err = failure
+        raise SystemExit(f"blast chunk failed (rc={rc}): {cmd}\n{err}")
+    with open(tmp_path, "wb") as out:
+        for _, _, _, cout in procs:
+            if os.path.exists(cout):
+                with open(cout, "rb") as src:
+                    shutil.copyfileobj(src, out)
+
+
 def cmd_blast(args):
     t0 = time.time()
     out_path = blast_cache_path(args.out_dir, args.query, args.db,
                                 args.task, args.word_size, args.dust,
-                                args.evalue, args.extra)
+                                args.evalue, args.extra,
+                                args.perc_identity, args.qcov_hsp_perc)
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     if out_path.exists() and not args.force:
@@ -163,31 +283,29 @@ def cmd_blast(args):
         print(out_path)
         return
 
-    outfmt = "6 " + " ".join(BLAST_COLS)
     # Write to a .tmp then atomic-rename: a partial file (interrupted run,
     # or a reader checking mid-run) never looks like a complete cache entry.
     tmp_path = out_path.with_suffix(out_path.suffix + ".tmp")
-    cmd = ["blastn",
-           "-query", args.query,
-           "-db", args.db,
-           "-task", args.task,
-           "-word_size", str(args.word_size),
-           "-dust", args.dust,
-           "-evalue", str(args.evalue),
-           "-outfmt", outfmt,
-           "-num_threads", str(args.threads),
-           "-mt_mode", str(args.mt_mode),
-           "-max_target_seqs", str(args.max_target_seqs),
-           "-soft_masking", "false",
-           "-out", str(tmp_path)]
-    # task-specific extras only added when meaningful
-    if args.extra:
-        for tok in args.extra.split():
-            cmd.append(tok)
+    # Auto: as many length-balanced query chunks as fit the thread budget.
+    n_chunks = max(1, args.threads // max(1, args.chunk_threads))
 
-    log(f"blastn -> {out_path}")
-    run(cmd)
-    os.replace(tmp_path, out_path)
+    if n_chunks <= 1:
+        log(f"blastn -> {out_path}")
+        run(build_blast_cmd(args, args.query, tmp_path, args.threads))
+        os.replace(tmp_path, out_path)
+    else:
+        scratch = tempfile.mkdtemp(prefix="blastchunk_", dir=str(out_path.parent))
+        try:
+            chunks = chunk_query_by_length(args.query, n_chunks, scratch)
+            if len(chunks) <= 1:  # query too small to split usefully
+                log(f"blastn (query < {n_chunks} records, not chunked) -> {out_path}")
+                run(build_blast_cmd(args, args.query, tmp_path, args.threads))
+            else:
+                _run_blast_chunks(args, chunks, scratch, tmp_path)
+            os.replace(tmp_path, out_path)
+        finally:
+            shutil.rmtree(scratch, ignore_errors=True)
+
     log(f"blast done; {out_path}", t0)
     print(out_path)
 
@@ -235,9 +353,23 @@ def main():
                     help="DUST filter: 'no' or 'yes' or 'level window linker'")
     pb.add_argument("--evalue", default="10",
                     help="Permissive default; filter tighter post-hoc")
+    pb.add_argument("--perc-identity", type=float, default=None,
+                    help="blastn -perc_identity prefilter (HSP %%-identity floor). "
+                         "Set strictly below the downstream pident cutoff so the "
+                         "Python filter stays authoritative. Default: no filter.")
+    pb.add_argument("--qcov-hsp-perc", type=float, default=None,
+                    help="blastn -qcov_hsp_perc prefilter (per-HSP query-coverage "
+                         "floor). 0 or None disables it. Default: no filter.")
     pb.add_argument("--extra", default="",
                     help="Extra blastn flags as one string (e.g. for dc-megablast templates)")
     pb.add_argument("--threads", type=int, default=8)
+    pb.add_argument("--chunk-threads", type=int, default=4,
+                    help="Threads per blastn process when query-chunking. The "
+                         "query is split into (threads // chunk-threads) "
+                         "length-balanced chunks run concurrently against the "
+                         "shared DB, scaling past blastn's internal threading "
+                         "ceiling on many-core hosts. Set >= --threads (or a "
+                         "1-record query) to run a single blast.")
     pb.add_argument("--mt-mode", type=int, default=1,
                     help="1 = split by queries (best for many small queries vs big db)")
     pb.add_argument("--max-target-seqs", type=int, default=5000)

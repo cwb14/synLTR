@@ -24,6 +24,13 @@ deleted after a successful run; pass --keep-intermediates to retain them.
 Stages are cached: re-running with the same inputs skips the mask/db/blast
 work and only re-does the (fast) filter.  Use --threads for blastn.
 
+Blast output is bounded at the source: each blastn runs with the path's own
+downstream cutoffs as -evalue/-perc_identity/-qcov_hsp_perc (a touch looser, so
+the Python filter stays authoritative), so the on-disk TSV holds ~survivors,
+not every permissive hit -- a genome-scale permissive blastn can otherwise
+reach terabytes.  --loose-blast restores one permissive blast for filter
+sweeps.
+
 Defaults are the grid-search F1 optimum on the PrinTE benchmark
 (blastn word_size 11, pident>=85, qcov>=95, TSD 5bp slop 2, internal flank 25).
 """
@@ -90,8 +97,17 @@ def main():
     p.add_argument("--task", default="blastn")
     p.add_argument("--word-size", type=int, default=11)
     p.add_argument("--dust", default="no")
-    p.add_argument("--evalue", default="10")
+    p.add_argument("--evalue", default="10",
+                   help="blastn -evalue; used ONLY with --loose-blast. Default "
+                        "mode derives the per-path blast e-value from "
+                        "--max-evalue / --int-max-evalue so the TSV stays small.")
     p.add_argument("--threads", type=int, default=8)
+    p.add_argument("--chunk-threads", type=int, default=4,
+                   help="Threads per blastn process; the query is split into "
+                        "(threads // chunk-threads) length-balanced chunks run "
+                        "concurrently against the shared DB, scaling past "
+                        "blastn's internal threading ceiling on many-core hosts. "
+                        "Set >= --threads to run a single blast.")
 
     # filter params (defaults = benchmark F1 optimum: F1=0.581, P=0.95, R=0.42)
     # High-precision alternative: --min-qcov-hsp 95  (F1=0.580, P=0.97, 2 FP)
@@ -112,6 +128,12 @@ def main():
 
     p.add_argument("--truth", default=None, help="PrinTE BED -> report P/R/F1")
     p.add_argument("--force", action="store_true", help="Redo cached mask/blast")
+    p.add_argument("--loose-blast", action="store_true",
+                   help="Disable the blast-level prefilter and run one permissive "
+                        "blastn (-evalue from --evalue, no pident/qcov cap). For "
+                        "parameter sweeps that vary the Python cutoffs on a single "
+                        "cached blast; NOT for genome-scale runs -- the permissive "
+                        "TSV can reach terabytes on disk.")
     p.add_argument("--keep-intermediates", action="store_true",
                    help="Keep the masked genome, BLAST db, blast/ dir, and "
                         "full_length_ltr.bed (default: delete them after a "
@@ -152,19 +174,38 @@ def main():
         db_cmd.append("--force")
     run(db_cmd)
 
-    def do_blast(query, db):
+    def do_blast(query, db, *, min_pident, min_qcov, max_evalue):
+        # Push the path's downstream cutoffs into blastn so the on-disk TSV is
+        # bounded to ~survivors (disk analogue of the streaming RAM prefilter).
+        # --loose-blast restores one permissive blast for filter sweeps.
+        if args.loose_blast:
+            evalue, perc_id, qcov_hsp = args.evalue, None, None
+        else:
+            ev, perc_id, qcov_hsp = core.blast_prefilter(
+                min_pident, min_qcov, max_evalue)
+            evalue = f"{ev:.3e}"
         cmd = [sys.executable, str(SEARCH), "blast",
                "--query", query, "--db", str(db), "--out-dir", str(blast_dir),
                "--task", args.task, "--word-size", str(args.word_size),
-               "--dust", args.dust, "--evalue", str(args.evalue),
-               "--threads", str(args.threads)]
+               "--dust", args.dust, "--evalue", str(evalue),
+               "--threads", str(args.threads),
+               "--chunk-threads", str(args.chunk_threads)]
+        if perc_id is not None:
+            cmd += ["--perc-identity", str(perc_id)]
+        if qcov_hsp is not None and qcov_hsp > 0:
+            cmd += ["--qcov-hsp-perc", str(qcov_hsp)]
         if args.force:
             cmd.append("--force")
         out = subprocess.check_output([str(x) for x in cmd]).decode().strip().splitlines()
         return out[-1]  # last line = path
 
-    cons_tsv = do_blast(args.consensus, masked)
-    int_tsv = do_blast(args.internal, masked)
+    cons_tsv = do_blast(args.consensus, masked,
+                        min_pident=args.min_pident, min_qcov=args.min_qcov_hsp,
+                        max_evalue=args.max_evalue)
+    int_tsv = do_blast(args.internal, masked,
+                       min_pident=args.int_min_pident,
+                       min_qcov=args.int_min_qcov_hsp,
+                       max_evalue=args.int_max_evalue)
 
     # 3. filter
     log("stage 3/3: TSD + internal filter")
@@ -203,7 +244,10 @@ def main():
             db_cmd.append("--force")
         run(db_cmd)
 
-        nested_tsv = do_blast(args.consensus, internal_db)
+        nested_tsv = do_blast(args.consensus, internal_db,
+                              min_pident=args.nested_min_pident,
+                              min_qcov=args.min_qcov_hsp,
+                              max_evalue=args.max_evalue)
 
         # restrict orientation detection to subjects that actually got a hit
         hit_ids = set()

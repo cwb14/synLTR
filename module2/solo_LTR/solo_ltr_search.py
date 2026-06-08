@@ -35,6 +35,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 # Custom outfmt-6 columns: enough for full filtering + divergence downstream.
@@ -236,36 +237,54 @@ def chunk_query_by_length(query_fa, n_chunks, out_dir):
     return [p for p in paths if os.path.getsize(p) > 0]
 
 
-def _run_blast_chunks(args, chunks, scratch, tmp_path):
-    """Run one blastn per chunk concurrently, then concatenate -> tmp_path.
+def _run_blast_chunks(args, chunks, scratch, tmp_path, n_workers):
+    """Run blastn over the query chunks through a dynamic pool, concat -> tmp_path.
 
-    blastn's own -num_threads parallelism plateaus well below a many-core host's
-    capacity; splitting the query and running (threads // chunk-threads)
-    processes against the shared DB uses the cores it leaves idle. Results are
-    identical to a single blast (same query, DB, params -- only HSP line order
-    differs, which the order-independent downstream filter ignores).
+    A bounded pool of n_workers concurrent blastn processes (chunk-threads each)
+    pulls from a shared queue of chunks: the moment a chunk finishes, its worker
+    grabs the next pending chunk, so every worker stays busy until the queue
+    drains -- no core idles waiting on a straggler. With more chunks than workers
+    (see --chunk-oversub) the unavoidable tail shrinks to a single small chunk
+    instead of the slowest of n_workers fat ones. blastn runtime tracks hit count,
+    not bp, so it is this dynamic pull -- not the bp-balanced split -- that
+    actually balances load; chunks are merely submitted largest-first so the big
+    ones start early (longest-processing-time scheduling) and the last thing
+    running is small.
+
+    Results are identical to a single blast (same query, DB, params -- only HSP
+    line order differs, which the order-independent downstream filter ignores).
     """
-    log(f"blastn x{len(chunks)} chunks ({args.chunk_threads} threads each) "
-        f"-> {tmp_path.with_suffix('')}")
-    procs = []
-    for i, chunk in enumerate(chunks):
-        cout = Path(scratch) / f"part_{i}.tsv"
-        cerr = open(Path(scratch) / f"part_{i}.err", "w")
+    # Largest-first submission (LPT): start the slow chunks before the fast ones.
+    chunks = sorted(chunks, key=os.path.getsize, reverse=True)
+    log(f"blastn pool: {len(chunks)} chunks across {n_workers} workers "
+        f"({args.chunk_threads} thread(s) each) -> {tmp_path.with_suffix('')}")
+
+    def run_one(idx, chunk):
+        cout = Path(scratch) / f"part_{idx}.tsv"
+        cerr_path = Path(scratch) / f"part_{idx}.err"
         cmd = build_blast_cmd(args, chunk, cout, args.chunk_threads)
-        p = subprocess.Popen([str(x) for x in cmd], stderr=cerr)
-        procs.append((p, cerr, cmd, cout))
-    failure = None
-    for p, cerr, cmd, cout in procs:
-        rc = p.wait()
-        cerr.close()
-        if rc != 0 and failure is None:
-            failure = (rc, cmd, Path(cerr.name).read_text()[-2000:])
-    if failure is not None:
-        rc, cmd, err = failure
-        raise SystemExit(f"blast chunk failed (rc={rc}): {cmd}\n{err}")
+        with open(cerr_path, "w") as cerr:
+            rc = subprocess.call([str(x) for x in cmd], stderr=cerr)
+        if rc != 0:
+            raise SystemExit(
+                f"blast chunk failed (rc={rc}): {cmd}\n"
+                f"{cerr_path.read_text()[-2000:]}")
+        return cout
+
+    parts = [None] * len(chunks)
+    ex = ThreadPoolExecutor(max_workers=n_workers)
+    try:
+        futs = {ex.submit(run_one, i, c): i for i, c in enumerate(chunks)}
+        for fut in as_completed(futs):
+            parts[futs[fut]] = fut.result()  # re-raises a failed chunk's error
+    except BaseException:
+        ex.shutdown(wait=False, cancel_futures=True)  # drop the un-started chunks
+        raise
+    ex.shutdown(wait=True)
+
     with open(tmp_path, "wb") as out:
-        for _, _, _, cout in procs:
-            if os.path.exists(cout):
+        for cout in parts:
+            if cout is not None and os.path.exists(cout):
                 with open(cout, "rb") as src:
                     shutil.copyfileobj(src, out)
 
@@ -286,22 +305,26 @@ def cmd_blast(args):
     # Write to a .tmp then atomic-rename: a partial file (interrupted run,
     # or a reader checking mid-run) never looks like a complete cache entry.
     tmp_path = out_path.with_suffix(out_path.suffix + ".tmp")
-    # Auto: as many length-balanced query chunks as fit the thread budget.
-    n_chunks = max(1, args.threads // max(1, args.chunk_threads))
+    # One worker per (chunk-threads) slice of the thread budget; each worker is a
+    # blastn process. Over-decompose the query into chunk-oversub x more chunks
+    # than workers so a finished worker always has queued work to pull -- the
+    # straggler tail collapses to one small chunk (see _run_blast_chunks).
+    n_workers = max(1, args.threads // max(1, args.chunk_threads))
 
-    if n_chunks <= 1:
+    if n_workers <= 1:
         log(f"blastn -> {out_path}")
         run(build_blast_cmd(args, args.query, tmp_path, args.threads))
         os.replace(tmp_path, out_path)
     else:
+        n_chunks = n_workers * max(1, args.chunk_oversub)
         scratch = tempfile.mkdtemp(prefix="blastchunk_", dir=str(out_path.parent))
         try:
             chunks = chunk_query_by_length(args.query, n_chunks, scratch)
             if len(chunks) <= 1:  # query too small to split usefully
-                log(f"blastn (query < {n_chunks} records, not chunked) -> {out_path}")
+                log(f"blastn (query < 2 chunks, not chunked) -> {out_path}")
                 run(build_blast_cmd(args, args.query, tmp_path, args.threads))
             else:
-                _run_blast_chunks(args, chunks, scratch, tmp_path)
+                _run_blast_chunks(args, chunks, scratch, tmp_path, n_workers)
             os.replace(tmp_path, out_path)
         finally:
             shutil.rmtree(scratch, ignore_errors=True)
@@ -364,12 +387,21 @@ def main():
                     help="Extra blastn flags as one string (e.g. for dc-megablast templates)")
     pb.add_argument("--threads", type=int, default=8)
     pb.add_argument("--chunk-threads", type=int, default=4,
-                    help="Threads per blastn process when query-chunking. The "
-                         "query is split into (threads // chunk-threads) "
-                         "length-balanced chunks run concurrently against the "
+                    help="Threads per blastn process when query-chunking. Sets "
+                         "the worker count to (threads // chunk-threads): that "
+                         "many blastn processes run concurrently against the "
                          "shared DB, scaling past blastn's internal threading "
                          "ceiling on many-core hosts. Set >= --threads (or a "
                          "1-record query) to run a single blast.")
+    pb.add_argument("--chunk-oversub", type=int, default=16,
+                    help="Over-decomposition factor: split the query into "
+                         "(threads // chunk-threads) * chunk-oversub length-"
+                         "balanced chunks fed through a pool of (threads // "
+                         "chunk-threads) concurrent blastn workers. >1 lets a "
+                         "finished worker pull queued work instead of idling on "
+                         "a straggler, shrinking the tail to one small chunk. "
+                         "1 = one chunk per worker (static; the step ends with "
+                         "the single slowest chunk). Default 16.")
     pb.add_argument("--mt-mode", type=int, default=1,
                     help="1 = split by queries (best for many small queries vs big db)")
     pb.add_argument("--max-target-seqs", type=int, default=5000)

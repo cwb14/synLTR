@@ -39,6 +39,8 @@
 #     --ltrharvest5-args-from-round 1 "tesorter-rule=70-70-80"
 #     --ltrharvest5-args-from-round 3 "tesorter-rule=70-40-80"
 
+# In the dog genome, there are many false positves, I think due to abundant SINE pieces. We can
+
 set -euo pipefail
 
 # Print the exact command for reproducibility

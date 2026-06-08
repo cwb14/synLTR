@@ -103,11 +103,19 @@ def main():
                         "--max-evalue / --int-max-evalue so the TSV stays small.")
     p.add_argument("--threads", type=int, default=8)
     p.add_argument("--chunk-threads", type=int, default=4,
-                   help="Threads per blastn process; the query is split into "
-                        "(threads // chunk-threads) length-balanced chunks run "
+                   help="Threads per blastn process; the worker count is "
+                        "(threads // chunk-threads) blastn processes run "
                         "concurrently against the shared DB, scaling past "
                         "blastn's internal threading ceiling on many-core hosts. "
                         "Set >= --threads to run a single blast.")
+    p.add_argument("--chunk-oversub", type=int, default=16,
+                   help="Split the query into (threads // chunk-threads) * "
+                        "chunk-oversub length-balanced chunks fed through a pool "
+                        "of (threads // chunk-threads) blastn workers. >1 lets a "
+                        "finished worker pull queued work instead of idling on a "
+                        "straggler, so the step ends with one small chunk rather "
+                        "than the single slowest of one-chunk-per-worker. "
+                        "1 = static one chunk per worker. Default 16.")
 
     # filter params (defaults = benchmark F1 optimum: F1=0.581, P=0.95, R=0.42)
     # High-precision alternative: --min-qcov-hsp 95  (F1=0.580, P=0.97, 2 FP)
@@ -189,7 +197,8 @@ def main():
                "--task", args.task, "--word-size", str(args.word_size),
                "--dust", args.dust, "--evalue", str(evalue),
                "--threads", str(args.threads),
-               "--chunk-threads", str(args.chunk_threads)]
+               "--chunk-threads", str(args.chunk_threads),
+               "--chunk-oversub", str(args.chunk_oversub)]
         if perc_id is not None:
             cmd += ["--perc-identity", str(perc_id)]
         if qcov_hsp is not None and qcov_hsp > 0:

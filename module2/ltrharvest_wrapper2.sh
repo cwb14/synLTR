@@ -39,7 +39,16 @@
 #     --ltrharvest5-args-from-round 1 "tesorter-rule=70-70-80"
 #     --ltrharvest5-args-from-round 3 "tesorter-rule=70-40-80"
 
-# In the dog genome, there are many false positves, I think due to abundant SINE pieces. We can
+# In the dog genome, this pipeline identifies many false positves, I think due to high abundant SINE pieces.
+# Maybe the easiest way to filter them is using a Kmer2LTR clustering approach, similar to as is done with "ltr_cluster_phylo.py". 
+# Ie, We can cluster consensus LTRs (as is already implemented) and also cluster internal sequences. 
+#     We can compare the consensus LTR clusters (We consider these to be families) to the internal clusters.
+#     Internal sequences from large true positive families should cluster with their family with some frequency.
+#     Internal seuqences from large false positive families will likely form many singletons, or cluster elsewhere.
+# Also, maybe a LTR-RT size-based filter could do it. 
+# Ie, True positive families will likely form a dense peak of LTR-RT sizes, while false positive families are probably quite disperse, LTR-RT size-wise. 
+# Its simple enough to edit PrinTE to drop some high-frequency repeat into intergenic space. 
+# I should implement a corrective approach to eliminate false positives from genomes with high-abundant non-LTR-RT repeats, like SINE, DNA repeats, and low-complexity repeats and use PrinTE to benchmark my implementation. 
 
 set -euo pipefail
 

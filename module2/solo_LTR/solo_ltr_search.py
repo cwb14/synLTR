@@ -215,25 +215,49 @@ def _iter_fasta(path):
 
 
 def chunk_query_by_length(query_fa, n_chunks, out_dir):
-    """Bin-pack query records into <= n_chunks FASTA files balanced by total bp.
+    """Split query records into <= n_chunks FASTA files, ~balanced by total bp.
 
-    Online greedy: each record is appended to the currently-lightest bin in a
-    single streaming pass (one record held at a time -- no whole-library load),
-    which keeps the parallel blastn processes finishing at about the same time
-    instead of one straggler holding up the rest. Empty bins (when records <
-    n_chunks) are dropped. Returns the list of non-empty chunk paths.
+    Streaming fill, ONE open handle at a time: a first pass sums the query
+    length, then a second pass fills the current chunk to ~(total_bp / n_chunks)
+    before closing it and opening the next. Only a single chunk file is ever
+    open, so the chunk count -- (threads // chunk-threads) * chunk-oversub -- can
+    be arbitrarily large without approaching the process file-descriptor limit.
+    (Opening all n_chunks handles at once was the cause of an earlier
+    "OSError: Too many open files" crash when n_chunks exceeded `ulimit -n`.)
+
+    The dynamic largest-first blast pool (_run_blast_chunks) does the actual
+    load balancing across workers, so contiguous bp-balanced chunks are as
+    effective here as a global bin-pack, and a single record larger than the
+    target simply becomes its own (oversized) chunk. One record is held in
+    memory at a time; the query library (not the genome) is read twice, which is
+    negligible beside the blastn that follows. Returns the non-empty chunk paths
+    (no empty chunk is ever created, so the result has no gaps to filter).
     """
-    paths = [os.path.join(out_dir, f"chunk_{i}.fa") for i in range(n_chunks)]
-    handles = [open(p, "w") for p in paths]
-    loads = [0] * n_chunks
+    total_bp = sum(len(seq) for _h, seq in _iter_fasta(query_fa))
+    if total_bp == 0:
+        return []
+    target = max(1, -(-total_bp // n_chunks))  # ceil(total_bp / n_chunks)
+    paths = []
+    fh = None
+    cur_bp = 0
     try:
         for header, seq in _iter_fasta(query_fa):
-            i = loads.index(min(loads))
-            handles[i].write(f"{header}\n{seq}\n")
-            loads[i] += len(seq)
+            # Start a new chunk when the current one is non-empty and adding this
+            # record would overshoot the target -- unless we have already opened
+            # the full n_chunks budget, in which case keep filling the last one.
+            if fh is None or (cur_bp > 0 and cur_bp + len(seq) > target
+                              and len(paths) < n_chunks):
+                if fh is not None:
+                    fh.close()
+                p = os.path.join(out_dir, f"chunk_{len(paths)}.fa")
+                fh = open(p, "w")
+                paths.append(p)
+                cur_bp = 0
+            fh.write(f"{header}\n{seq}\n")
+            cur_bp += len(seq)
     finally:
-        for h in handles:
-            h.close()
+        if fh is not None:
+            fh.close()
     return [p for p in paths if os.path.getsize(p) > 0]
 
 

@@ -34,10 +34,10 @@ sweeps.
 Defaults are the grid-search F1 optimum on the PrinTE benchmark
 (blastn word_size 11, pident>=85, qcov>=95, TSD 5bp slop 2, internal flank 25).
 
-# A thought: 
+# A thought:
   I can Blast the flanking sequence of the candidate solo-LTRs against the flanking of all other candidates, similarly to the internal blast.
-  The flanking sequence of true solo-LTRs should be unique. 
-  Imagine a genome full of SINEs (formatted '[SINE_tRNA][SINE_tail]'). 
+  The flanking sequence of true solo-LTRs should be unique.
+  Imagine a genome full of SINEs (formatted '[SINE_tRNA][SINE_tail]').
   Adjacent SINEs will sometimes be falsely labeled as LTR-RT (eg, '[SINE_tRNA][SINE_tail][intergenic][SINE_tRNA][SINE_tail]' instead of '[LTR][internal][LTR]').
   LTRharvest may have erroneously caught a fragment ([SINE_tRNA]) as LTR or it may have caught the whole thing ([SINE_tRNA][SINE_tail]).
   If the candidate solo-LTR is the fragment ('[SINE_tRNA]') then the flanks would contain [SINE_tail]. So, if I blast those flanks agains each other and see matches, its likely [SINE_tail], indicating a false positive. 
@@ -230,16 +230,14 @@ def main():
     # 3. filter
     log("stage 3/3: TSD + internal filter")
     genome = core.load_genome(args.genome)
-    # Streaming prefilter at load time (bounds memory by survivors, not file
-    # size): pass each path's own downstream thresholds so a genome-scale,
-    # multi-TB BLAST TSV is never held whole in RAM. Lossless -- make_candidates
-    # / filter_internal apply the identical cutoffs.
+    # Consensus hits become the solo-LTR calls, so they're held as HSPs -- but
+    # streamed with the path's downstream thresholds at load time (bounds memory
+    # by survivors, not file size; lossless -- make_candidates applies the same
+    # cutoffs). The internal BLAST, used only as a coverage mask, is handled
+    # separately below without ever materializing its HSPs.
     cons = core.load_blast(
         cons_tsv, min_pident=args.min_pident, min_qcov=args.min_qcov_hsp,
         min_length=args.min_length, max_evalue=args.max_evalue)
-    intn = core.load_blast(
-        int_tsv, min_pident=args.int_min_pident, min_qcov=args.int_min_qcov_hsp,
-        min_length=args.int_min_length, max_evalue=args.int_max_evalue)
     cands = core.make_candidates(
         cons, genome,
         min_pident=args.min_pident, min_qcov=args.min_qcov_hsp,
@@ -247,11 +245,17 @@ def main():
         use_tsd=not args.no_tsd, tsd_k=args.tsd_k, tsd_slop=args.tsd_slop,
         merge_slop=args.merge_slop)
     if not args.no_internal_filter:
-        cands = core.filter_internal(
-            cands, intn,
+        # Internal-region mask as a packed-bit genomic coverage track: bounds RAM
+        # to ~genome/8 bytes regardless of the (multi-TB on wheat) internal TSV
+        # size, vs the old load_blast() which held every HSP's btop in RAM and
+        # OOM-killed on maize. Lossless: drop_near_internal_cov reproduces the old
+        # prefilter_internal()+drop_near_internal() drops exactly.
+        genome_lengths = {c: len(s) for c, s in genome.items()}
+        int_cov = core.load_internal_coverage(
+            int_tsv, genome_lengths,
             min_pident=args.int_min_pident, min_qcov=args.int_min_qcov_hsp,
-            min_length=args.int_min_length, max_evalue=args.int_max_evalue,
-            flank=args.flank)
+            min_length=args.int_min_length, max_evalue=args.int_max_evalue)
+        cands = core.drop_near_internal_cov(cands, int_cov, args.flank)
 
     # 3b. nested (intra-LTR-RT) solo recovery: consensus vs internal FASTA
     if not args.no_nested:

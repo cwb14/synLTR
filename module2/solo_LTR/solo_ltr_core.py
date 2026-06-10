@@ -26,6 +26,8 @@ import math
 import re
 import sys
 
+import numpy as np
+
 # Tabular BLAST columns produced by solo_ltr_search.py
 BLAST_COLS = (
     "qseqid sseqid pident length qlen slen "
@@ -257,6 +259,61 @@ def blast_prefilter(min_pident, min_qcov, max_evalue, *,
 # --------------------------------------------------------------------------- #
 # BLAST loading
 # --------------------------------------------------------------------------- #
+class Coverage:
+    """Packed-bit genomic coverage mask: one bit per base, set if covered.
+
+    Memory is ceil(length/8) bytes, INDEPENDENT of how many intervals are
+    painted -- the bounded substitute for holding internal-region BLAST HSPs in
+    RAM (which reach terabytes on a repeat-rich, GB-scale genome). set_range and
+    any operate on half-open [a, b) base intervals and clamp to [0, length).
+    Bit p lives in byte p >> 3, bit position p & 7 (LSB-first within a byte).
+    """
+    __slots__ = ("n", "bits")
+
+    def __init__(self, length):
+        self.n = int(length)
+        self.bits = np.zeros((self.n + 7) // 8, dtype=np.uint8)
+
+    def set_range(self, a, b):
+        """Mark bases [a, b) covered (clamped to [0, n))."""
+        if a < 0:
+            a = 0
+        if b > self.n:
+            b = self.n
+        if a >= b:
+            return
+        ba, oa = a >> 3, a & 7
+        bb, ob = b >> 3, b & 7
+        if ba == bb:
+            self.bits[ba] |= ((1 << ob) - 1) ^ ((1 << oa) - 1)
+            return
+        self.bits[ba] |= (0xFF << oa) & 0xFF           # partial first byte
+        if bb > ba + 1:                                 # whole middle bytes
+            self.bits[ba + 1:bb] |= np.uint8(0xFF)
+        if ob:                                          # partial last byte
+            self.bits[bb] |= (1 << ob) - 1
+
+    def any(self, a, b):
+        """True iff any base in [a, b) is covered (clamped to [0, n))."""
+        if a < 0:
+            a = 0
+        if b > self.n:
+            b = self.n
+        if a >= b:
+            return False
+        ba, oa = a >> 3, a & 7
+        bb, ob = b >> 3, b & 7
+        if ba == bb:
+            return bool(self.bits[ba] & (((1 << ob) - 1) ^ ((1 << oa) - 1)))
+        if self.bits[ba] & ((0xFF << oa) & 0xFF):
+            return True
+        if bb > ba + 1 and bool(self.bits[ba + 1:bb].any()):
+            return True
+        if ob and (self.bits[bb] & ((1 << ob) - 1)):
+            return True
+        return False
+
+
 def load_blast(path, *, min_pident=0.0, min_qcov=0.0, min_length=0,
                max_evalue=float("inf")):
     """Parse tabular BLAST -> dict chrom -> list of HSP (main path; host=None).
@@ -310,6 +367,62 @@ def load_blast(path, *, min_pident=0.0, min_qcov=0.0, min_length=0,
             f"were too narrow ({len(BLAST_COLS)} cols expected) -- stale/"
             f"incompatible BLAST cache? re-run with --force\n")
     return by
+
+
+def load_internal_coverage(path, genome_lengths, *, min_pident=0.0, min_qcov=0.0,
+                           min_length=0, max_evalue=float("inf")):
+    """Stream an (internal-region vs masked-genome) tabular BLAST -> dict
+    chrom -> Coverage.
+
+    The internal filter only needs to know which genomic bases a surviving
+    internal HSP covers, never the HSP records. So we paint covered bases into a
+    per-chromosome packed-bit Coverage mask while reading, applying the SAME
+    cutoffs as prefilter_internal()/make_candidates(). Peak memory is bounded by
+    the genome (one bit/base), NOT the file size -- the internal TSV can be
+    terabytes (a 16 Gb wheat genome's would be) and this stays ~genome/8 bytes.
+
+    Subject coords are genomic (subject = the masked genome), mapped
+    (s0, e1) = (min(sstart,send) - 1, max(sstart,send)) -- 0-based half-open,
+    exactly as load_blast() maps them. Rows whose sseqid is absent from
+    genome_lengths are skipped (defensive). Lossless w.r.t. the old
+    load_blast()+filter_internal() path (certified by test_internal_coverage.py).
+    """
+    cov = {}
+    n_lines = n_narrow = 0
+    ncols = len(BLAST_COLS)
+    with open(path) as fh:
+        for line in fh:
+            if not line or line[0] == "#":
+                continue
+            n_lines += 1
+            f = line.rstrip("\n").split("\t")
+            if len(f) < ncols:
+                n_narrow += 1
+                continue
+            pident = float(f[COL["pident"]])
+            qcovhsp = float(f[COL["qcovhsp"]])
+            length = int(f[COL["length"]])
+            evalue = float(f[COL["evalue"]])
+            if (pident < min_pident or qcovhsp < min_qcov
+                    or length < min_length or evalue > max_evalue):
+                continue
+            chrom = f[COL["sseqid"]]
+            L = genome_lengths.get(chrom)
+            if L is None:
+                continue
+            s = int(f[COL["sstart"]]); e = int(f[COL["send"]])
+            if s > e:
+                s, e = e, s
+            c = cov.get(chrom)
+            if c is None:
+                c = cov[chrom] = Coverage(L)
+            c.set_range(s - 1, e)
+    if n_lines and n_narrow == n_lines:
+        sys.stderr.write(
+            f"[solo_ltr_core] WARNING: {path} had {n_lines} data lines but all "
+            f"were too narrow ({ncols} cols expected) -- stale/incompatible "
+            f"BLAST cache? re-run with --force\n")
+    return cov
 
 
 def load_internal_blast(path, orient_map, *, min_pident=0.0, min_qcov=0.0,
@@ -511,6 +624,27 @@ def drop_near_internal(cands, internal, flank):
             if not near:
                 keep.append(c)
         out[chrom] = keep
+    return out
+
+
+def drop_near_internal_cov(cands, coverage, flank):
+    """Coverage analogue of drop_near_internal.
+
+    Drops a Candidate [cs, ce) iff any internal-covered base lies within `flank`
+    bp -- i.e. in [cs - flank - 1, ce + flank + 1). That window reproduces
+    drop_near_internal's `gap <= flank` rule EXACTLY (derivation in the design
+    doc; the equivalence is pinned by test_internal_coverage.py). Chroms with no
+    Coverage keep all their candidates, matching drop_near_internal's behaviour
+    for chroms with no internal intervals.
+    """
+    out = {}
+    for chrom, arr in cands.items():
+        cov = coverage.get(chrom)
+        if cov is None:
+            out[chrom] = list(arr)
+            continue
+        out[chrom] = [c for c in arr
+                      if not cov.any(c.start - flank - 1, c.end + flank + 1)]
     return out
 
 

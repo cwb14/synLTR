@@ -33,6 +33,17 @@ sweeps.
 
 Defaults are the grid-search F1 optimum on the PrinTE benchmark
 (blastn word_size 11, pident>=85, qcov>=95, TSD 5bp slop 2, internal flank 25).
+
+# A thought: 
+  I can Blast the flanking sequence of the candidate solo-LTRs against the flanking of all other candidates, similarly to the internal blast.
+  The flanking sequence of true solo-LTRs should be unique. 
+  Imagine a genome full of SINEs (formatted '[SINE_tRNA][SINE_tail]'). 
+  Adjacent SINEs will sometimes be falsely labeled as LTR-RT (eg, '[SINE_tRNA][SINE_tail][intergenic][SINE_tRNA][SINE_tail]' instead of '[LTR][internal][LTR]').
+  LTRharvest may have erroneously caught a fragment ([SINE_tRNA]) as LTR or it may have caught the whole thing ([SINE_tRNA][SINE_tail]).
+  If the candidate solo-LTR is the fragment ('[SINE_tRNA]') then the flanks would contain [SINE_tail]. So, if I blast those flanks agains each other and see matches, its likely [SINE_tail], indicating a false positive. 
+  If the whole thing ([SINE_tRNA][SINE_tail]) is labeled as solo-LTR, then this approach wont work and it may be harder to find.
+  Im thinking of the dog genome where many false positive LTR-RTs are fragments of SINEs.
+  Probably easier to filter these out at the LTR-RT annotation step than the solo-step.
 """
 import argparse
 import glob

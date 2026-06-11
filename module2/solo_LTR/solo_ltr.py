@@ -44,6 +44,20 @@ Defaults are the grid-search F1 optimum on the PrinTE benchmark
   If the whole thing ([SINE_tRNA][SINE_tail]) is labeled as solo-LTR, then this approach wont work and it may be harder to find.
   Im thinking of the dog genome where many false positive LTR-RTs are fragments of SINEs.
   Probably easier to filter these out at the LTR-RT annotation step than the solo-step.
+
+In maize, this pipeline identifies zero non-nested soloLTRs and 23,405 nested solo-LTRs. 
+
+Non-nest identification may be too strict. Spitballing a stringency fix:
+We could loosen by requiring the flanking sequence to be of the same family as the candidate solo. Currently, any internal alignments within 25bp are enough to filter.  
+
+Nested may be too lenient. Spitballing a stringency fix:
+A real nested solo-LTR is an extra piece of DNA that dropped into one copy of an LTR-RT — so other copies of that same LTR-RT shouldn't have it. 
+Use that to check each candidate: find the host element it's sitting in, then compare against other copies of that same element family (or the family's consensus sequence). 
+If those other copies have a clean, continuous internal region with no LTR at that spot, the candidate is a real insertion — keep it. 
+If the other copies also have that LTR there, then it's just a normal part of that element, not an insertion — drop it as a false positive. 
+In a family, some may also have the solo-, but some should definitely only have the flanks.
+
+Probably target Nested being to lenient first and use PrinTE to benchmark the fix. 
 """
 import argparse
 import glob

@@ -1,26 +1,46 @@
 #!/usr/bin/env python3
 """
-plot.py
+ltrharvest_plot_struct.py
+
+Plot LTR-RT structure from the reconciler-era depth-bucketed outputs of
+ltrharvest_wrapper2.sh (ltrharvest5.py -> reconcile_nests.py). Protein domains
+and their genomic coordinates are embedded in the TSV's 'domains' column, so no
+separate GFF/SCN is needed; strand is inferred from the genomic order of domains.
 
 Usage:
-  python plot.py --tsv ltrrt.tsv --scn file.scn --gff hmm.gff --out_dir dir_name [--fai genome.fai] [--html]
-  python plot.py --scn <(awk '{if (NF>12) {for(i=1;i<=NF;i++) if(i!=NF-1) printf "%s%s",$i,(i==NF?"":" "); print ""} else print}' Col0_ltr_r1.work/Col0_ltr_r1.ltrfinder.stitched.scn) --gff   Col0_ltr_r1.work/Col0_ltr_r1.ltrtools.intact_for_tesorter.fa.rexdb-plant.dom.gff3 --tsv Col0_ltr_r1_kmer2ltr_dedup --out_dir plot_struct --fai ../Col0.fa.fai --html
+  # From a depth TSV directly:
+  python ltrharvest_plot_struct.py --tsv Aare_depth0_ltr.tsv --out_dir plot_struct \
+      [--genome Aare_At4.fa] [--html]
+
+  # Or by sample prefix (resolves <indir>/<prefix>_depth<depth>_ltr.tsv):
+  python ltrharvest_plot_struct.py --prefix Aare --depth 0 --out_dir plot_struct \
+      [--genome Aare_At4.fa] [--html]
+
+Inputs:
+  <prefix>_depth<N>_ltr.tsv   element table with an embedded 'domains' column.
+  <genome>.fa (optional)      indexed internally via 'samtools faidx' to enable
+                              the per-chromosome browser. The _depth<N>_ltr.fa
+                              and _r<N>.work directory are NOT needed.
+
 Outputs:
   <out_dir>/<safe_family>_average.pdf   (or embedded in HTML if --html)
   <out_dir>/<safe_family>_individual.pdf (or embedded in HTML if --html)
   <out_dir>/all_elements.pdf            (or embedded in HTML if --html)
-  <out_dir>/chrom_plots/<chrom>.html    (always HTML, if --fai provided)
+  <out_dir>/chrom_plots/<chrom>.html    (always HTML, if --genome provided)
   <out_dir>/index.html                  (if --html, master page with everything)
 
 Key features:
-- Strand-normalizes all elements for plotting/averaging (flips '-' into '+').
-- Auto-detects whether GFF coordinates are genomic or internal-to-element (shift vs no-shift).
+- Reads protein domains straight from the TSV 'domains' column (genomic coords).
+- Infers element strand from domain order and normalizes all elements 5'->3'
+  (flips '-' into '+') for plotting/averaging.
 - Average plots EXCLUDE rare proteins unless present in >= --min_presence fraction of elements.
 - Individual plots always show ALL proteins for each element.
 - Average plots include whiskers showing 95% CI for start/end of each feature (bootstrap CI).
 - Per-chromosome positional plots are interactive IGV-like HTML viewers.
 - Prints per-family summary stats + 95% CI to terminal.
 - Flags potential false positives: elements with outlier-long lengths that lack expected proteins.
+
+python synLTR/module2/ltrharvest_plot_struct.py --prefix Athal --depth all --genome Athal.fa --out_dir Ahal_plot --nesting both
 """
 
 import argparse
@@ -31,6 +51,8 @@ import math
 import os
 import re
 import random
+import shutil
+import subprocess
 from dataclasses import dataclass, field
 from typing import Dict, List, Tuple, Optional, Set
 
@@ -81,6 +103,14 @@ class Feature:
 
 
 @dataclass
+class Insertion:
+    child_key: str          # 'chrom:start-end' of the nested child element
+    start: int              # element-relative, 1-based inclusive
+    end: int
+    child_family: str = "?" # resolved from the pool later ('superfamily/family')
+
+
+@dataclass
 class Element:
     element_id: str
     chrom: str
@@ -91,16 +121,29 @@ class Element:
     cls: str
     superfamily: str
     family: str
-    shift: int = 0
     ltr_len_raw: int = 0   # column 2 of TSV (LTR_LEN)
     aln_len_raw: int = 0   # column 3 of TSV (ALN_LEN)
 
     strand: str = "?"
-    strand_counts: Dict[str, int] = field(default_factory=lambda: {"+": 0, "-": 0})
+
+    # Domains parsed from the TSV 'domains' column, in GENOMIC coords:
+    # list of (normalized_gene, genomic_start, genomic_end).
+    raw_domains: List[Tuple[str, int, int]] = field(default_factory=list)
 
     proteins: List[Feature] = field(default_factory=list)
 
     k2p: Optional[float] = None
+
+    # Reconciler nesting: raw 'nest_status' string + cross-depth links.
+    nest_raw: str = "."
+    depth: int = 0
+    insertions: List[Insertion] = field(default_factory=list)
+
+    # Collapsed (insertion-excised) representation, filled after strand
+    # normalization by attach_collapsed_all(). For leaves these equal
+    # length / proteins.
+    collapsed_length: int = 0
+    collapsed_proteins: List[Feature] = field(default_factory=list)
 
 
 # -----------------------------
@@ -355,11 +398,14 @@ def detect_false_positives(
     if n < min_family_size:
         return flagged  # too few for outlier analysis, return dubious flags only
 
-    lengths = sorted(float(e.length) for e in fam_elements)
+    # Use collapsed (insertion-excised) length so a legitimate host is not
+    # flagged as "outlier-long" merely because another element nested into it.
+    # For leaves collapsed_length == length, so single-depth behavior is unchanged.
+    lengths = sorted(float(e.collapsed_length) for e in fam_elements)
     upper_fence = _compute_upper_fence(lengths, n, iqr_mul=iqr_mul)
 
     # Identify outlier-long elements
-    outlier_long = [e for e in fam_elements if e.length > upper_fence]
+    outlier_long = [e for e in fam_elements if e.collapsed_length > upper_fence]
     if not outlier_long:
         return flagged
 
@@ -463,6 +509,13 @@ def parse_tsv(tsv_path: str) -> Dict[str, Element]:
             sup = class_bits[1] if len(class_bits) > 1 else "NA"
             fam = class_bits[2] if len(class_bits) > 2 else "NA"
 
+            # Domains embedded in the reconciler TSV live in the second-to-last
+            # column ('gene|clade@gStart-gEnd;...', genomic coords). Read from the
+            # end to survive the benign header/data column-count mismatch; the
+            # regex in parse_domains_field rejects any non-domain field safely.
+            raw_domains = parse_domains_field(parts[-2]) if len(parts) >= 3 else []
+            nest_raw = parts[-1].strip() if len(parts) >= 3 and parts[-1].strip() else "."
+
             element_id = elem_part
             if element_id in elements:
                 continue
@@ -480,44 +533,104 @@ def parse_tsv(tsv_path: str) -> Dict[str, Element]:
                 k2p=k2p,
                 ltr_len_raw=ltr1,
                 aln_len_raw=ltr2,
+                raw_domains=raw_domains,
+                nest_raw=nest_raw,
             )
 
     print(f"[INFO] TSV loaded: {len(elements)} elements")
     return elements
 
 
-def parse_scn(scn_path: str) -> Dict[str, int]:
-    shifts: Dict[str, int] = {}
-    print(f"[INFO] Reading SCN: {scn_path}")
+def resolve_depth_files(tsv: Optional[str], prefix: Optional[str], indir: str,
+                        depth) -> List[Tuple[str, int]]:
+    """Return [(path, depth_int)] to LOAD into the pool. Always loads every
+    available depth for a prefix (so hosts can resolve their children across
+    depths); the caller applies the focus filter afterward. For --tsv, globs
+    sibling *_depth<N>_ltr.tsv files when the name matches, else loads that file
+    alone at depth 0."""
+    import glob
+    files: List[Tuple[str, int]] = []
+    if prefix:
+        pat = os.path.join(indir, f"{prefix}_depth*_ltr.tsv")
+        for p in sorted(glob.glob(pat)):
+            m = re.search(r"_depth(\d+)_ltr\.tsv$", os.path.basename(p))
+            if m:
+                files.append((p, int(m.group(1))))
+    else:
+        m = re.search(r"_depth(\d+)_ltr\.tsv$", os.path.basename(tsv))
+        if m:
+            d0 = os.path.dirname(tsv) or "."
+            base = os.path.basename(tsv)[:m.start()]  # '<prefix>'
+            pat = os.path.join(d0, f"{base}_depth*_ltr.tsv")
+            for p in sorted(glob.glob(pat)):
+                mm = re.search(r"_depth(\d+)_ltr\.tsv$", os.path.basename(p))
+                if mm:
+                    files.append((p, int(mm.group(1))))
+        if not files:
+            files = [(tsv, 0)]
+    return files
 
-    with open(scn_path, "r", encoding="utf-8") as f:
-        for ln, line in enumerate(f, start=1):
-            line = line.strip()
-            if not line or line.startswith("#"):
-                continue
-            parts = re.split(r"\s+", line)
-            if len(parts) < 12:
-                continue
-            try:
-                s0 = int(parts[0])
-                e0 = int(parts[1])
-                shift = int(float(parts[5]))
-                chrom = parts[11]
-            except ValueError:
-                continue
 
-            element_id = f"{chrom}:{s0}-{e0}"
-            if element_id in shifts:
-                continue
-            shifts[element_id] = shift
-
-    print(f"[INFO] SCN loaded: {len(shifts)} element shifts")
-    return shifts
+def load_pool(files: List[Tuple[str, int]]) -> Dict[str, Element]:
+    """Parse every (path, depth) into one keyed pool, tagging each element's
+    depth. Keys already seen (an element appears in exactly one depth bucket) are
+    not overwritten."""
+    pool: Dict[str, Element] = {}
+    for path, d in files:
+        sub = parse_tsv(path)
+        for k, el in sub.items():
+            el.depth = d
+            if k not in pool:
+                pool[k] = el
+    print(f"[INFO] Pool loaded: {len(pool)} elements from {len(files)} depth file(s)")
+    return pool
 
 
-def extract_attr(col9: str, key: str) -> Optional[str]:
-    m = re.search(rf"(?:^|;){re.escape(key)}=([^;]+)", col9)
-    return m.group(1) if m else None
+def parse_domains_field(dom_field: str) -> List[Tuple[str, int, int]]:
+    """Parse the reconciler TSV 'domains' column into a list of
+    (normalized_gene, genomic_start, genomic_end).
+
+    Field format: 'gene|clade@gStart-gEnd;gene|clade@gStart-gEnd;...' or '.'.
+    Coordinates are genomic (they fall within the element interval). Any token
+    that does not match the 'gene|clade@start-end' shape is skipped, so passing
+    a non-domain column (e.g. a bare integer) safely yields no domains.
+    """
+    out: List[Tuple[str, int, int]] = []
+    if not dom_field or dom_field == ".":
+        return out
+    for tok in dom_field.split(";"):
+        tok = tok.strip()
+        if not tok:
+            continue
+        m = re.match(r"^([^|@]+)\|[^@]*@(\d+)-(\d+)$", tok)
+        if not m:
+            continue
+        gene = normalize_protein_name(m.group(1))
+        gs, ge = int(m.group(2)), int(m.group(3))
+        if ge < gs:
+            gs, ge = ge, gs
+        out.append((gene, gs, ge))
+    return out
+
+
+def parse_insertions(nest_raw: str) -> List[Tuple[str, str, int, int]]:
+    """Parse the 'nest_status' column, returning only nest-outer (child) links as
+    (child_key, chrom, gstart, gend). nest-inner links (host pointers) are ignored
+    here — they matter only for standalone/host classification, which the
+    presence of nest-outer tags already captures."""
+    out: List[Tuple[str, str, int, int]] = []
+    if not nest_raw or nest_raw == ".":
+        return out
+    for tok in nest_raw.split(";"):
+        tok = tok.strip()
+        if not tok.startswith("nest-outer:"):
+            continue
+        key = tok[len("nest-outer:"):]
+        m = re.match(r"^(.+):(\d+)-(\d+)$", key)
+        if not m:
+            continue
+        out.append((key, m.group(1), int(m.group(2)), int(m.group(3))))
+    return out
 
 
 def normalize_protein_name(raw: str) -> str:
@@ -536,175 +649,151 @@ def normalize_protein_name(raw: str) -> str:
     return p
 
 
-def parse_gff_domains(gff_path: str) -> List[Tuple[str, str, int, int, str]]:
-    out: List[Tuple[str, str, int, int, str]] = []
-    print(f"[INFO] Reading GFF: {gff_path}")
-
-    with open(gff_path, "r", encoding="utf-8") as f:
-        for ln, line in enumerate(f, start=1):
-            line = line.rstrip("\n")
-            if not line or line.startswith("#"):
-                continue
-            parts = line.split("\t")
-            if len(parts) < 9:
-                continue
-
-            strand = parts[6].strip()
-            if strand not in ("+", "-"):
-                strand = "?"
-
-            try:
-                gff_start = int(parts[3])
-                gff_end = int(parts[4])
-            except ValueError:
-                continue
-
-            attr = parts[8]
-            id_val = extract_attr(attr, "ID")
-            if not id_val:
-                continue
-
-            element_part = id_val.split("|", 1)[0].split(";", 1)[0]
-            if not re.match(r"^.+:\d+-\d+$", element_part):
-                continue
-
-            gene = extract_attr(attr, "gene")
-            if gene:
-                prot = normalize_protein_name(gene)
-            else:
-                tail = id_val.split(":")[-1]
-                tail = re.sub(r"^TY\d+-", "", tail, flags=re.IGNORECASE)
-                tail = re.sub(r"^TY3-", "", tail, flags=re.IGNORECASE)
-                tail = re.sub(r"^TY1-", "", tail, flags=re.IGNORECASE)
-                tail = re.sub(r"^.*-", "", tail)
-                prot = normalize_protein_name(tail)
-
-            out.append((element_part, prot, gff_start, gff_end, strand))
-
-    print(f"[INFO] GFF loaded: {len(out)} protein features")
-    return out
-
-
 # -----------------------------
-# Auto-detect GFF coordinate mode
+# Domain attachment & strand inference
 # -----------------------------
-def detect_gff_coordinate_mode(
-    elements: Dict[str, Element],
-    gff_feats: List[Tuple[str, str, int, int, str]],
-) -> str:
+# Canonical 5'->3' internal-domain order per superfamily, used to infer element
+# strand from the genomic order of domains (the reconciler TSV no longer stores
+# domain strand). INT sits in a different position for Copia vs Gypsy; for
+# unknown/other superfamilies we fall back to the order shared by both.
+_CANON_RANK_COPIA = {"GAG": 0, "PROT": 1, "INT": 2, "RT": 3, "RH": 4}
+_CANON_RANK_GYPSY = {"GAG": 0, "PROT": 1, "RT": 2, "RH": 3, "INT": 4}
+_CANON_RANK_CORE = {"GAG": 0, "PROT": 1, "RT": 2, "RH": 3}
+
+
+def infer_strand_from_domains(raw_domains: List[Tuple[str, int, int]],
+                              superfamily: str) -> str:
+    """Infer element strand ('+', '-', or '?') from the genomic order of its
+    domains relative to the canonical 5'->3' order for its superfamily.
+
+    Pairwise concordance vote: for each pair of canonically-ranked domain types
+    present, cast a '+' vote if their genomic order matches canonical order else
+    a '-' vote. Majority wins; a tie or fewer than two ranked domain types
+    yields '?' (the element is left unflipped downstream).
     """
-    Determine if GFF coordinates are:
-      'genomic'  — true genomic coordinates (fall within element start..end)
-      'internal' — internal-to-element (need shift to map into element coords)
-
-    Strategy: for each GFF feature that maps to a known element, check if the
-    GFF start..end falls within element.start..element.end.  If most do,
-    coordinates are genomic.  Otherwise, they are internal.
-    """
-    genomic_hits = 0
-    internal_hits = 0
-    tested = 0
-
-    for (eid, _prot, gs, ge, _strand) in gff_feats:
-        el = elements.get(eid)
-        if el is None:
-            continue
-        tested += 1
-        if tested > 5000:
-            break  # sample enough
-
-        # Check if GFF coords fall within [el.start, el.end]
-        if el.start <= gs <= el.end and el.start <= ge <= el.end:
-            genomic_hits += 1
-        else:
-            internal_hits += 1
-
-    if tested == 0:
-        print("[WARN] No GFF features matched TSV elements for coordinate-mode detection; defaulting to 'internal'.")
-        return "internal"
-
-    frac_genomic = genomic_hits / tested
-    if frac_genomic >= 0.8:
-        mode = "genomic"
+    sf = (superfamily or "").lower()
+    if sf == "copia":
+        rank = _CANON_RANK_COPIA
+    elif sf == "gypsy":
+        rank = _CANON_RANK_GYPSY
     else:
-        mode = "internal"
+        rank = _CANON_RANK_CORE
 
-    print(f"[INFO] GFF coordinate mode auto-detected: '{mode}' "
-          f"(tested={tested}, genomic_hits={genomic_hits} ({frac_genomic:.1%}), internal_hits={internal_hits})")
-    return mode
-
-
-# -----------------------------
-# Join TSV + SCN + GFF
-# -----------------------------
-def attach_shifts(elements: Dict[str, Element], shifts: Dict[str, int]) -> None:
-    hit = 0
-    for eid, el in elements.items():
-        if eid in shifts:
-            el.shift = shifts[eid]
-            hit += 1
-    print(f"[INFO] Shift attachment: matched {hit}/{len(elements)} TSV elements to SCN shifts")
-
-
-def attach_proteins_and_strand(
-    elements: Dict[str, Element],
-    gff_feats: List[Tuple[str, str, int, int, str]],
-    coord_mode: str,
-) -> None:
-    """
-    coord_mode: 'genomic' or 'internal'
-
-    If 'genomic', GFF coords are true genomic — convert to element-relative by
-    subtracting element.start (no shift needed).
-
-    If 'internal', GFF coords are internal and need el.shift applied, then
-    converted to element-relative.
-    """
-    matched = 0
-    unmatched = 0
-
-    for (eid, prot, gs, ge, strand) in gff_feats:
-        el = elements.get(eid)
-        if el is None:
-            unmatched += 1
+    # One representative genomic start per ranked domain type (the 5'-most copy).
+    pos: Dict[str, int] = {}
+    for gene, gs, _ge in raw_domains:
+        if gene not in rank:
             continue
+        if gene not in pos or gs < pos[gene]:
+            pos[gene] = gs
 
-        if strand in ("+", "-"):
-            el.strand_counts[strand] = el.strand_counts.get(strand, 0) + 1
+    if len(pos) < 2:
+        return "?"
 
-        if coord_mode == "genomic":
-            # GFF coords are genomic; convert to element-relative [1..length]
+    genes = list(pos.keys())
+    plus = minus = 0
+    for i in range(len(genes)):
+        for j in range(i + 1, len(genes)):
+            gi, gj = genes[i], genes[j]
+            if rank[gi] == rank[gj] or pos[gi] == pos[gj]:
+                continue
+            if (rank[gi] < rank[gj]) == (pos[gi] < pos[gj]):
+                plus += 1
+            else:
+                minus += 1
+    if plus > minus:
+        return "+"
+    if minus > plus:
+        return "-"
+    return "?"
+
+
+def _canon_rank_for(superfamily: str) -> Dict[str, int]:
+    sf = (superfamily or "").lower()
+    if sf == "copia":
+        return _CANON_RANK_COPIA
+    if sf == "gypsy":
+        return _CANON_RANK_GYPSY
+    return _CANON_RANK_CORE
+
+
+def infer_strand_from_position(proteins: List[Feature], superfamily: str,
+                               length: int) -> str:
+    """Fallback strand inference for elements with exactly ONE ranked domain type
+    (order-based inference needs >=2). Compares the domain's fractional position
+    within the element (genomic orientation, pre-flip) to its canonical expected
+    fraction; if they fall on opposite sides of mid-element the element is
+    reversed. Central-expected domains (expected frac == 0.5) carry no signal and
+    yield '?'. `proteins` are element-relative, 1-based, pre-flip.
+    """
+    rank = _canon_rank_for(superfamily)
+    maxr = max(rank.values()) if rank else 0
+    ranked = [p for p in proteins if p.name in rank]
+    names = set(p.name for p in ranked)
+    if len(names) != 1 or maxr == 0:
+        return "?"
+    g = next(iter(names))
+    expected = rank[g] / maxr
+    if abs(expected - 0.5) < 1e-9:
+        return "?"
+    centers = [(p.start + p.end) / 2.0 for p in ranked]
+    observed = (sum(centers) / len(centers)) / max(1, length)
+    if abs(observed - 0.5) < 1e-9:
+        return "+"   # domain at exact midpoint carries no strand signal -> no flip
+    exp_side = 1 if expected > 0.5 else -1
+    obs_side = 1 if observed > 0.5 else -1
+    return "-" if exp_side != obs_side else "+"
+
+
+def attach_domains_and_infer_strand(elements: Dict[str, Element]) -> None:
+    """Convert each element's genomic domains to element-relative Features, parse
+    nested-child insertions, and infer strand. Strand comes from domain order;
+    when that is ambiguous ('?') and the element has a single ranked domain, a
+    positional fallback (edit 4) is used. Strand normalization (flipping '-'
+    elements to a common 5'->3' orientation) happens later in
+    normalize_all_elements_strand().
+    """
+    n_plus = n_minus = n_unknown = 0
+    n_feats = 0
+    n_pos_rescued = 0
+    n_ins = 0
+    for el in elements.values():
+        feats: List[Feature] = []
+        for gene, gs, ge in el.raw_domains:
             rel_s = gs - el.start + 1
             rel_e = ge - el.start + 1
+            feats.append(Feature(gene, int(rel_s), int(rel_e)).clamp(1, el.length))
+            n_feats += 1
+        el.proteins = feats
+
+        el.strand = infer_strand_from_domains(el.raw_domains, el.superfamily)
+        if el.strand == "?":
+            pos = infer_strand_from_position(el.proteins, el.superfamily, el.length)
+            if pos != "?":
+                el.strand = pos
+                n_pos_rescued += 1
+
+        if el.strand == "+":
+            n_plus += 1
+        elif el.strand == "-":
+            n_minus += 1
         else:
-            # Internal coords: apply shift then convert
-            adj_start = gs + el.shift
-            adj_end = ge + el.shift
-            rel_s = adj_start - el.start + 1
-            rel_e = adj_end - el.start + 1
+            n_unknown += 1
 
-        feat = Feature(prot, int(rel_s), int(rel_e)).clamp(1, el.length)
-        el.proteins.append(feat)
-        matched += 1
+        ins: List[Insertion] = []
+        for child_key, _chrom, gs, ge in parse_insertions(el.nest_raw):
+            rel_s = max(1, min(gs - el.start + 1, el.length))
+            rel_e = max(1, min(ge - el.start + 1, el.length))
+            if rel_e < rel_s:
+                rel_s, rel_e = rel_e, rel_s
+            ins.append(Insertion(child_key=child_key, start=int(rel_s), end=int(rel_e)))
+            n_ins += 1
+        el.insertions = ins
 
-    print(f"[INFO] Protein attachment ({coord_mode} mode): matched {matched} GFF features; unmatched={unmatched}")
-
-    # decide strand
-    plus_major = minus_major = unknown = 0
-    for el in elements.values():
-        p = el.strand_counts.get("+", 0)
-        m = el.strand_counts.get("-", 0)
-        if p == 0 and m == 0:
-            el.strand = "?"
-            unknown += 1
-        elif p >= m:
-            el.strand = "+"
-            plus_major += 1
-        else:
-            el.strand = "-"
-            minus_major += 1
-
-    print(f"[INFO] Strand inference: +={plus_major}, -={minus_major}, ?={unknown}")
+    print(f"[INFO] Domains attached: {n_feats} features across {len(elements)} elements")
+    print(f"[INFO] Strand inferred: +={n_plus}, -={n_minus}, ?={n_unknown} "
+          f"(single-domain positional rescues: {n_pos_rescued})")
+    print(f"[INFO] Nested-child insertions parsed: {n_ins}")
 
 
 def flip_features_for_minus_strand(el: Element) -> None:
@@ -717,6 +806,17 @@ def flip_features_for_minus_strand(el: Element) -> None:
         new_e = L - f.start + 1
         flipped.append(Feature(f.name, new_s, new_e).clamp(1, L))
     el.proteins = flipped
+    # Insertions live in the same element frame; flip them so they stay aligned
+    # with the (now flipped) proteins.
+    flipped_ins = []
+    for ins in el.insertions:
+        new_s = L - ins.end + 1
+        new_e = L - ins.start + 1
+        if new_e < new_s:
+            new_s, new_e = new_e, new_s
+        flipped_ins.append(Insertion(ins.child_key, max(1, new_s), max(1, new_e),
+                                     ins.child_family))
+    el.insertions = flipped_ins
     el.strand = "+"
 
 
@@ -731,6 +831,88 @@ def normalize_all_elements_strand(elements: Dict[str, Element]) -> None:
         else:
             n_unknown += 1
     print(f"[INFO] Strand normalization: flipped={n_flip}, already_plus={n_plus}, unknown={n_unknown}")
+
+
+def merge_intervals(iv: List[Tuple[int, int]]) -> List[Tuple[int, int]]:
+    """Union of 1-based inclusive intervals -> sorted disjoint list."""
+    if not iv:
+        return []
+    xs = sorted((min(s, e), max(s, e)) for s, e in iv)
+    out = [list(xs[0])]
+    for s, e in xs[1:]:
+        if s <= out[-1][1] + 1:
+            out[-1][1] = max(out[-1][1], e)
+        else:
+            out.append([s, e])
+    return [(s, e) for s, e in out]
+
+
+def collapse_coords(length: int, proteins: List[Feature],
+                    insertions: List[Insertion]):
+    """Excise the union of insertion intervals from a length-`length` element.
+
+    Returns (collapsed_length, collapsed_proteins, markers). `markers` are
+    (collapsed_x, child_family) at each excised region's left edge — where the
+    caret/triangle goes in the collapsed view. Host domains never fall inside a
+    child span (verified), but the remap handles it defensively by snapping any
+    inside-coordinate to the excision's left edge.
+    """
+    ins = merge_intervals([(i.start, i.end) for i in insertions])
+    excised = sum(e - s + 1 for s, e in ins)
+
+    def remap(x: int) -> int:
+        shift = 0
+        for s, e in ins:
+            if e < x:
+                shift += (e - s + 1)
+            elif s <= x <= e:
+                shift += (x - s)   # inside excision: snap to its left edge
+        return x - shift
+
+    collapsed_length = max(1, length - excised)
+    cprot: List[Feature] = []
+    for p in proteins:
+        ns, ne = remap(p.start), remap(p.end)
+        if ne < ns:
+            ns, ne = ne, ns
+        cprot.append(Feature(p.name, max(1, ns), max(1, ne)))
+
+    markers: List[Tuple[int, str]] = []
+    for s, e in ins:
+        # Label with EVERY child overlapping this excised block (adjacent/merged
+        # children must not silently drop their neighbour's family), short names.
+        fams: List[str] = []
+        for i in insertions:
+            if not (i.end < s or i.start > e):
+                short = i.child_family.split("/")[-1]
+                if short not in fams:
+                    fams.append(short)
+        # Clamp the caret to the collapsed right edge (an insertion flush against
+        # the 3' end would otherwise map to collapsed_length + 1, past the bar).
+        markers.append((min(remap(s), collapsed_length),
+                        "+".join(fams) if fams else "?"))
+    return collapsed_length, cprot, markers
+
+
+def resolve_insertion_families(pool: Dict[str, Element]) -> None:
+    """Fill each insertion's child_family from the pooled child element (if the
+    child is present in the pool)."""
+    for el in pool.values():
+        for ins in el.insertions:
+            child = pool.get(ins.child_key)
+            if child is not None:
+                ins.child_family = f"{child.superfamily}/{child.family}"
+
+
+def attach_collapsed_all(elements: Dict[str, Element]) -> None:
+    """Compute collapsed_length/collapsed_proteins for every element. Must run
+    AFTER strand normalization (so proteins/insertions are in the flipped frame).
+    For leaves (no insertions) these equal length/proteins.
+    """
+    for el in elements.values():
+        clen, cprot, _ = collapse_coords(el.length, el.proteins, el.insertions)
+        el.collapsed_length = clen
+        el.collapsed_proteins = cprot
 
 
 # -----------------------------
@@ -781,6 +963,88 @@ def draw_whisker(ax, y: float, lo: int, hi: int, color: str, lw: float = 1.2):
     ax.plot([hi, hi], [y - cap, y + cap], linewidth=lw, color=color)
 
 
+# Edge color / hatch used for nested (inset) child elements in the expanded view.
+NEST_EDGE = "#3355aa"
+
+
+def draw_insertion_marker(ax, x: float, y: float, height: float, label: str):
+    """Upward triangle at collapsed position `x` marking an excised insertion,
+    with the child family printed beneath it (collapsed view)."""
+    h = height / 2.0
+    tri = plt.Polygon([(x, y - h), (x - h * 0.6, y - h - h * 0.8),
+                       (x + h * 0.6, y - h - h * 0.8)],
+                      closed=True, facecolor="#222222", edgecolor="black",
+                      linewidth=0.5)
+    ax.add_patch(tri)
+    if label:
+        ax.text(x, y - h - h * 1.1, label, ha="center", va="top", fontsize=5,
+                color="#555555")
+
+
+def draw_nested(ax, y: float, el: Element, pool: Dict[str, Element],
+                x0: float, span: float, height: float, level: int,
+                seen: Optional[Set[str]] = None):
+    """Draw `el` mapped into the x-window [x0, x0+span] (bp units of the top-level
+    host). LTRs + proteins are drawn in el's own coordinates; each insertion
+    recurses to draw the resolved child element inset at reduced height, labeled
+    with its family. `level` controls height shrink + edge styling; `seen` guards
+    against cyclic nest references. Unresolved children draw a hatched placeholder.
+    """
+    if seen is None:
+        seen = set()
+    scale = span / max(1, el.length)
+
+    def gx(c):  # element coord (1-based) -> host bp x
+        return x0 + (c - 1) * scale
+
+    edge = "black" if level == 0 else NEST_EDGE
+    lw = 1.0 if level == 0 else 0.8
+    ax.add_patch(plt.Rectangle((x0, y - height / 2), span, height, fill=False,
+                               edgecolor=edge, linewidth=lw))
+    ltr_w = min(span, max(1.0, el.ltr_len * scale))
+    ltr_col = FEATURE_COLORS["LTR"]
+    ax.add_patch(plt.Rectangle((x0, y - height / 2), ltr_w, height,
+                               facecolor=ltr_col, edgecolor="black", linewidth=0.5))
+    ax.add_patch(plt.Rectangle((x0 + span - ltr_w, y - height / 2), ltr_w, height,
+                               facecolor=ltr_col, edgecolor="black", linewidth=0.5))
+    for p in el.proteins:
+        px = gx(p.start)
+        pw = max(1.0, (p.end - p.start + 1) * scale)
+        ax.add_patch(plt.Rectangle((px, y - height / 2), pw, height,
+                                   facecolor=FEATURE_COLORS.get(p.name, DEFAULT_COLOR),
+                                   edgecolor="black", linewidth=0.5))
+
+    if el.element_id in seen:
+        return
+    seen = seen | {el.element_id}
+    child_h = height * 0.62
+    drawn_spans: List[Tuple[int, int]] = []
+    for ins in el.insertions:
+        # Skip near-duplicate children (heavy reciprocal overlap with one already
+        # drawn) — some hosts list the same insertion twice (e.g. two LTR calls).
+        dup = False
+        for ds, de in drawn_spans:
+            ov = min(ins.end, de) - max(ins.start, ds) + 1
+            if ov > 0 and ov >= 0.5 * min(ins.end - ins.start + 1, de - ds + 1):
+                dup = True
+                break
+        if dup:
+            continue
+        drawn_spans.append((ins.start, ins.end))
+        cx0 = gx(ins.start)
+        cspan = max(1.0, (ins.end - ins.start + 1) * scale)
+        child = pool.get(ins.child_key)
+        if child is not None:
+            draw_nested(ax, y, child, pool, cx0, cspan, child_h, level + 1, seen)
+        else:
+            ax.add_patch(plt.Rectangle((cx0, y - child_h / 2), cspan, child_h,
+                                       facecolor="#dddddd", edgecolor=NEST_EDGE,
+                                       linewidth=0.8, hatch="///"))
+        fam = ins.child_family if ins.child_family != "?" else os.path.basename(ins.child_key)
+        ax.text(cx0 + cspan / 2, y + child_h / 2 + 0.02, fam.split("/")[-1],
+                ha="center", va="bottom", fontsize=5, color=NEST_EDGE)
+
+
 # -----------------------------
 # Average computation w/ rarity filter + CI
 # -----------------------------
@@ -815,7 +1079,10 @@ def compute_family_averages_with_ci(
     alpha: float = 0.05,
 ) -> FamilyAverages:
     n = len(fam_elements)
-    lengths = [e.length for e in fam_elements]
+    # Use collapsed (insertion-excised) length + domains so nested insertions do
+    # not inflate host lengths or shift 3'-side domain positions. Leaves are
+    # unaffected (collapsed == raw).
+    lengths = [e.collapsed_length for e in fam_elements]
     ltrs = [e.ltr_len for e in fam_elements]
 
     len_center, len_lo, len_hi = bootstrap_ci(lengths, boot=boot, alpha=alpha, stat="median")
@@ -823,7 +1090,7 @@ def compute_family_averages_with_ci(
 
     prot_presence: Dict[str, int] = {}
     for e in fam_elements:
-        present = set(p.name for p in e.proteins)
+        present = set(p.name for p in e.collapsed_proteins)
         for name in present:
             prot_presence[name] = prot_presence.get(name, 0) + 1
 
@@ -839,7 +1106,7 @@ def compute_family_averages_with_ci(
         starts = []
         ends = []
         for e in fam_elements:
-            hits = [p for p in e.proteins if p.name == prot]
+            hits = [p for p in e.collapsed_proteins if p.name == prot]
             if not hits:
                 continue
             s = min(h.start for h in hits)
@@ -925,44 +1192,74 @@ def plot_family_average_with_whiskers(family_key: str, avg: FamilyAverages, out_
     ax.set_ylim(0.25, 1.65)
     ax.set_yticks([])
     ax.set_xlabel("Position [bp] (relative)")
-    ax.legend(handles=legend_handles, loc="upper right", frameon=False, ncol=min(6, len(legend_handles)))
+    ax.legend(handles=legend_handles, loc="upper left", bbox_to_anchor=(1.01, 1.0),
+              borderaxespad=0, frameon=False, ncol=1, fontsize=8)
     plt.tight_layout()
-    fig.savefig(out_path)
+    fig.savefig(out_path, bbox_inches="tight")
     plt.close(fig)
     return out_path
 
 
 def plot_family_individual(family_key: str, fam_elements: List[Element], out_path: str,
+                           pool: Dict[str, Element], nesting: str = "expanded",
                            flagged_ids: Set[str] = None):
     """Plot ALL individual elements (no max cap). Always shows all proteins.
-    Elements in flagged_ids are highlighted with red outlines."""
+    Elements in flagged_ids are highlighted with red outlines.
+
+    nesting='expanded' draws nested children inside their host (recursively,
+    resolving children from `pool`); nesting='collapsed' excises insertions and
+    marks each with a triangle. Leaves render identically in both.
+    """
     if flagged_ids is None:
         flagged_ids = set()
 
     n = len(fam_elements)
-    max_len = max(e.length for e in fam_elements) if fam_elements else 1
+    if nesting == "collapsed":
+        max_len = max((e.collapsed_length for e in fam_elements), default=1)
+        prots_seen = sorted(set(p.name for e in fam_elements
+                                for p in e.collapsed_proteins))
+    else:
+        max_len = max((e.length for e in fam_elements), default=1)
+        prots_seen = sorted(set(p.name for e in fam_elements for p in e.proteins))
 
-    prots_seen = sorted(set(p.name for e in fam_elements for p in e.proteins))
     features_present = ["LTR"] + prots_seen
     has_flagged = any(e.element_id in flagged_ids for e in fam_elements)
     legend_handles = build_legend_handles(features_present, include_flagged=has_flagged)
+
+    # Show a depth tag on row labels when the family spans multiple depths.
+    multi_depth = len({e.depth for e in fam_elements}) > 1
 
     fig_h = max(3.0, 0.18 * n + 1.8)
     fig, ax = plt.subplots(figsize=(14, fig_h))
 
     for i, e in enumerate(fam_elements):
         y = n - i
-        prots = sorted(e.proteins, key=lambda x: x.start)
         k2p_txt = "NA" if e.k2p is None else f"{e.k2p * 100:.1f}%"
         is_flagged = e.element_id in flagged_ids
-        label = f"{e.element_id}  {k2p_txt}"
+        depth_tag = f"  [d{e.depth}]" if multi_depth else ""
+        label = f"{e.element_id}  {k2p_txt}{depth_tag}"
         if is_flagged:
             label += "  [FP?]"
-        draw_element(ax, y=y, el_len=e.length, ltr_len=e.ltr_len, proteins=prots,
-                     label=label, height=0.65, flagged=is_flagged)
+
+        if nesting == "collapsed":
+            prots = sorted(e.collapsed_proteins, key=lambda x: x.start)
+            draw_element(ax, y=y, el_len=e.collapsed_length, ltr_len=e.ltr_len,
+                         proteins=prots, label=label, height=0.65, flagged=is_flagged)
+            _clen, _cp, markers = collapse_coords(e.length, e.proteins, e.insertions)
+            for mx, mfam in markers:
+                draw_insertion_marker(ax, mx, y, 0.65, mfam)
+        else:  # expanded
+            draw_nested(ax, y, e, pool, 0.0, float(e.length), 0.65, 0)
+            label_color = FLAGGED_COLOR if is_flagged else "black"
+            ax.text(-0.01 * max_len, y, label, ha="right", va="center", fontsize=8,
+                    color=label_color, fontweight="bold" if is_flagged else "normal")
+            if is_flagged:
+                # red outline over the host to match draw_element's flag styling
+                ax.add_patch(plt.Rectangle((0, y - 0.65 / 2), e.length, 0.65, fill=False,
+                                           edgecolor=FLAGGED_COLOR, linewidth=2.0))
 
     n_flagged = sum(1 for e in fam_elements if e.element_id in flagged_ids)
-    title = f"{family_key} : Individual elements (n={n})"
+    title = f"{family_key} : Individual elements (n={n}, {nesting})"
     if n_flagged > 0:
         title += f"  [{n_flagged} potential FP highlighted]"
     ax.set_title(title)
@@ -970,9 +1267,10 @@ def plot_family_individual(family_key: str, fam_elements: List[Element], out_pat
     ax.set_ylim(0, n + 1)
     ax.set_yticks([])
     ax.set_xlabel("Position [bp] (relative)")
-    ax.legend(handles=legend_handles, loc="lower right", frameon=False, ncol=min(6, len(legend_handles)))
+    ax.legend(handles=legend_handles, loc="upper left", bbox_to_anchor=(1.01, 1.0),
+              borderaxespad=0, frameon=False, ncol=1, fontsize=8)
     plt.tight_layout()
-    fig.savefig(out_path)
+    fig.savefig(out_path, bbox_inches="tight")
     plt.close(fig)
     return out_path
 
@@ -1014,9 +1312,10 @@ def plot_all_elements_average(family_avg_map: Dict[str, FamilyAverages], out_pat
     ax.set_ylim(0, len(fam_keys) + 1)
     ax.set_yticks([])
     ax.set_xlabel("Position [bp] (relative)")
-    ax.legend(handles=legend_handles, loc="upper right", frameon=False, ncol=min(6, len(legend_handles)))
+    ax.legend(handles=legend_handles, loc="upper left", bbox_to_anchor=(1.01, 1.0),
+              borderaxespad=0, frameon=False, ncol=1, fontsize=8)
     plt.tight_layout()
-    fig.savefig(out_path)
+    fig.savefig(out_path, bbox_inches="tight")
     plt.close(fig)
     return out_path
 
@@ -1024,6 +1323,34 @@ def plot_all_elements_average(family_avg_map: Dict[str, FamilyAverages], out_pat
 # -----------------------------
 # FAI parsing
 # -----------------------------
+def ensure_fai(genome_path: Optional[str]) -> Optional[str]:
+    """Return a .fai index for `genome_path`, creating it with `samtools faidx`
+    if missing or stale. Returns None (with a warning) if no genome is given,
+    the genome is missing, samtools is unavailable, or indexing fails — the
+    per-chromosome browser is optional, so this fails soft.
+    """
+    if not genome_path:
+        return None
+    if not os.path.isfile(genome_path):
+        print(f"[WARN] --genome not found: {genome_path}; skipping chromosome browser.")
+        return None
+    fai = genome_path + ".fai"
+    stale = (not os.path.isfile(fai)) or (
+        os.path.getmtime(fai) < os.path.getmtime(genome_path))
+    if stale:
+        if shutil.which("samtools") is None:
+            print("[WARN] samtools not on PATH; cannot index genome. "
+                  "Skipping chromosome browser.")
+            return None
+        print(f"[INFO] Indexing genome: samtools faidx {genome_path}")
+        try:
+            subprocess.run(["samtools", "faidx", genome_path], check=True)
+        except subprocess.CalledProcessError as e:
+            print(f"[WARN] samtools faidx failed ({e}); skipping chromosome browser.")
+            return None
+    return fai if os.path.isfile(fai) else None
+
+
 def parse_fai(fai_path: str) -> Dict[str, int]:
     chrom_lens: Dict[str, int] = {}
     print(f"[INFO] Reading FAI: {fai_path}")
@@ -1707,10 +2034,31 @@ a:hover {{ text-decoration: underline; }}
 # Main
 # -----------------------------
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--tsv", required=True, help="LTR-RT TSV file")
-    ap.add_argument("--scn", required=True, help="SCN file")
-    ap.add_argument("--gff", required=True, help="Domain HMM gff file")
+    ap = argparse.ArgumentParser(
+        description="Plot LTR-RT structure from reconciler-era depth-bucketed TSVs "
+                    "(e.g. <prefix>_depth0_ltr.tsv). Domains are read from the TSV; "
+                    "strand is inferred from domain order.")
+    ap.add_argument("--tsv",
+                    help="Depth-bucketed LTR-RT TSV (e.g. Aare_depth0_ltr.tsv). "
+                         "Mutually exclusive with --prefix.")
+    ap.add_argument("--prefix",
+                    help="Sample prefix; resolves --tsv to "
+                         "<indir>/<prefix>_depth<depth>_ltr.tsv.")
+    ap.add_argument("--depth", default="0",
+                    help="Nesting-depth bucket to plot with --prefix: an integer "
+                         "(e.g. 0, 1) or 'all' to merge every depth onto one plot "
+                         "(default 0). All depths are always loaded internally so "
+                         "hosts can resolve their nested children; --depth selects "
+                         "which elements get their own rows/averages.")
+    ap.add_argument("--nesting", choices=["expanded", "collapsed", "both"],
+                    default="expanded",
+                    help="Nested-element rendering for individual plots: 'expanded' "
+                         "(draw nested children inside their host, default), "
+                         "'collapsed' (excise insertions, mark each with a triangle), "
+                         "or 'both' (emit both PDFs). Averages always use collapsed "
+                         "lengths regardless of this setting.")
+    ap.add_argument("--indir", default=".",
+                    help="Directory holding the depth files for --prefix (default '.').")
     ap.add_argument("--out_dir", required=True, help="Output directory")
 
     ap.add_argument("--min_presence", type=float, default=0.50,
@@ -1718,8 +2066,10 @@ def main():
                          "in the AVERAGE plot only (default 0.50)")
     ap.add_argument("--boot", type=int, default=2000,
                     help="Bootstrap iterations for 95%% CI (default 2000)")
-    ap.add_argument("--fai", default=None,
-                    help="Optional FASTA .fai index to enable per-chromosome interactive HTML plots")
+    ap.add_argument("--genome", default=None,
+                    help="Optional genome FASTA. Indexed internally via 'samtools faidx' "
+                         "to enable per-chromosome interactive HTML browsers. If omitted "
+                         "(or samtools/genome unavailable), chromosome plots are skipped.")
     ap.add_argument("--html", action="store_true",
                     help="Generate a master index.html with all outputs embedded; "
                          "otherwise only chromosome plots are HTML and family plots are PDF")
@@ -1754,22 +2104,52 @@ def main():
                          "K2P and LTR_LEN/ALN_LEN quality filters.")
 
     args = ap.parse_args()
-    random.seed(args.seed)
 
+    # Exactly one of --tsv / --prefix.
+    if bool(args.tsv) == bool(args.prefix):
+        ap.error("provide exactly one of --tsv or --prefix")
+
+    depth_all = str(args.depth).lower() == "all"
+    focus_depth = None
+    if not depth_all:
+        try:
+            focus_depth = int(args.depth)
+        except ValueError:
+            ap.error("--depth must be a non-negative integer or 'all'")
+    if args.tsv and not os.path.isfile(args.tsv):
+        ap.error(f"TSV not found: {args.tsv}")
+
+    random.seed(args.seed)
     os.makedirs(args.out_dir, exist_ok=True)
 
-    elements = parse_tsv(args.tsv)
-    shifts = parse_scn(args.scn)
-    gff_feats = parse_gff_domains(args.gff)
+    # Load the whole nest across depths (so hosts resolve their children); the
+    # focus set (elements that get rows/averages) is filtered afterward.
+    files = resolve_depth_files(args.tsv, args.prefix, args.indir, args.depth)
+    if not files:
+        ap.error(f"no depth TSVs found for prefix '{args.prefix}' in {args.indir}")
+    pool = load_pool(files)
 
-    attach_shifts(elements, shifts)
+    # Domains -> element-relative features + insertions; strand inferred (order,
+    # then single-domain positional fallback); normalize to 5'->3'; resolve child
+    # families; compute collapsed (insertion-excised) representation.
+    attach_domains_and_infer_strand(pool)
+    normalize_all_elements_strand(pool)
+    resolve_insertion_families(pool)
+    attach_collapsed_all(pool)
 
-    # --- Edit (1): auto-detect GFF coordinate mode ---
-    coord_mode = detect_gff_coordinate_mode(elements, gff_feats)
-    attach_proteins_and_strand(elements, gff_feats, coord_mode)
-
-    # Strand normalize
-    normalize_all_elements_strand(elements)
+    # Focus set: which elements get their own family rows/averages.
+    if depth_all:
+        elements = pool
+    elif args.prefix:
+        elements = {k: e for k, e in pool.items() if e.depth == focus_depth}
+    else:  # --tsv: focus = elements physically in that file
+        want = set(parse_tsv(args.tsv).keys())
+        elements = {k: e for k, e in pool.items() if k in want}
+    print(f"[INFO] Focus set: {len(elements)} of {len(pool)} pooled elements "
+          f"(depth={args.depth})")
+    if not elements:
+        ap.error(f"no elements at depth={args.depth} (available depths: "
+                 f"{sorted({d for _, d in files})})")
 
     # Group by superfamily/family
     family_to_elements: Dict[str, List[Element]] = {}
@@ -1838,9 +2218,19 @@ def main():
         out_avg = os.path.join(args.out_dir, f"{safe_fk}_average.pdf")
         plot_family_average_with_whiskers(fk, avg, out_avg)
 
-        # Individual plot (shows ALL proteins, no max cap) — with FP highlighting
-        out_ind = os.path.join(args.out_dir, f"{safe_fk}_individual.pdf")
-        plot_family_individual(fk, fam_elements, out_ind, flagged_ids=flagged_ids)
+        # Individual plot(s) (shows ALL proteins, no max cap) — with FP highlighting.
+        # nesting: expanded (default) / collapsed / both.
+        if args.nesting == "both":
+            plot_family_individual(fk, fam_elements,
+                                   os.path.join(args.out_dir, f"{safe_fk}_individual_expanded.pdf"),
+                                   pool, nesting="expanded", flagged_ids=flagged_ids)
+            plot_family_individual(fk, fam_elements,
+                                   os.path.join(args.out_dir, f"{safe_fk}_individual_collapsed.pdf"),
+                                   pool, nesting="collapsed", flagged_ids=flagged_ids)
+        else:
+            plot_family_individual(fk, fam_elements,
+                                   os.path.join(args.out_dir, f"{safe_fk}_individual.pdf"),
+                                   pool, nesting=args.nesting, flagged_ids=flagged_ids)
 
         # If --html, also generate base64 PNGs
         if args.html:
@@ -1866,29 +2256,40 @@ def main():
             ax_avg.set_ylim(0.25, 1.65)
             ax_avg.set_yticks([])
             ax_avg.set_xlabel("Position [bp]")
-            ax_avg.legend(handles=build_legend_handles(avg.features_present), loc="upper right", frameon=False, ncol=6)
+            ax_avg.legend(handles=build_legend_handles(avg.features_present),
+                          loc="upper left", bbox_to_anchor=(1.01, 1.0),
+                          borderaxespad=0, frameon=False, ncol=1, fontsize=8)
             plt.tight_layout()
             avg_b64 = fig_to_base64_png(fig_avg)
             plt.close(fig_avg)
 
-            # Individual as PNG — with FP highlighting
+            # Individual as PNG — expanded nesting + FP highlighting (mirrors the
+            # PDF expanded view; --nesting only affects the PDF filenames).
             n = len(fam_elements)
-            max_len = max(e.length for e in fam_elements) if fam_elements else 1
+            max_len = max((e.length for e in fam_elements), default=1)
             prots_seen = sorted(set(p.name for e in fam_elements for p in e.proteins))
+            multi_depth = len({e.depth for e in fam_elements}) > 1
             fig_h = max(3.0, 0.18 * n + 1.8)
             fig_ind, ax_ind = plt.subplots(figsize=(14, fig_h))
             has_flagged = any(e.element_id in flagged_ids for e in fam_elements)
             for i, e in enumerate(fam_elements):
                 y = n - i
-                prots = sorted(e.proteins, key=lambda x: x.start)
                 k2p_txt = "NA" if e.k2p is None else f"{e.k2p*100:.1f}%"
                 is_flagged = e.element_id in flagged_ids
-                label = f"{e.element_id}  {k2p_txt}"
+                depth_tag = f"  [d{e.depth}]" if multi_depth else ""
+                label = f"{e.element_id}  {k2p_txt}{depth_tag}"
                 if is_flagged:
                     label += "  [FP?]"
-                draw_element(ax_ind, y=y, el_len=e.length, ltr_len=e.ltr_len, proteins=prots,
-                             label=label, height=0.65, flagged=is_flagged)
-            title = f"{fk} : Individual (n={n})"
+                draw_nested(ax_ind, y, e, pool, 0.0, float(e.length), 0.65, 0)
+                label_color = FLAGGED_COLOR if is_flagged else "black"
+                ax_ind.text(-0.01 * max_len, y, label, ha="right", va="center",
+                            fontsize=8, color=label_color,
+                            fontweight="bold" if is_flagged else "normal")
+                if is_flagged:
+                    ax_ind.add_patch(plt.Rectangle((0, y - 0.65 / 2), e.length, 0.65,
+                                                   fill=False, edgecolor=FLAGGED_COLOR,
+                                                   linewidth=2.0))
+            title = f"{fk} : Individual (n={n}, expanded)"
             n_flagged_fam = sum(1 for e in fam_elements if e.element_id in flagged_ids)
             if n_flagged_fam > 0:
                 title += f"  [{n_flagged_fam} potential FP]"
@@ -1898,7 +2299,8 @@ def main():
             ax_ind.set_yticks([])
             ax_ind.set_xlabel("Position [bp]")
             ax_ind.legend(handles=build_legend_handles(["LTR"]+prots_seen, include_flagged=has_flagged),
-                          loc="lower right", frameon=False, ncol=6)
+                          loc="upper left", bbox_to_anchor=(1.01, 1.0),
+                          borderaxespad=0, frameon=False, ncol=1, fontsize=8)
             plt.tight_layout()
             ind_b64 = fig_to_base64_png(fig_ind)
             plt.close(fig_ind)
@@ -1941,15 +2343,17 @@ def main():
         ax_all.set_yticks([])
         ax_all.set_xlabel("Position [bp]")
         ax_all.legend(handles=build_legend_handles(["LTR"]+sorted(all_prots)),
-                      loc="upper right", frameon=False, ncol=6)
+                      loc="upper left", bbox_to_anchor=(1.01, 1.0),
+                      borderaxespad=0, frameon=False, ncol=1, fontsize=8)
         plt.tight_layout()
         all_b64 = fig_to_base64_png(fig_all)
         plt.close(fig_all)
 
     # Per-chromosome interactive HTML plots (always HTML, edit 4)
     chrom_html_files = []
-    if args.fai:
-        chrom_lens = parse_fai(args.fai)
+    fai_path = ensure_fai(args.genome)
+    if fai_path:
+        chrom_lens = parse_fai(fai_path)
 
         chrom_to_elements: Dict[str, List[Element]] = {}
         for el in elements.values():
@@ -2012,7 +2416,7 @@ def main():
                 n_fam = len(fam_els)
                 skip_iqr_here = unknown and args.skip_unknown_iqr
                 if n_fam >= args.min_family_size and not skip_iqr_here:
-                    lengths = sorted(float(e.length) for e in fam_els)
+                    lengths = sorted(float(e.collapsed_length) for e in fam_els)
                     upper_fence = _compute_upper_fence(lengths, n_fam, iqr_mul=args.iqr_mul)
                 else:
                     upper_fence = float("inf")
@@ -2035,8 +2439,8 @@ def main():
                         if el.aln_len_raw < args.min_ltr_aln:
                             reasons.append(f"dubious_clade;ALN_LEN<{args.min_ltr_aln}")
 
-                    # Check length-outlier reason
-                    if el.length > upper_fence:
+                    # Check length-outlier reason (collapsed length; see detector)
+                    if el.collapsed_length > upper_fence:
                         if n_expected == 0:
                             reasons.append("outlier_long;non_autonomous")
                         else:
@@ -2050,32 +2454,43 @@ def main():
                                f"{reason_str}\n")
         print(f"[INFO] Flagged false positives written: {flagged_tsv_path} ({total_flagged} elements)")
 
-    # Write filtered TSV (input TSV minus flagged elements)
+    # Write filtered TSV (every loaded source TSV, concatenated, minus flagged
+    # elements). Only the focus-set elements are eligible to be flagged, so in
+    # single-depth mode this filters just that bucket; in --depth all it filters
+    # the whole pool. The header from the first source file is kept once.
     if not args.no_fp:
         filtered_tsv_path = os.path.join(args.out_dir, "filtered.tsv")
+        # Only focus-set elements are eligible for flagging, so filtered.tsv must
+        # reflect only the FOCUS input file(s) — not every pooled depth. This keeps
+        # single-depth output (incl. the default --depth 0) and --tsv unchanged.
+        if depth_all:
+            src_files = [p for p, _ in files]
+        elif args.prefix:
+            src_files = [p for p, d in files if d == focus_depth]
+        else:
+            src_files = [args.tsv]
         n_kept = 0
         n_removed = 0
-        with open(args.tsv, "r", encoding="utf-8") as fin, \
-             open(filtered_tsv_path, "w", encoding="utf-8") as fout:
-            for line in fin:
-                stripped = line.strip()
-                if not stripped or stripped.startswith("#"):
-                    fout.write(line)
-                    continue
-                parts = stripped.split("\t")
-                if len(parts) < 3:
-                    fout.write(line)
-                    continue
-                raw_id = parts[0]
-                if "#" in raw_id:
-                    elem_part = raw_id.split("#", 1)[0]
-                else:
-                    elem_part = raw_id
-                if elem_part in all_flagged_ids:
-                    n_removed += 1
-                else:
-                    fout.write(line)
-                    n_kept += 1
+        with open(filtered_tsv_path, "w", encoding="utf-8") as fout:
+            for si, src in enumerate(src_files):
+                with open(src, "r", encoding="utf-8") as fin:
+                    for line in fin:
+                        stripped = line.strip()
+                        if not stripped or stripped.startswith("#"):
+                            if si == 0:
+                                fout.write(line)
+                            continue
+                        parts = stripped.split("\t")
+                        if len(parts) < 3:
+                            fout.write(line)
+                            n_kept += 1
+                            continue
+                        elem_part = parts[0].split("#", 1)[0]
+                        if elem_part in all_flagged_ids:
+                            n_removed += 1
+                        else:
+                            fout.write(line)
+                            n_kept += 1
         print(f"[INFO] Filtered TSV written: {filtered_tsv_path} "
               f"(kept={n_kept}, removed={n_removed})")
 

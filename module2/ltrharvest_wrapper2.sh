@@ -39,16 +39,21 @@
 #     --ltrharvest5-args-from-round 1 "tesorter-rule=70-70-80"
 #     --ltrharvest5-args-from-round 3 "tesorter-rule=70-40-80"
 
-# In the dog genome, this pipeline identifies many false positves, I think due to high abundant SINE pieces.
-# Maybe the easiest way to filter them is using a Kmer2LTR clustering approach, similar to as is done with "ltr_cluster_phylo.py". 
-# Ie, We can cluster consensus LTRs (as is already implemented) and also cluster internal sequences. 
-#     We can compare the consensus LTR clusters (We consider these to be families) to the internal clusters.
-#     Internal sequences from large true positive families should cluster with their family with some frequency.
-#     Internal seuqences from large false positive families will likely form many singletons, or cluster elsewhere.
-# Also, maybe a LTR-RT size-based filter could do it. 
-# Ie, True positive families will likely form a dense peak of LTR-RT sizes, while false positive families are probably quite disperse, LTR-RT size-wise. 
-# Its simple enough to edit PrinTE to drop some high-frequency repeat into intergenic space. 
-# I should implement a corrective approach to eliminate false positives from genomes with high-abundant non-LTR-RT repeats, like SINE, DNA repeats, and low-complexity repeats and use PrinTE to benchmark my implementation. 
+# FALSE-POSITIVE (FP) FAMILY CORRECTION (post-detection):
+#   High-abundance non-LTR repeats (SINEs, DNA/low-complexity) can seed spurious
+#   LTR-RT calls. After reconciliation, this wrapper:
+#     (1) concatenates the depth-bucketed FASTAs and strips non-ACGT characters
+#         (the reconciler's IUPAC-masked nested inners), leaving only the
+#         outermost putative LTR-RT of each element -> {OUT_PREFIX}_all_ltr.fa
+#     (2) clusters those with Kmer2LTR (consensus + internal clustering, id 0.75)
+#     (3) runs flag_fp_families.py to flag FP families and purge their rows from
+#         each depth TSV -> {OUT_PREFIX}_depth{N}_clean_ltr.tsv
+#   If the FP fraction exceeds --fp-mask-threshold, flag_fp_families.py hard-masks
+#   those repeats in the genome ({OUT_PREFIX}_FP_masked.fa) and the ENTIRE pipeline
+#   is automatically re-run on the masked genome. Each attempt runs fully isolated
+#   in its own staging directory, so first-run files can never be mistaken for the
+#   final outputs; the hidden --dev-keep-fp-rounds flag retains every attempt for
+#   debugging. See the "FP-correction orchestrator" section below.
 
 set -euo pipefail
 
@@ -57,6 +62,11 @@ echo "Command: $0 $*"
 echo ""
 
 WRAPPER_START=$SECONDS
+
+# Capture the original argv up-front (before parsing consumes it) so the
+# FP-correction orchestrator can re-invoke this script as a worker on a masked
+# genome without having to reconstruct every flag.
+ORIG_ARGS=( "$@" )
 
 # ----------------------------
 # Defaults
@@ -73,6 +83,13 @@ WFA_ALIGN=false
 KEEP_WEAK_HMM_PASS2=false
 PASS2_ALIGNER="minimap2"
 
+# FP-family correction (post-detection Kmer2LTR stage)
+FP_MASK_THRESHOLD="0.10"   # user-tunable: FP-element fraction above which the
+                           # genome is hard-masked and the pipeline auto-re-runs
+DEV_KEEP_FP_ROUNDS=false   # hidden dev flag: keep every FP-round staging dir
+MAX_FP_ROUNDS=10           # hidden safety cap on automatic FP-masking re-runs
+                           # (overridable via --dev-max-fp-rounds)
+
 # Storage for extra ltrharvest5.py arg directives
 # Each entry is tab-separated: "FROMROUND\tKEY\tVALUE\tIS_BOOL"
 declare -a EXTRA_ARG_DIRECTIVES=()
@@ -87,7 +104,8 @@ usage() {
 Usage:
   bash nest_ltr_detector.sh --genome genome.fa [--proteins prot.fa] [--terminate_count 100]
       [--max-rounds N] [--script_path ./synLTR/module2/] [--threads 20] [--out_prefix PREFIX]
-      [--wfa-align] [--ltrharvest5-args "KEY=VALUE ..."] [--ltrharvest5-args-from-round N "KEY=VALUE ..."]
+      [--wfa-align] [--fp-mask-threshold 0.10]
+      [--ltrharvest5-args "KEY=VALUE ..."] [--ltrharvest5-args-from-round N "KEY=VALUE ..."]
 
 Required:
   --genome              Genome FASTA (.fa/.fasta)
@@ -108,6 +126,15 @@ Optional:
                         candidate (had HMM hits but no clade -> LTR/unknown/unknown via augment).
                         By default these matches are dropped. Default: off.
   --pass2-aligner       TEBinSorter pass-2 aligner: minimap2 (default) or blast.
+  --fp-mask-threshold   False-positive element fraction above which the genome is
+                        hard-masked and the whole pipeline is automatically re-run
+                        on the masked genome (default 0.10; higher tolerates more
+                        false positives before masking/re-running).
+
+Post-detection FP-family correction runs automatically: it clusters the detected
+LTR-RTs with Kmer2LTR, purges false-positive families into
+<out_prefix>_depth{N}_clean_ltr.tsv, and (when FPs are pervasive) masks the genome
+and re-runs. See the script header for details.
 
 Extra ltrharvest5.py options:
   --ltrharvest5-args "KEY=VALUE [KEY2=VALUE2 ...]"
@@ -230,6 +257,145 @@ build_extra_args_for_round() {
   done
 }
 
+# Resolve a file or directory to an absolute path (no realpath dependency).
+abspath() {
+  local p="$1"
+  if [[ -d "$p" ]]; then
+    (cd "$p" && pwd)
+  else
+    echo "$(cd "$(dirname "$p")" && pwd)/$(basename "$p")"
+  fi
+}
+
+# ----------------------------
+# FP-correction orchestrator helpers
+# ----------------------------
+# Ensure the Kmer2LTR clone used by the FP stage is available. ltrharvest5.py
+# normally clones it into TOOLS_DIR during the rounds; clone defensively if the
+# rounds produced nothing or the layout ever changes.
+ensure_kmer2ltr_dir() {
+  local k2l="${TOOLS_DIR}/Kmer2LTR"
+  if [[ ! -f "${k2l}/Kmer2LTR.py" || ! -f "${k2l}/flag_fp_families.py" ]]; then
+    echo "Kmer2LTR not present in ${k2l}; cloning..." >&2
+    mkdir -p "$TOOLS_DIR"
+    git clone --depth 1 https://github.com/cwb14/Kmer2LTR.git "$k2l" >&2 \
+      || die "Failed to clone Kmer2LTR into ${k2l}"
+  fi
+  [[ -f "${k2l}/Kmer2LTR.py" && -f "${k2l}/flag_fp_families.py" ]] \
+    || die "Kmer2LTR clone incomplete in ${k2l}"
+}
+
+# Move (default) or copy (--dev-keep-fp-rounds) the final attempt's outputs into
+# the user's working directory, dropping the isolation scaffolding and the
+# FP-masked trigger file (never a final output). A same-named output from a prior
+# run in the destination is removed first so directory moves overwrite cleanly.
+promote_fp_outputs() {
+  local src="$1" dst="$2" e name
+  rm -f "${src}/${OUT_PREFIX}.input_genome.fa"* 2>/dev/null || true
+  rm -f "${src}/${OUT_PREFIX}_FP_masked.fa" 2>/dev/null || true
+
+  shopt -s nullglob
+  local entries=( "${src}"/* )
+  shopt -u nullglob
+  for e in "${entries[@]}"; do
+    name="$(basename "$e")"
+    rm -rf "${dst:?}/${name}"
+    if [[ "$DEV_KEEP_FP_ROUNDS" == true ]]; then
+      cp -a "$e" "${dst}/"
+    else
+      mv "$e" "${dst}/"
+    fi
+  done
+}
+
+# Top-level driver. Runs one or more fully-isolated detection attempts, each in
+# its own staging directory. When an attempt hard-masks a pervasively-FP genome
+# ({OUT_PREFIX}_FP_masked.fa), the next attempt runs on that masked genome. When
+# an attempt produces no masked genome, its outputs are the final ones and are
+# promoted to the user's working directory. Detection is by file existence
+# because flag_fp_families.py returns 0 whether or not it masks.
+run_fp_orchestrator() {
+  local final_dir staging abs_self abs_genome abs_proteins abs_script
+  final_dir="$PWD"
+  abs_self="$(abspath "${BASH_SOURCE[0]}")"
+  abs_genome="$(abspath "$GENOME")"
+  abs_script="$(abspath "$SCRIPT_PATH")"
+  [[ -n "$PROTEINS" ]] && abs_proteins="$(abspath "$PROTEINS")"
+
+  staging="${final_dir}/${OUT_PREFIX}_FPstaging"
+  rm -rf "$staging"                 # defensive: clear a stale/partial staging dir
+  mkdir -p "$staging"
+
+  echo ""
+  echo "############################################################"
+  echo "FP-correction orchestrator: up to ${MAX_FP_ROUNDS} attempt(s)"
+  echo "  staging dir: ${staging}"
+  echo "############################################################"
+
+  local attempt=1 cur_genome="$abs_genome" final_adir="" rc masked adir sym
+  while (( attempt <= MAX_FP_ROUNDS )); do
+    adir="${staging}/round${attempt}"
+    mkdir -p "$adir"
+    sym="${adir}/${OUT_PREFIX}.input_genome.fa"
+    ln -sf "$cur_genome" "$sym"
+
+    echo ""
+    echo "======================= FP round ${attempt} ======================="
+    echo "  input genome: ${cur_genome}"
+    echo "  work dir:     ${adir}"
+
+    # Replay the original argv, then append overrides so the parser's last-wins
+    # semantics pin genome/proteins/out_prefix/script_path to isolated, absolute
+    # values. The env var flips the re-exec'd script into worker mode.
+    local worker_args=( "${ORIG_ARGS[@]}"
+        --genome "${OUT_PREFIX}.input_genome.fa"
+        --out_prefix "$OUT_PREFIX"
+        --script_path "$abs_script" )
+    [[ -n "${abs_proteins:-}" ]] && worker_args+=( --proteins "$abs_proteins" )
+
+    rc=0
+    ( cd "$adir" && _LTRHARVEST_WRAPPER2_WORKER=1 bash "$abs_self" "${worker_args[@]}" ) || rc=$?
+    if (( rc != 0 )); then
+      die "FP round ${attempt} failed (exit ${rc}). Staging left at: ${adir}"
+    fi
+
+    masked="${adir}/${OUT_PREFIX}_FP_masked.fa"
+    if [[ -s "$masked" ]]; then
+      if (( attempt >= MAX_FP_ROUNDS )); then
+        echo "" >&2
+        echo "WARNING: FP masking still triggered after ${MAX_FP_ROUNDS} attempt(s); not" >&2
+        echo "converged. Promoting the last attempt's cleaned outputs anyway." >&2
+        final_adir="$adir"
+        break
+      fi
+      echo "FP round ${attempt}: FPs pervasive -> re-running on the masked genome."
+      cur_genome="$(abspath "$masked")"
+      attempt=$((attempt + 1))
+      continue
+    fi
+
+    echo "FP round ${attempt}: no masked genome produced -> final pass."
+    final_adir="$adir"
+    break
+  done
+
+  [[ -n "$final_adir" ]] || die "FP orchestrator produced no final attempt (internal error)"
+
+  echo ""
+  echo "Promoting final outputs: ${final_adir} -> ${final_dir}"
+  promote_fp_outputs "$final_adir" "$final_dir"
+
+  if [[ "$DEV_KEEP_FP_ROUNDS" == true ]]; then
+    echo "[dev] --dev-keep-fp-rounds set: retaining staging dir ${staging}"
+  else
+    rm -rf "$staging"
+  fi
+
+  local elapsed=$((SECONDS - WRAPPER_START))
+  printf 'FP-correction complete (%d attempt(s), total %d:%02d).\n' \
+    "$attempt" $((elapsed / 60)) $((elapsed % 60))
+}
+
 # ----------------------------
 # Parse args
 # ----------------------------
@@ -249,6 +415,9 @@ while [[ $# -gt 0 ]]; do
     --wfa-align) WFA_ALIGN=true; shift;;
     --keep-weak-hmm-pass2-matches) KEEP_WEAK_HMM_PASS2=true; shift;;
     --pass2-aligner) PASS2_ALIGNER="${2:-}"; shift 2;;
+    --fp-mask-threshold) FP_MASK_THRESHOLD="${2:-}"; shift 2;;
+    --dev-keep-fp-rounds) DEV_KEEP_FP_ROUNDS=true; shift;;      # hidden dev flag
+    --dev-max-fp-rounds) MAX_FP_ROUNDS="${2:-}"; shift 2;;       # hidden dev flag
     --ltrharvest5-args)
       parse_kv_string 1 "${2:-}"
       shift 2;;
@@ -268,6 +437,14 @@ done
 if [[ -n "$PROTEINS" ]]; then
   [[ -f "$PROTEINS" ]] || die "Proteins not found: $PROTEINS"
 fi
+
+# Validate FP-correction knobs.
+[[ "$FP_MASK_THRESHOLD" =~ ^[0-9]*\.?[0-9]+$ ]] \
+  || die "--fp-mask-threshold must be a number in [0,1] (got '$FP_MASK_THRESHOLD')"
+awk -v x="$FP_MASK_THRESHOLD" 'BEGIN{exit !(x>=0 && x<=1)}' \
+  || die "--fp-mask-threshold must be in [0,1] (got '$FP_MASK_THRESHOLD')"
+[[ "$MAX_FP_ROUNDS" =~ ^[1-9][0-9]*$ ]] \
+  || die "--dev-max-fp-rounds must be a positive integer (got '$MAX_FP_ROUNDS')"
 
 # ----------------------------
 # Derived names
@@ -310,6 +487,18 @@ RECONCILER="${SCRIPT_PATH}/reconcile_nests.py"
 [[ -f "$LTRHARVEST" ]] || die "Missing: $LTRHARVEST"
 [[ -f "$MASKLTR" ]] || die "Missing: $MASKLTR"
 [[ -f "$RECONCILER" ]] || die "Missing: $RECONCILER"
+
+# ----------------------------
+# Orchestrator vs. worker
+# ----------------------------
+# The top-level invocation orchestrates the (possibly iterated) FP-masking
+# re-runs, each isolated in its own staging dir. Every attempt re-execs this
+# script with _LTRHARVEST_WRAPPER2_WORKER=1 set, which skips orchestration and
+# runs exactly one detection pipeline in the current (isolated) directory.
+if [[ -z "${_LTRHARVEST_WRAPPER2_WORKER:-}" ]]; then
+  run_fp_orchestrator
+  exit $?
+fi
 
 # ----------------------------
 # Config: IUPAC codes to use for successive rounds (exclude V)
@@ -604,6 +793,90 @@ if (( ${#completed_round_prefixes[@]} > 0 )); then
     --fa  "${recon_fa_args[@]}" \
     --scn "${recon_scn_args[@]}"
   set +x
+fi
+
+# ----------------------------
+# FP-family correction (Kmer2LTR). Runs on the reconciled depth outputs. Must
+# run BEFORE the TOOLS_DIR cleanup below (Kmer2LTR lives in TOOLS_DIR/Kmer2LTR).
+# Produces {OUT_PREFIX}_depth{N}_clean_ltr.tsv, and — only when the FP fraction
+# exceeds --fp-mask-threshold — {OUT_PREFIX}_FP_masked.fa, which the orchestrator
+# detects to trigger an automatic re-run.
+# ----------------------------
+shopt -s nullglob
+depth_fas=( "${OUT_PREFIX}"_depth*_ltr.fa )
+depth_tsvs=( "${OUT_PREFIX}"_depth*_ltr.tsv )
+shopt -u nullglob
+
+if (( ${#depth_fas[@]} > 0 )); then
+  all_ltr_fa="${OUT_PREFIX}_all_ltr.fa"
+
+  echo ""
+  echo "============================================================"
+  echo "FP-family correction on ${#depth_fas[@]} depth-bucketed FASTA(s)..."
+
+  # (1) Concatenate all nest-level FASTAs, stripping non-ACGT characters. Those
+  #     characters are the reconciler's IUPAC-masked nested inners; removing them
+  #     leaves only the outermost putative LTR-RT of each element.
+  cat "${depth_fas[@]}" \
+    | awk '/^>/{printf "\n%s\n",$0;next}{gsub(/[^ACGTacgt]/,"");printf "%s",$0}END{print ""}' \
+    > "$all_ltr_fa"
+
+  if [[ ! -s "$all_ltr_fa" ]]; then
+    # Degenerate (near-impossible) case: nothing to cluster. The primary depth
+    # detection already succeeded, so warn and skip the optional FP add-on rather
+    # than aborting and discarding good results.
+    echo "WARNING: ${all_ltr_fa} is empty after stripping non-ACGT; skipping FP-family correction." >&2
+  else
+    # Locate Kmer2LTR (cloned into TOOLS_DIR by ltrharvest5.py during the rounds).
+    ensure_kmer2ltr_dir
+    KMER2LTR_PY="${TOOLS_DIR}/Kmer2LTR/Kmer2LTR.py"
+    FLAG_FP_PY="${TOOLS_DIR}/Kmer2LTR/flag_fp_families.py"
+
+    # (2) Build the consensus + internal LTR clusters at id 0.75 (developer-fixed).
+    set -x
+    python "$KMER2LTR_PY" \
+      -i "$all_ltr_fa" \
+      -o "${OUT_PREFIX}_all_ltr" \
+      --ltr-cluster --internal-cluster \
+      -p "$THREADS" \
+      --min-seq-id 0.75
+    set +x
+
+    # Resolve the produced cluster tables by glob (robust to id-tag formatting);
+    # a single --min-seq-id yields exactly one of each.
+    shopt -s nullglob
+    cons_cluster=( "${OUT_PREFIX}"_all_ltr.consensus_id*_cluster.tsv )
+    int_cluster=(  "${OUT_PREFIX}"_all_ltr.internal_id*_cluster.tsv )
+    shopt -u nullglob
+    cons_fa="${OUT_PREFIX}_all_ltr.consensus.fa"
+    (( ${#cons_cluster[@]} == 1 )) || die "Expected exactly 1 consensus cluster TSV, found ${#cons_cluster[@]}"
+    (( ${#int_cluster[@]}  == 1 )) || die "Expected exactly 1 internal cluster TSV, found ${#int_cluster[@]}"
+    [[ -s "$cons_fa" ]] || die "Missing consensus FASTA: $cons_fa"
+
+    # (3) Flag FP families, purge their rows from each depth TSV (-> *_clean_ltr.tsv),
+    #     and — only if the FP fraction exceeds --fp-mask-threshold — write the
+    #     masked genome that triggers an orchestrator re-run. --masked-out pins the
+    #     name to the prefix (default naming keys off the genome basename instead).
+    set -x
+    python "$FLAG_FP_PY" \
+      --consensus-cluster "${cons_cluster[0]}" \
+      --internal-cluster "${int_cluster[0]}" \
+      --ltr-fasta "$cons_fa" \
+      --domains-tsv "${depth_tsvs[@]}" \
+      -o "${OUT_PREFIX}_fpcheck" \
+      --genome "$GENOME" \
+      --masked-out "${OUT_PREFIX}_FP_masked.fa" \
+      --threads "$THREADS" \
+      --fp-mask-threshold "$FP_MASK_THRESHOLD"
+    set +x
+
+    if [[ -s "${OUT_PREFIX}_FP_masked.fa" ]]; then
+      echo "FP fraction exceeded --fp-mask-threshold (${FP_MASK_THRESHOLD}); wrote ${OUT_PREFIX}_FP_masked.fa."
+      echo "The orchestrator will re-run detection on the masked genome."
+    else
+      echo "FP fraction within --fp-mask-threshold (${FP_MASK_THRESHOLD}); no re-run needed."
+    fi
+  fi
 fi
 
 # Cleanup

@@ -40,13 +40,25 @@ Density correctness:
 - Per species, KDE per type is computed using SAME bandwidth as global KDE, then weighted by n_type/n_total.
   Stacked fill sums to the global density estimate, avoiding disproportionate bumps from tiny-count types.
 
+Chromosome detection:
+- The FAI is classified automatically (see detect_chromosomes). Chromosomes are
+  few, long, and usually carry a header convention distinct from scaffolds and
+  contigs; all three signals are used.
+- Chromosome-level assembly  -> scaffolds/contigs are dropped and only the
+  detected chromosomes are plotted.
+- Non-chromosome-level assembly -> the coordinate-based pages (karyotype,
+  density facets, windowed-K2P facets, and the chromosome panel of family pages)
+  are skipped. K2P and the three size distributions are unaffected and still
+  produced.
+- The call is always printed to stderr. Override with --chrom-regex or
+  --min-chrom-len; force the pages off with --no-chrom-plots.
+
 Assumptions:
 - Alignment file is whitespace-delimited with >= 11 columns
 - Column 1: "Chr:start-end#TYPE"
 - Column 3: LTR length (bp)
 - Column 11: K2P divergence
 - Full-length LTR-RT length is (end - start) (NOT +1), per your example (100-200 => 100)
-- Ignore scaffolds: any chromosome name containing "sca" (case-insensitive) excluded in FAI and TE intervals
 """
 
 import re
@@ -101,9 +113,9 @@ class Timer:
 # -----------------------------
 # IO / parsing
 # -----------------------------
-def read_fai_lengths(fai_path):
-    """Return OrderedDict {chrom: length}, excluding seqnames with 'sca' (case-insensitive)."""
-    chrom2len = {}
+def read_fai(fai_path):
+    """Return OrderedDict {seqname: length} for every sequence in a FAI."""
+    name2len = OrderedDict()
     with open(fai_path, "r") as f:
         for line in f:
             if not line.strip():
@@ -111,20 +123,222 @@ def read_fai_lengths(fai_path):
             parts = line.rstrip("\n").split("\t")
             if len(parts) < 2:
                 continue
-            chrom = parts[0]
-            if "sca" in chrom.lower():
-                continue
             try:
-                length = int(parts[1])
+                name2len[parts[0]] = int(parts[1])
             except ValueError:
                 continue
-            chrom2len[chrom] = length
+    return name2len
 
-    def sort_key(name):
+
+def sort_chrom_names(names):
+    """Karyotype order: alphabetic stem first, then trailing number."""
+    def key(name):
         m = re.search(r"(\d+)$", name)
         return (name[:m.start()] if m else name, int(m.group(1)) if m else 10**18, name)
+    return sorted(names, key=key)
 
-    return OrderedDict((k, chrom2len[k]) for k in sorted(chrom2len, key=sort_key))
+
+# -----------------------------
+# Chromosome detection
+# -----------------------------
+#
+# A mixed assembly holds two populations: chromosomes (few, long, usually sharing
+# a header convention) and everything else (many, short, a different convention).
+# Length and header turn out to be the same cliff-detection problem at two
+# granularities, so a single routine covers both:
+#
+#   header granularity  group sequences by header signature (digit runs collapsed
+#                       to '#'), then cut between groups. CM023363.1 and
+#                       CM023401.1 share 'CM#.#'; JAAQRD020000065.1 does not.
+#   length granularity  when headers carry no class signal they collapse to one
+#                       group; every sequence then becomes its own group and the
+#                       identical code path degenerates to a pure length cut.
+#
+# Headers are tried first because they are the only signal that survives size
+# classes overlapping -- an unplaced scaffold can be longer than a microchromosome,
+# so the chromosome set is not always a length-rank prefix. Length is the fallback
+# for assemblies whose headers say nothing (e.g. chromosomes still named
+# 'scaffold_N').
+#
+# Cuts are RANKED (not argmax'd) by Otsu between-class variance on log10(length),
+# and the best cut that survives the guards wins. Ranking is what makes this
+# robust: a spurious cliff gets skipped rather than obeyed.
+
+_DIGIT_RUN_RE = re.compile(r"\d+")
+
+# Guard defaults, tuned against a sweep of synthetic assembly shapes.
+CHROM_MAX_COUNT = 200     # chromosomes are FEW
+CHROM_MIN_FRAC = 0.30     # chromosomes ARE the genome (rejects fragmented assemblies)
+CHROM_MIN_FOLD = 2.0      # the size drop must be a cliff, not a gradient
+CHROM_PURE_RATIO = 0.10   # no junk class at all: everything is chromosome-scale
+
+
+def header_signature(name):
+    """Collapse digit runs, keeping the characters that mark the sequence class."""
+    return _DIGIT_RUN_RE.sub("#", name)
+
+
+def _rank_cuts(medians, counts):
+    """Rank cut points by Otsu between-class variance on log10(median length).
+
+    Cut j assigns groups[:j+1] to the chromosome class. Scoring on a log scale
+    makes this scale-free; weighting by group size keeps a 500-member scaffold
+    class from being outvoted by a 1-member chromosome class. Returns
+    [(score, j), ...] best first.
+    """
+    x = np.log10(np.maximum(np.asarray(medians, dtype=float), 1.0))
+    w = np.asarray(counts, dtype=float)
+    cw = np.cumsum(w)
+    cx = np.cumsum(w * x)
+    total_w, total_x = cw[-1], cx[-1]
+
+    scored = []
+    for j in range(len(medians) - 1):
+        w1, w2 = cw[j], total_w - cw[j]
+        if w1 <= 0 or w2 <= 0:
+            continue
+        m1, m2 = cx[j] / w1, (total_x - cx[j]) / w2
+        scored.append(((w1 * w2 / (total_w * total_w)) * (m1 - m2) ** 2, j))
+
+    scored.sort(reverse=True)
+    return scored
+
+
+def _best_partition(name2len, by_header, max_chroms, min_frac, min_fold):
+    """Best guard-passing chromosome set at one granularity, else None."""
+    buckets = OrderedDict()
+    for name in name2len:
+        key = header_signature(name) if by_header else name
+        buckets.setdefault(key, []).append(name)
+
+    groups = sorted(
+        ((names, float(np.median([name2len[n] for n in names]))) for names in buckets.values()),
+        key=lambda g: -g[1],
+    )
+    if len(groups) < 2:
+        return None
+
+    medians = [m for _, m in groups]
+    sizes = [len(names) for names, _ in groups]
+    cum_count = np.cumsum(sizes)
+    cum_mass = np.cumsum([sum(name2len[n] for n in names) for names, _ in groups])
+    total = float(sum(name2len.values()))
+
+    for _, j in _rank_cuts(medians, sizes):
+        fold = medians[j] / medians[j + 1] if medians[j + 1] > 0 else float("inf")
+        if fold < min_fold:
+            continue
+        if not (2 <= cum_count[j] <= max_chroms):
+            continue
+        mass = cum_mass[j] / total
+        if mass < min_frac:
+            continue
+        return {
+            "chroms": [n for names, _ in groups[: j + 1] for n in names],
+            "fold": float(fold),
+            "mass": float(mass),
+            "n_groups": len(groups),
+        }
+    return None
+
+
+def detect_chromosomes(
+    name2len,
+    max_chroms=CHROM_MAX_COUNT,
+    min_frac=CHROM_MIN_FRAC,
+    min_fold=CHROM_MIN_FOLD,
+    pure_ratio=CHROM_PURE_RATIO,
+):
+    """Split an assembly into chromosomes and everything else.
+
+    Returns (chrom_names, info). An empty chrom_names means the assembly is not
+    chromosome-level, and coordinate-based plots should be skipped.
+    """
+    info = {"rule": "not chromosome-level", "n_seqs": len(name2len),
+            "fold": None, "mass": None, "agree": None, "n_groups": None}
+    if len(name2len) < 2:
+        return [], info
+
+    lengths = sorted(name2len.values(), reverse=True)
+
+    # No junk class at all: every sequence is within pure_ratio of the largest.
+    if lengths[-1] >= pure_ratio * lengths[0] and len(lengths) <= max_chroms:
+        info.update(rule="pure-scale", mass=1.0)
+        return list(name2len), info
+
+    by_header = _best_partition(name2len, True, max_chroms, min_frac, min_fold)
+    by_length = _best_partition(name2len, False, max_chroms, min_frac, min_fold)
+
+    chosen = by_header or by_length
+    if chosen is None:
+        return [], info
+
+    if by_header and by_length:
+        # Independent corroboration when both granularities land on the same set.
+        info["agree"] = set(by_header["chroms"]) == set(by_length["chroms"])
+
+    info.update(
+        rule="header-class" if by_header else "length-cliff",
+        fold=chosen["fold"],
+        mass=chosen["mass"],
+        n_groups=chosen["n_groups"],
+    )
+    return chosen["chroms"], info
+
+
+def select_chromosomes(fai_path, chrom_regex=None, min_chrom_len=None):
+    """Read a FAI and decide which of its sequences are chromosomes.
+
+    Returns (chrom2len, all2len, info). chrom2len is empty when the assembly is
+    not chromosome-level. Explicit overrides bypass detection entirely.
+    """
+    all2len = read_fai(fai_path)
+    if not all2len:
+        return OrderedDict(), all2len, {"rule": "empty FAI", "n_seqs": 0,
+                                        "fold": None, "mass": None, "agree": None}
+
+    if chrom_regex:
+        rx = re.compile(chrom_regex)
+        chroms = [n for n in all2len if rx.search(n)]
+        info = {"rule": f"--chrom-regex {chrom_regex!r}", "n_seqs": len(all2len),
+                "fold": None, "mass": None, "agree": None}
+    elif min_chrom_len:
+        chroms = [n for n, L in all2len.items() if L >= int(min_chrom_len)]
+        info = {"rule": f"--min-chrom-len {int(min_chrom_len)}", "n_seqs": len(all2len),
+                "fold": None, "mass": None, "agree": None}
+    else:
+        chroms, info = detect_chromosomes(all2len)
+
+    if chroms:
+        total = float(sum(all2len.values()))
+        info["mass"] = sum(all2len[n] for n in chroms) / total if total else 0.0
+
+    chrom2len = OrderedDict((n, all2len[n]) for n in sort_chrom_names(chroms))
+    return chrom2len, all2len, info
+
+
+def report_chromosome_call(sp, chrom2len, all2len, info):
+    """Always say out loud what was decided -- a misfire must be visible, not silent."""
+    n_all = len(all2len)
+    if not chrom2len:
+        tlog(f"[{sp}] NOT chromosome-level ({n_all} sequences, rule: {info['rule']}). "
+             f"Skipping chromosome-based plots.", enabled=True)
+        return
+
+    bits = [f"{len(chrom2len)}/{n_all} sequences", f"rule: {info['rule']}"]
+    if info.get("mass") is not None:
+        bits.append(f"{info['mass']:.1%} of assembly bp")
+    if info.get("fold"):
+        bits.append(f"{info['fold']:,.1f}x size cliff")
+    if info.get("agree") is True:
+        bits.append("header + length agree")
+    elif info.get("agree") is False:
+        bits.append("WARNING: header and length disagree -- check --chrom-regex")
+
+    tlog(f"[{sp}] chromosome-level: " + "  |  ".join(bits), enabled=True)
+    kept = list(chrom2len)
+    preview = ", ".join(kept[:4]) + (f", ... , {kept[-1]}" if len(kept) > 5 else "")
+    tlog(f"[{sp}]   chromosomes: {preview}", enabled=True)
 
 
 def parse_alignment_file(path):
@@ -202,12 +416,10 @@ def compute_chrom_density(records, chrom2len, window_bp=1_000_000, step_bp=500_0
     if window_bp <= 0 or step_bp <= 0:
         return dens, centers
 
-    # index intervals by chrom
+    # index intervals by chrom (chrom2len is the authority on what is a chromosome)
     by_chrom = defaultdict(list)
     for r in records:
         chrom = r["chrom"]
-        if "sca" in chrom.lower():
-            continue
         if chrom not in chrom2len:
             continue
         start = max(0, int(r["start"]))
@@ -312,12 +524,10 @@ def compute_chrom_k2p_window_stats(records, chrom2len, window_bp=1_000_000, step
     if window_bp <= 0 or step_bp <= 0:
         return mean_k2p, err_k2p, n_k2p, centers
 
-    # index per chrom
+    # index per chrom (chrom2len is the authority on what is a chromosome)
     by_chrom = defaultdict(list)
     for r in records:
         chrom = r["chrom"]
-        if "sca" in chrom.lower():
-            continue
         if chrom not in chrom2len:
             continue
         k = r.get("k2p", None)
@@ -986,7 +1196,7 @@ def plot_chrom_panel(ax, sp_label, chrom2len, records, type_colors, dot_types, x
     ax.set_title(sp_label, fontsize=10)
 
     if not chrom2len:
-        ax.text(0.5, 0.5, "No chromosomes", ha="center", va="center", fontsize=9)
+        ax.text(0.5, 0.5, "not chromosome-level", ha="center", va="center", fontsize=9, alpha=0.6)
         ax.set_axis_off()
         return
 
@@ -997,8 +1207,6 @@ def plot_chrom_panel(ax, sp_label, chrom2len, records, type_colors, dot_types, x
 
     for r in records:
         chrom = r["chrom"]
-        if "sca" in chrom.lower():
-            continue
         if chrom not in chrom2len:
             continue
 
@@ -1206,8 +1414,30 @@ def main():
         help="Print timestamped timing logs to stderr to identify bottlenecks.",
     )
 
+    grp = ap.add_argument_group("chromosome detection")
+    grp.add_argument(
+        "--chrom-regex",
+        default=None,
+        help="Skip detection: sequences whose name matches this regex are the chromosomes. "
+             "Use when the heuristic misfires (e.g. --chrom-regex '^chr[0-9XYZW]+$').",
+    )
+    grp.add_argument(
+        "--min-chrom-len",
+        type=int,
+        default=None,
+        help="Skip detection: sequences at least this many bp are the chromosomes.",
+    )
+    grp.add_argument(
+        "--no-chrom-plots",
+        action="store_true",
+        help="Force-skip every chromosome-based page, however the assembly is classified.",
+    )
+
     args = ap.parse_args()
     timing = bool(args.timing)
+
+    if args.chrom_regex and args.min_chrom_len:
+        ap.error("--chrom-regex and --min-chrom-len are mutually exclusive")
 
     with Timer("Load species: read FAI + parse alignment + collect global TE types", enabled=timing):
         # Load species and build global TE type set for consistent colors
@@ -1219,8 +1449,17 @@ def main():
             fai = f"{sp}{args.fai_suffix}"
             aln = f"{sp}{args.aln_suffix}"
 
-            with Timer(f"[{sp}] read_fai_lengths({fai})", enabled=timing):
-                chrom2len = read_fai_lengths(fai)
+            with Timer(f"[{sp}] select_chromosomes({fai})", enabled=timing):
+                chrom2len, all2len, chrom_info = select_chromosomes(
+                    fai,
+                    chrom_regex=args.chrom_regex,
+                    min_chrom_len=args.min_chrom_len,
+                )
+            report_chromosome_call(sp, chrom2len, all2len, chrom_info)
+
+            if args.no_chrom_plots and chrom2len:
+                tlog(f"[{sp}] --no-chrom-plots given: skipping chromosome pages anyway.", enabled=True)
+                chrom2len = OrderedDict()
 
             with Timer(f"[{sp}] parse_alignment_file({aln})", enabled=timing):
                 records = parse_alignment_file(aln)
@@ -1229,14 +1468,23 @@ def main():
                 for r in records:
                     all_types.add(r["type"])
                     global_type_counts[r["type"]] += 1
-                species_data[sp] = {"chrom2len": chrom2len, "records": records}
+                species_data[sp] = {
+                    "chrom2len": chrom2len,
+                    "records": records,
+                    "is_chrom_level": bool(chrom2len),
+                }
 
             tlog(f"[{sp}] parsed records: {len(species_data[sp]['records'])}", enabled=timing)
-            tlog(f"[{sp}] chromosomes kept (non-sca): {len(species_data[sp]['chrom2len'])}", enabled=timing)
 
     with Timer("Build global type_colors", enabled=timing):
         type_colors = make_type_colors(all_types)
         tlog(f"Global TE types: {len(type_colors)}", enabled=timing)
+
+    # Coordinate-based pages need at least one chromosome-level assembly.
+    any_chrom_level = any(species_data[sp]["is_chrom_level"] for sp in args.species)
+    if not any_chrom_level:
+        tlog("No species is chromosome-level: skipping karyotype, density-facet and "
+             "windowed-K2P pages. K2P and size distributions are unaffected.", enabled=True)
 
     with Timer(f"Open PDF for writing: {args.outpdf}", enabled=timing):
         with PdfPages(args.outpdf) as pdf:
@@ -1384,7 +1632,7 @@ def main():
                         fig.suptitle(title, fontsize=12)
 
                         if embed_legend and (not args.legend_page):
-                            add_embedded_legend(fig, type_colors, type_counts=type_counts, ncol=args.embedded_legend_cols, fontsize=7)
+                            add_embedded_legend(fig, type_colors, type_counts=global_type_counts, ncol=args.embedded_legend_cols, fontsize=7)
 
                             fig.tight_layout(rect=[0, 0, 0.72, 0.96])
                         else:
@@ -1418,29 +1666,31 @@ def main():
                     embed_legend=True,
                 )
 
-                # Chromosome multipanel
-                dot_note = ("  |  dots: " + ", ".join(args.dot_type)) if args.dot_type else ""
-                def chr_plotter(ax, sp):
-                    plot_chrom_panel(
-                        ax=ax,
-                        sp_label=sp,
-                        chrom2len=species_data[sp]["chrom2len"],
-                        records=species_data[sp]["records"],
-                        type_colors=type_colors,
-                        dot_types=args.dot_type,
-                        x_max=global_chr_xmax if global_chr_xmax > 0 else None,
+                # Chromosome multipanel. A shared page survives if ANY species is
+                # chromosome-level; the rest get a placeholder panel.
+                if any_chrom_level:
+                    dot_note = ("  |  dots: " + ", ".join(args.dot_type)) if args.dot_type else ""
+                    def chr_plotter(ax, sp):
+                        plot_chrom_panel(
+                            ax=ax,
+                            sp_label=sp,
+                            chrom2len=species_data[sp]["chrom2len"],
+                            records=species_data[sp]["records"],
+                            type_colors=type_colors,
+                            dot_types=args.dot_type,
+                            x_max=global_chr_xmax if global_chr_xmax > 0 else None,
+                        )
+
+                    save_multipanel_page(
+                        title=f"Chromosome distribution of LTR-RTs (shared x-axis){dot_note}",
+                        plotter=chr_plotter,
+                        xlabel="bp",
+                        ylabel="Chromosomes",
+                        embed_legend=True,
                     )
 
-                save_multipanel_page(
-                    title=f"Chromosome distribution of LTR-RTs (shared x-axis){dot_note}",
-                    plotter=chr_plotter,
-                    xlabel="bp",
-                    ylabel="Chromosomes",
-                    embed_legend=True,
-                )
-
                 # Extra chromosome multipanel page: only records in first K2P hist bin
-                if args.k2p_mode == "hist":
+                if any_chrom_level and args.k2p_mode == "hist":
                     k2p_lo = 0.0
                     k2p_hi = float(args.k2p_bin_width)
                     dot_note2 = ("  |  dots: " + ", ".join(args.dot_type)) if args.dot_type else ""
@@ -1472,6 +1722,9 @@ def main():
 
                 # Density-style chromosome distribution (one page per species; faceted by chromosome)
                 for sp in args.species:
+                    if not species_data[sp]["is_chrom_level"]:
+                        continue
+
                     plot_chrom_density_facets(
                         pdf=pdf,
                         sp=sp,
@@ -1560,82 +1813,23 @@ def main():
                         pdf.savefig(fig)
                         plt.close(fig)
 
-                    # 2) Chromosome distribution
-                    with Timer(f"[{sp}] page: Chromosome distribution render+save", enabled=timing):
-                        fig_h = max(6, 0.35 * max(1, len(chrom2len)))
-                        fig, ax = plt.subplots(figsize=(11, fig_h))
-                        dot_note = (" | dots: " + ", ".join(args.dot_type)) if args.dot_type else ""
-                        plot_chrom_panel(
-                            ax=ax,
-                            sp_label=f"{sp}: Chromosome distribution{dot_note}",
-                            chrom2len=chrom2len,
-                            records=records,
-                            type_colors=type_colors,
-                            dot_types=args.dot_type,
-                            x_max=None,
-                            merge_gap_bp=args.chr_merge_gap,
-                            rasterize=args.chr_rasterize,
-                        )
-
-                        ax.set_xlabel("Position (bp)")
-                        maybe_embed_legend(fig)
-                        if not args.legend_page:
-                            fig.tight_layout(rect=[0, 0, 0.72, 1])
-                        else:
-                            fig.tight_layout()
-                        pdf.savefig(fig)
-                        plt.close(fig)
-
-                    # 2b) Chromosome distribution (density-style; faceted)
-                    plot_chrom_density_facets(
-                        pdf=pdf,
-                        sp=sp,
-                        chrom2len=chrom2len,
-                        records=records,
-                        type_colors=type_colors,
-                        window_bp=args.dens_window,
-                        step_bp=args.dens_step,
-                        threshold_percent=args.dens_threshold,
-                        top_n=args.dens_top_types,
-                        type_counts=global_type_counts,
-                        legend_page=args.legend_page,
-                        embedded_legend_cols=args.embedded_legend_cols,
-                        timing=timing,
-                    )
-
-                    plot_chrom_k2p_mean_facets(
-                            pdf=pdf,
-                            sp=sp,
-                            chrom2len=species_data[sp]["chrom2len"],
-                            records=species_data[sp]["records"],
-                            window_bp=args.dens_window,
-                            step_bp=args.dens_step,
-                            legend_page=args.legend_page,
-                            timing=timing,
-                        )
-
-
-                    # 2a) Chromosome distribution for first K2P hist bin only (hist mode only)
-                    if args.k2p_mode == "hist":
-                        k2p_lo = 0.0
-                        k2p_hi = float(args.k2p_bin_width)
-
-                        records_k2p0 = filter_records_by_k2p_range(records, k2p_lo, k2p_hi, inclusive_max=False)
-
-                        with Timer(f"[{sp}] page: Chromosome distribution (K2P in [{k2p_lo:.4f},{k2p_hi:.4f}))", enabled=timing):
+                    # 2, 2a, 2b) Coordinate-based pages -- only for chromosome-level assemblies.
+                    if species_data[sp]["is_chrom_level"]:
+                        # 2) Chromosome distribution
+                        with Timer(f"[{sp}] page: Chromosome distribution render+save", enabled=timing):
                             fig_h = max(6, 0.35 * max(1, len(chrom2len)))
                             fig, ax = plt.subplots(figsize=(11, fig_h))
-
+                            dot_note = (" | dots: " + ", ".join(args.dot_type)) if args.dot_type else ""
                             plot_chrom_panel(
                                 ax=ax,
-                                sp_label=f"{sp}: Chromosome distribution (K2P in [{k2p_lo:.4f},{k2p_hi:.4f}))",
+                                sp_label=f"{sp}: Chromosome distribution{dot_note}",
                                 chrom2len=chrom2len,
-                                records=records_k2p0,
+                                records=records,
                                 type_colors=type_colors,
                                 dot_types=args.dot_type,
                                 x_max=None,
                                 merge_gap_bp=args.chr_merge_gap,
-                                rasterize=False,
+                                rasterize=args.chr_rasterize,
                             )
 
                             ax.set_xlabel("Position (bp)")
@@ -1646,6 +1840,66 @@ def main():
                                 fig.tight_layout()
                             pdf.savefig(fig)
                             plt.close(fig)
+
+                        # 2b) Chromosome distribution (density-style; faceted)
+                        plot_chrom_density_facets(
+                            pdf=pdf,
+                            sp=sp,
+                            chrom2len=chrom2len,
+                            records=records,
+                            type_colors=type_colors,
+                            window_bp=args.dens_window,
+                            step_bp=args.dens_step,
+                            threshold_percent=args.dens_threshold,
+                            top_n=args.dens_top_types,
+                            type_counts=global_type_counts,
+                            legend_page=args.legend_page,
+                            embedded_legend_cols=args.embedded_legend_cols,
+                            timing=timing,
+                        )
+
+                        plot_chrom_k2p_mean_facets(
+                            pdf=pdf,
+                            sp=sp,
+                            chrom2len=chrom2len,
+                            records=records,
+                            window_bp=args.dens_window,
+                            step_bp=args.dens_step,
+                            legend_page=args.legend_page,
+                            timing=timing,
+                        )
+
+                        # 2a) Chromosome distribution for first K2P hist bin only (hist mode only)
+                        if args.k2p_mode == "hist":
+                            k2p_lo = 0.0
+                            k2p_hi = float(args.k2p_bin_width)
+
+                            records_k2p0 = filter_records_by_k2p_range(records, k2p_lo, k2p_hi, inclusive_max=False)
+
+                            with Timer(f"[{sp}] page: Chromosome distribution (K2P in [{k2p_lo:.4f},{k2p_hi:.4f}))", enabled=timing):
+                                fig_h = max(6, 0.35 * max(1, len(chrom2len)))
+                                fig, ax = plt.subplots(figsize=(11, fig_h))
+
+                                plot_chrom_panel(
+                                    ax=ax,
+                                    sp_label=f"{sp}: Chromosome distribution (K2P in [{k2p_lo:.4f},{k2p_hi:.4f}))",
+                                    chrom2len=chrom2len,
+                                    records=records_k2p0,
+                                    type_colors=type_colors,
+                                    dot_types=args.dot_type,
+                                    x_max=None,
+                                    merge_gap_bp=args.chr_merge_gap,
+                                    rasterize=False,
+                                )
+
+                                ax.set_xlabel("Position (bp)")
+                                maybe_embed_legend(fig)
+                                if not args.legend_page:
+                                    fig.tight_layout(rect=[0, 0, 0.72, 1])
+                                else:
+                                    fig.tight_layout()
+                                pdf.savefig(fig)
+                                plt.close(fig)
 
             # -----------------------------
             # Optional: family-level pages via mmseqs easy-cluster
@@ -1680,10 +1934,16 @@ def main():
                     # Sort families: biggest first
                     big_reps.sort(key=lambda r: (-rep_counts[r], r))
 
-                    # ---- helper: write a two-panel page ----
+                    # ---- helper: K2P + chromosome panels, or K2P alone when the
+                    #      assembly has no chromosomes to plot against ----
+                    is_chrom_level = species_data[sp]["is_chrom_level"]
+
                     def write_family_page(title_left, recs_left, title_right, recs_right, suptitle):
-                        fig, axes = plt.subplots(1, 2, figsize=(11, 6))
-                        ax1, ax2 = axes
+                        if is_chrom_level:
+                            fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(11, 6))
+                        else:
+                            fig, ax1 = plt.subplots(1, 1, figsize=(11, 6))
+                            ax2 = None
 
                         # K2P
                         if args.k2p_mode == "kde":
@@ -1707,18 +1967,19 @@ def main():
                         ax1.set_ylabel("Density")
 
                         # Chrom (NEVER rasterized for family pages)
-                        plot_chrom_panel(
-                            ax=ax2,
-                            sp_label=title_right,
-                            chrom2len=chrom2len,
-                            records=recs_right,
-                            type_colors=type_colors,
-                            dot_types=args.dot_type,
-                            x_max=None,
-                            merge_gap_bp=args.chr_merge_gap,
-                            rasterize=False,
-                        )
-                        ax2.set_xlabel("Position (bp)")
+                        if ax2 is not None:
+                            plot_chrom_panel(
+                                ax=ax2,
+                                sp_label=title_right,
+                                chrom2len=chrom2len,
+                                records=recs_right,
+                                type_colors=type_colors,
+                                dot_types=args.dot_type,
+                                x_max=None,
+                                merge_gap_bp=args.chr_merge_gap,
+                                rasterize=False,
+                            )
+                            ax2.set_xlabel("Position (bp)")
 
                         fig.suptitle(suptitle, fontsize=12)
 
@@ -1816,4 +2077,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-    

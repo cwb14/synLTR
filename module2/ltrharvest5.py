@@ -1355,11 +1355,12 @@ def load_tebinsorter_domains_from_db(db_path: str, pipeline_py_path: str,
     if not p.exists() or p.stat().st_size == 0:
         return result
 
-    src_dir = str(Path(pipeline_py_path).resolve().parent)
-    if src_dir not in sys.path:
-        sys.path.insert(0, src_dir)
-    from classifier import (hmm2best, apply_filters, parse_clade_rexdb,
-                             parse_clade_gydb, DB_CONFIGS)
+    classifier = import_tebinsorter_classifier(pipeline_py_path)
+    hmm2best = classifier.hmm2best
+    apply_filters = classifier.apply_filters
+    parse_clade_rexdb = classifier.parse_clade_rexdb
+    parse_clade_gydb = classifier.parse_clade_gydb
+    DB_CONFIGS = classifier.DB_CONFIGS
 
     config = DB_CONFIGS.get(db_name)
     if config is None:
@@ -1672,37 +1673,91 @@ def ensure_tools(tools_dir: Path) -> Tuple[str, str]:
 # Step 9: TEsorter
 # -----------------------------
 
+# Upstream rebranded the checkout to TEsorter2, turning the flat src/ directory
+# into an importable tesorter2/ package whose modules use relative imports. A
+# package layout therefore has to be launched with -m and the repo root on
+# PYTHONPATH; pipeline.py can no longer be run as a bare script path. Both
+# layouts are probed so older checkouts keep working.
+_TEBINSORTER_PKG_DIRS = ("tesorter2", "src")
+
+
+def find_tebinsorter_pipeline(tb_dir: Path) -> Optional[Path]:
+    """Locate pipeline.py in either the package or the legacy src/ layout."""
+    for sub in _TEBINSORTER_PKG_DIRS:
+        cand = Path(tb_dir) / sub / "pipeline.py"
+        if cand.exists():
+            return cand
+    return None
+
+
+def tebinsorter_argv(pipeline_py: Path) -> Tuple[List[str], Dict[str, str]]:
+    """Interpreter argv and environment for invoking a TEBinSorter pipeline.py.
+
+    PYTHONSAFEPATH keeps the working directory off sys.path so a stray
+    stdlib-shadowing module there cannot break the import (ignored pre-3.11).
+    """
+    pipeline_py = Path(pipeline_py).resolve()
+    pkg_dir = pipeline_py.parent
+    env = dict(os.environ)
+    if (pkg_dir / "__init__.py").exists():
+        prev = env.get("PYTHONPATH")
+        env["PYTHONPATH"] = os.pathsep.join(
+            [str(pkg_dir.parent)] + ([prev] if prev else []))
+        env["PYTHONSAFEPATH"] = "1"
+        return ["python3", "-m", f"{pkg_dir.name}.{pipeline_py.stem}"], env
+    return ["python3", str(pipeline_py)], env
+
+
+def import_tebinsorter_classifier(pipeline_py_path: str):
+    """Import the checkout's classifier module, whichever layout it uses."""
+    import importlib
+    import sys
+    pkg_dir = Path(pipeline_py_path).resolve().parent
+    if (pkg_dir / "__init__.py").exists():
+        root, name = str(pkg_dir.parent), f"{pkg_dir.name}.classifier"
+    else:
+        root, name = str(pkg_dir), "classifier"
+    if root not in sys.path:
+        sys.path.insert(0, root)
+    return importlib.import_module(name)
+
+
 def tool_usable_tebinsorter(tb_dir: Path) -> bool:
-    pipeline_py = tb_dir / "src" / "pipeline.py"
-    if not pipeline_py.exists():
+    pipeline_py = find_tebinsorter_pipeline(tb_dir)
+    if pipeline_py is None:
         return False
     try:
+        argv, env = tebinsorter_argv(pipeline_py)
         r = subprocess.run(
-            ["python3", str(pipeline_py), "-h"],
+            argv + ["-h"],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
+            env=env,
         )
         txt = (r.stdout or "") + "\n" + (r.stderr or "")
-        return ("usage: TEBinSorter" in txt) or (r.returncode == 0)
+        return ("usage: TEBinSorter" in txt) or ("usage: tesorter2" in txt) \
+            or (r.returncode == 0)
     except Exception:
         return False
 
 def ensure_tebinsorter(tools_dir: Path, local_path: Optional[str] = None) -> str:
-    """Return path to TEBinSorter src/pipeline.py.
+    """Return path to the TEBinSorter pipeline.py.
 
     If local_path (or env TEBINSORTER_SRC) is set, use that checkout instead of
     cloning the feat/minimap2 branch from GitHub.
     """
+    hint = ("Expected pipeline.py under one of: "
+            + ", ".join(f"{d}/" for d in _TEBINSORTER_PKG_DIRS))
+
     local = local_path or os.environ.get("TEBINSORTER_SRC")
     if local:
         tb_dir = Path(local).expanduser().resolve()
         if not tool_usable_tebinsorter(tb_dir):
             raise RuntimeError(
-                f"--tebinsorter-path given but unusable: {tb_dir}\n"
-                f"Try: python3 {tb_dir}/src/pipeline.py -h"
+                f"--tebinsorter-path given but unusable: {tb_dir}\n{hint}"
             )
-        return str((tb_dir / "src" / "pipeline.py").resolve())
+        return str(find_tebinsorter_pipeline(tb_dir))
 
     tools_dir = mkdirp(tools_dir)
     tb_dir = tools_dir / "TEBinSorter"
@@ -1719,11 +1774,10 @@ def ensure_tebinsorter(tools_dir: Path, local_path: Optional[str] = None) -> str
 
         if not tool_usable_tebinsorter(tb_dir):
             raise RuntimeError(
-                f"TEBinSorter appears unusable in: {tb_dir}\n"
-                f"Try: python3 {tb_dir}/src/pipeline.py -h"
+                f"TEBinSorter appears unusable in: {tb_dir}\n{hint}"
             )
 
-    return str((tb_dir / "src" / "pipeline.py").resolve())
+    return str(find_tebinsorter_pipeline(tb_dir))
 
 def tool_usable_trfmod(bin_path: Path) -> bool:
     if not bin_path.exists() or not os.access(str(bin_path), os.X_OK):
@@ -1775,8 +1829,8 @@ def run_tebinsorter(stitched_fa: str, pipeline_py_path: str, outdir: Path,
     stitched_fa_abs = str(Path(stitched_fa).resolve())
     base = Path(stitched_fa_abs).name
 
-    cmd = [
-        "python3", str(Path(pipeline_py_path).resolve()),
+    argv, env = tebinsorter_argv(Path(pipeline_py_path))
+    cmd = argv + [
         stitched_fa_abs,
         "-d", db,
         "-p", str(threads),
@@ -1804,7 +1858,7 @@ def run_tebinsorter(stitched_fa: str, pipeline_py_path: str, outdir: Path,
         label = f"  $ {' '.join(cmd)}\n    (cwd: {outdir})"
         print(label, file=sys.stderr)
 
-    r = subprocess.run(cmd, cwd=str(outdir), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    r = subprocess.run(cmd, cwd=str(outdir), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env)
     if r.returncode != 0:
         raise RuntimeError(f"TEBinSorter failed:\n{(r.stderr or '').strip()}")
 
@@ -3509,8 +3563,9 @@ def main():
                          "(reproduces TEBinSorter master's blastn pass-2).")
     ap.add_argument("--tebinsorter-path", default=None,
                     help="Path to a local TEBinSorter checkout; uses its "
-                         "src/pipeline.py instead of cloning feat/minimap2 from "
-                         "GitHub. Falls back to env TEBINSORTER_SRC.")
+                         "tesorter2/ (or legacy src/) pipeline.py instead of "
+                         "cloning feat/minimap2 from GitHub. Falls back to env "
+                         "TEBINSORTER_SRC.")
 
     ap.add_argument(
         "--pass2-classified-fasta",

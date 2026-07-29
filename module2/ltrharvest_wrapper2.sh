@@ -767,6 +767,13 @@ for (( round=1; round<=MAX_ROUNDS; round++ )); do
   clean_and_concat_libs "$temp_lib" "${libs[@]}"
 done
 
+# A run that completed no rounds produced no library at all. Without this the
+# reconciler below is skipped and the wrapper still exits 0, reporting success
+# for a run whose very first round died (e.g. a missing helper tool).
+if (( ${#completed_round_prefixes[@]} == 0 )); then
+  die "No detection round completed; no LTR library was produced. See the round errors above."
+fi
+
 # ----------------------------
 # Reconcile nested-status across rounds into depth-bucketed outputs.
 # Each element's inward-chain depth (how many LTR-RT layers are nested inside

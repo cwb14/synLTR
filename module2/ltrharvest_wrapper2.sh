@@ -83,6 +83,7 @@ RUN_TRF=true
 WFA_ALIGN=false
 KEEP_WEAK_HMM_PASS2=false
 PASS2_ALIGNER="minimap2"
+RUN_PLOTS=true
 
 # FP-family correction (post-detection Kmer2LTR stage)
 FP_MASK_THRESHOLD="0.10"   # user-tunable: FP-element fraction above which the
@@ -131,6 +132,9 @@ Optional:
                         hard-masked and the whole pipeline is automatically re-run
                         on the masked genome (default 0.10; higher tolerates more
                         false positives before masking/re-running).
+  --no-plots                Skip the post-completion plotting stage
+                            (ltrharvest_plots.sh: structure PDFs, summary PDF,
+                            TEGV HTML into <out_prefix>_plots/). Default: run it.
 
 Post-detection FP-family correction runs automatically: it clusters the detected
 LTR-RTs with Kmer2LTR, purges false-positive families into
@@ -395,6 +399,18 @@ run_fp_orchestrator() {
   local elapsed=$((SECONDS - WRAPPER_START))
   printf 'FP-correction complete (%d attempt(s), total %d:%02d).\n' \
     "$attempt" $((elapsed / 60)) $((elapsed % 60))
+
+  if [[ "$RUN_PLOTS" == true ]]; then
+    echo ""
+    echo "Post-completion plotting (disable with --no-plots)..."
+    if bash "${SCRIPT_PATH}/ltrharvest_plots.sh" \
+         --prefix "$OUT_PREFIX" --genome "$abs_genome" \
+         --indir "$final_dir" --script_path "$SCRIPT_PATH"; then
+      echo "Plots written to: ${final_dir}/${OUT_PREFIX}_plots"
+    else
+      echo "[WARN] plotting stage reported failures; annotation outputs are unaffected." >&2
+    fi
+  fi
 }
 
 # ----------------------------
@@ -417,6 +433,7 @@ while [[ $# -gt 0 ]]; do
     --keep-weak-hmm-pass2-matches) KEEP_WEAK_HMM_PASS2=true; shift;;
     --pass2-aligner) PASS2_ALIGNER="${2:-}"; shift 2;;
     --fp-mask-threshold) FP_MASK_THRESHOLD="${2:-}"; shift 2;;
+    --no-plots) RUN_PLOTS=false; shift;;
     --dev-keep-fp-rounds) DEV_KEEP_FP_ROUNDS=true; shift;;      # hidden dev flag
     --dev-max-fp-rounds) MAX_FP_ROUNDS="${2:-}"; shift 2;;       # hidden dev flag
     --ltrharvest5-args)

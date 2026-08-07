@@ -2883,7 +2883,7 @@ def dedup_kmer2ltr_tsv(kmer2ltr_tsv: str, out_tsv: str, threshold: float,
         # Header line
         out.write("#name\tLTR_len\taln_len\tsubs\tti\ttv\traw_d\traw_T\t"
                   "JC69_d\tJC69_T\tK2P_d\tK2P_T\tleft_trim\tright_trim\t"
-                  "tsd\tdomains\tnest_status\n")
+                  "ltr5_end\tltr3_start\ttsd\tdomains\tnest_status\n")
         for raw in fin:
             if not raw.strip():
                 continue

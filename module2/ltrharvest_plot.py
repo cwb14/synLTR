@@ -56,11 +56,12 @@ Chromosome detection:
 Assumptions:
 - Alignment file is whitespace-delimited with >= 11 columns
 - Column 1: "Chr:start-end#TYPE"
-- Column 3: LTR length (bp)
+- Column 2: LTR length (bp)
 - Column 11: K2P divergence
 - Full-length LTR-RT length is (end - start) (NOT +1), per your example (100-200 => 100)
 """
 
+import os
 import re
 import math
 import argparse
@@ -345,7 +346,7 @@ def parse_alignment_file(path):
     """
     Parse alignment file:
       col1 => chrom, start, end, type
-      col3 => LTR length
+      col2 => LTR length
       col11 => K2P
     """
     records = []
@@ -371,7 +372,7 @@ def parse_alignment_file(path):
             full_len = max(0, end - start)
 
             try:
-                ltr_len = int(float(parts[2]))  # column3
+                ltr_len = int(float(parts[1]))  # column 2: LTR_len
             except ValueError:
                 ltr_len = None
 
@@ -1449,13 +1450,18 @@ def main():
             fai = f"{sp}{args.fai_suffix}"
             aln = f"{sp}{args.aln_suffix}"
 
-            with Timer(f"[{sp}] select_chromosomes({fai})", enabled=timing):
-                chrom2len, all2len, chrom_info = select_chromosomes(
-                    fai,
-                    chrom_regex=args.chrom_regex,
-                    min_chrom_len=args.min_chrom_len,
-                )
-            report_chromosome_call(sp, chrom2len, all2len, chrom_info)
+            if not os.path.exists(fai):
+                tlog(f"[{sp}] {fai} not found: skipping chromosome-based pages "
+                     f"(K2P and size distributions unaffected).", enabled=True)
+                chrom2len, all2len = OrderedDict(), OrderedDict()
+            else:
+                with Timer(f"[{sp}] select_chromosomes({fai})", enabled=timing):
+                    chrom2len, all2len, chrom_info = select_chromosomes(
+                        fai,
+                        chrom_regex=args.chrom_regex,
+                        min_chrom_len=args.min_chrom_len,
+                    )
+                report_chromosome_call(sp, chrom2len, all2len, chrom_info)
 
             if args.no_chrom_plots and chrom2len:
                 tlog(f"[{sp}] --no-chrom-plots given: skipping chromosome pages anyway.", enabled=True)

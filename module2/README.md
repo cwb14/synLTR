@@ -30,7 +30,7 @@ Most runs only need three flags:
 | Flag | Meaning |
 |---|---|
 | `--genome` | Genome FASTA (`.fa`/`.fasta`, plain or `.gz`). **Required.** |
-| `--proteins` | **Can come from any related species** — it does not have to match the genome. Recommended (see Benchmarks). |
+| `--proteins` | **Can come from any related species** — it does not have to match the genome. Recommended. |
 | `--threads` | CPU threads (default 20). |
 
 Occasionally useful:

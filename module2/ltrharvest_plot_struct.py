@@ -545,27 +545,42 @@ def resolve_depth_files(tsv: Optional[str], prefix: Optional[str], indir: str,
                         depth) -> List[Tuple[str, int]]:
     """Return [(path, depth_int)] to LOAD into the pool. Always loads every
     available depth for a prefix (so hosts can resolve their children across
-    depths); the caller applies the focus filter afterward. For --tsv, globs
-    sibling *_depth<N>_ltr.tsv files when the name matches, else loads that file
-    alone at depth 0."""
+    depths); the caller applies the focus filter afterward. Prefers the
+    FP-purged *_depth<N>_clean_ltr.tsv set when present, falling back to
+    *_depth<N>_ltr.tsv. For --tsv, globs sibling depth files of the same
+    variant (clean or raw) when the name matches, else loads that file alone
+    at depth 0."""
     import glob
+
+    CLEAN_RX = r"_depth(\d+)_clean_ltr\.tsv$"
+    RAW_RX = r"_depth(\d+)_ltr\.tsv$"  # digits directly before _ltr.tsv: excludes _clean files
+
+    def _collect(d0: str, base: str, pattern: str) -> List[Tuple[str, int]]:
+        out: List[Tuple[str, int]] = []
+        for p in sorted(glob.glob(os.path.join(d0, f"{base}_depth*_ltr.tsv"))):
+            m = re.search(pattern, os.path.basename(p))
+            if m:
+                out.append((p, int(m.group(1))))
+        return out
+
     files: List[Tuple[str, int]] = []
     if prefix:
-        pat = os.path.join(indir, f"{prefix}_depth*_ltr.tsv")
-        for p in sorted(glob.glob(pat)):
-            m = re.search(r"_depth(\d+)_ltr\.tsv$", os.path.basename(p))
-            if m:
-                files.append((p, int(m.group(1))))
+        files = _collect(indir, prefix, CLEAN_RX)
+        variant = "clean (FP-purged)"
+        if not files:
+            files = _collect(indir, prefix, RAW_RX)
+            variant = "raw (no *_clean_ltr.tsv found)"
+        if files:
+            print(f"[INFO] depth files [{variant}]: "
+                  + ", ".join(os.path.basename(p) for p, _ in files))
     else:
-        m = re.search(r"_depth(\d+)_ltr\.tsv$", os.path.basename(tsv))
+        base_name = os.path.basename(tsv)
+        m_clean = re.search(CLEAN_RX, base_name)
+        m = m_clean or re.search(RAW_RX, base_name)
         if m:
             d0 = os.path.dirname(tsv) or "."
-            base = os.path.basename(tsv)[:m.start()]  # '<prefix>'
-            pat = os.path.join(d0, f"{base}_depth*_ltr.tsv")
-            for p in sorted(glob.glob(pat)):
-                mm = re.search(r"_depth(\d+)_ltr\.tsv$", os.path.basename(p))
-                if mm:
-                    files.append((p, int(mm.group(1))))
+            base = base_name[:m.start()]
+            files = _collect(d0, base, CLEAN_RX if m_clean else RAW_RX)
         if not files:
             files = [(tsv, 0)]
     return files
@@ -2089,7 +2104,7 @@ def main():
                          "higher values loosen it. Also scales the MAD multiplier for small families.")
     ap.add_argument("--min_ltr_aln", type=int, default=100,
                     help="Minimum LTR_LEN and ALN_LEN (bp) for dubious-clade quality filter "
-                         "(default 120). Elements in mixture/unknown clades with LTR_LEN or "
+                         "(default 100). Elements in mixture/unknown clades with LTR_LEN or "
                          "ALN_LEN below this value are flagged.")
     ap.add_argument("--dubious_k2p", type=float, default=0.15,
                     help="K2P divergence cutoff for dubious clades (mixture/unknown). "

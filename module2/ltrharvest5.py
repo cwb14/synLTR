@@ -1742,15 +1742,16 @@ def tool_usable_tebinsorter(tb_dir: Path) -> bool:
         return False
 
 def ensure_tebinsorter(tools_dir: Path, local_path: Optional[str] = None) -> str:
-    """Return path to the TEBinSorter pipeline.py.
+    """Return path to the TEsorter2 pipeline.py.
 
-    If local_path (or env TEBINSORTER_SRC) is set, use that checkout instead of
-    cloning the feat/minimap2 branch from GitHub.
+    If local_path (or env TESORTER2_SRC / legacy TEBINSORTER_SRC) is set, use
+    that checkout instead of cloning the feat/minimap2 branch from GitHub.
     """
     hint = ("Expected pipeline.py under one of: "
             + ", ".join(f"{d}/" for d in _TEBINSORTER_PKG_DIRS))
 
-    local = local_path or os.environ.get("TEBINSORTER_SRC")
+    local = (local_path or os.environ.get("TESORTER2_SRC")
+             or os.environ.get("TEBINSORTER_SRC"))
     if local:
         tb_dir = Path(local).expanduser().resolve()
         if not tool_usable_tebinsorter(tb_dir):
@@ -1760,7 +1761,7 @@ def ensure_tebinsorter(tools_dir: Path, local_path: Optional[str] = None) -> str
         return str(find_tebinsorter_pipeline(tb_dir))
 
     tools_dir = mkdirp(tools_dir)
-    tb_dir = tools_dir / "TEBinSorter"
+    tb_dir = tools_dir / "TEsorter2"
 
     if not tool_usable_tebinsorter(tb_dir):
         if not tb_dir.exists():
@@ -1768,13 +1769,13 @@ def ensure_tebinsorter(tools_dir: Path, local_path: Optional[str] = None) -> str
                 "git", "clone",
                 "--branch", "feat/minimap2",
                 "--single-branch",
-                "https://github.com/cwb14/TEBinSorter.git",
+                "https://github.com/cwb14/TEsorter2.git",
                 str(tb_dir)
             ], check=True)
 
         if not tool_usable_tebinsorter(tb_dir):
             raise RuntimeError(
-                f"TEBinSorter appears unusable in: {tb_dir}\n{hint}"
+                f"TEsorter2 appears unusable in: {tb_dir}\n{hint}"
             )
 
     return str(find_tebinsorter_pipeline(tb_dir))
@@ -1840,10 +1841,10 @@ def run_tebinsorter(stitched_fa: str, pipeline_py_path: str, outdir: Path,
         "--compat-tesorter-output",
     ]
 
-    # Only append for non-default to stay compatible with older TEBinSorter
-    # checkouts that predate --pass2-aligner.
-    if pass2_aligner != "minimap2":
-        cmd += ["--pass2-aligner", pass2_aligner]
+    # TEsorter2's --pass2-aligner default flipped from minimap2 to blast
+    # (upstream commit "Mirror upstream pass-2 defaults"), so the aligner must
+    # always be stated explicitly.
+    cmd += ["--pass2-aligner", pass2_aligner]
 
     if pass2_classified_fasta:
         p2 = Path(pass2_classified_fasta).resolve()
@@ -3552,20 +3553,20 @@ def main():
     ap.add_argument("--tesorter-db", default="rexdb",
                     help="TEBinSorter HMM database alias (-d). "
                          "Aliases: rexdb, gydb, line, tir, sine, sine-so. Default: rexdb.")
-    ap.add_argument("--tesorter-rule", default="70-70-80",
-                    help="TEBinSorter pass-2 rule I-C-L (-rule). "
+    ap.add_argument("--tesorter-rule", default="70-70-70",
+                    help="TEsorter2 pass-2 rule I-C-L (-rule). "
                          "I -> --min-pid; C -> --min-qcov AND --min-tcov; L parsed but unused.")
     ap.add_argument("--tesorter-minimap2-extra", default="",
-                    help="Extra flags forwarded to TEBinSorter's --minimap2-extra (advanced).")
+                    help="Extra flags forwarded to TEsorter2's --minimap2-extra (advanced).")
     ap.add_argument("--pass2-aligner", choices=["minimap2", "blast"],
                     default="minimap2",
-                    help="TEBinSorter pass-2 aligner: minimap2 (default) or blast "
-                         "(reproduces TEBinSorter master's blastn pass-2).")
+                    help="TEsorter2 pass-2 aligner: minimap2 (default) or blast "
+                         "(reproduces TEsorter2 master's blastn pass-2).")
     ap.add_argument("--tebinsorter-path", default=None,
-                    help="Path to a local TEBinSorter checkout; uses its "
+                    help="Path to a local TEsorter2 checkout; uses its "
                          "tesorter2/ (or legacy src/) pipeline.py instead of "
                          "cloning feat/minimap2 from GitHub. Falls back to env "
-                         "TEBINSORTER_SRC.")
+                         "TESORTER2_SRC (or legacy TEBINSORTER_SRC).")
 
     ap.add_argument(
         "--pass2-classified-fasta",

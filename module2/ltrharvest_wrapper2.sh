@@ -47,7 +47,8 @@
 #         outermost putative LTR-RT of each element -> {OUT_PREFIX}_all_ltr.fa
 #     (2) clusters those with Kmer2LTR (consensus + internal clustering, id 0.75)
 #     (3) runs flag_fp_families.py to flag FP families and purge their rows from
-#         each depth TSV -> {OUT_PREFIX}_depth{N}_clean_ltr.tsv
+#         each depth TSV -> {OUT_PREFIX}_depth{N}_clean_ltr.tsv, then writes the
+#         matching FP-purged FASTA -> {OUT_PREFIX}_depth{N}_clean_ltr.fa
 #   If the FP fraction exceeds --fp-mask-threshold, flag_fp_families.py hard-masks
 #   those repeats in the genome ({OUT_PREFIX}_FP_masked.fa) and the ENTIRE pipeline
 #   is automatically re-run on the masked genome. Each attempt runs fully isolated
@@ -133,8 +134,8 @@ Optional:
 
 Post-detection FP-family correction runs automatically: it clusters the detected
 LTR-RTs with Kmer2LTR, purges false-positive families into
-<out_prefix>_depth{N}_clean_ltr.tsv, and (when FPs are pervasive) masks the genome
-and re-runs. See the script header for details.
+<out_prefix>_depth{N}_clean_ltr.{tsv,fa}, and (when FPs are pervasive) masks the
+genome and re-runs. See the script header for details.
 
 Extra ltrharvest5.py options:
   --ltrharvest5-args "KEY=VALUE [KEY2=VALUE2 ...]"
@@ -805,9 +806,9 @@ fi
 # ----------------------------
 # FP-family correction (Kmer2LTR). Runs on the reconciled depth outputs. Must
 # run BEFORE the TOOLS_DIR cleanup below (Kmer2LTR lives in TOOLS_DIR/Kmer2LTR).
-# Produces {OUT_PREFIX}_depth{N}_clean_ltr.tsv, and — only when the FP fraction
-# exceeds --fp-mask-threshold — {OUT_PREFIX}_FP_masked.fa, which the orchestrator
-# detects to trigger an automatic re-run.
+# Produces {OUT_PREFIX}_depth{N}_clean_ltr.{tsv,fa}, and — only when the FP
+# fraction exceeds --fp-mask-threshold — {OUT_PREFIX}_FP_masked.fa, which the
+# orchestrator detects to trigger an automatic re-run.
 # ----------------------------
 shopt -s nullglob
 depth_fas=( "${OUT_PREFIX}"_depth*_ltr.fa )
@@ -876,6 +877,23 @@ if (( ${#depth_fas[@]} > 0 )); then
       --threads "$THREADS" \
       --fp-mask-threshold "$FP_MASK_THRESHOLD"
     set +x
+
+    # (4) Emit an FP-cleaned FASTA next to each cleaned TSV: keep only records
+    #     whose full header equals a surviving element id (TSV column 1; the
+    #     reconciler writes depth-FASTA headers as exactly that id).
+    for dtsv in "${depth_tsvs[@]}"; do
+      clean_tsv="${dtsv%_ltr.tsv}_clean_ltr.tsv"
+      depth_fa="${dtsv%_ltr.tsv}_ltr.fa"
+      clean_fa="${dtsv%_ltr.tsv}_clean_ltr.fa"
+      if [[ ! -s "$clean_tsv" || ! -s "$depth_fa" ]]; then
+        echo "WARNING: skipping cleaned FASTA for ${dtsv}: missing ${clean_tsv} or ${depth_fa}" >&2
+        continue
+      fi
+      awk -F'\t' 'NR==FNR { if ($0 !~ /^#/ && NF >= 2) keep[$1] = 1; next }
+                  /^>/ { p = (substr($0, 2) in keep) } p' \
+        "$clean_tsv" "$depth_fa" > "$clean_fa"
+      echo "Cleaned FASTA: ${clean_fa} ($(count_fasta_headers "$clean_fa") records)"
+    done
 
     if [[ -s "${OUT_PREFIX}_FP_masked.fa" ]]; then
       echo "FP fraction exceeded --fp-mask-threshold (${FP_MASK_THRESHOLD}); wrote ${OUT_PREFIX}_FP_masked.fa."

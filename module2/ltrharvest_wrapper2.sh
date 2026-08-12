@@ -56,6 +56,17 @@
 #   final outputs; the hidden --dev-keep-fp-rounds flag retains every attempt for
 #   debugging. See the "FP-correction orchestrator" section below.
 
+# ANNOTATION ADD-ONS (post FP-correction):
+#   (a) ltr_annotate.py inserts `strand` and `family` columns into every
+#       {OUT_PREFIX}_depth{N}_ltr.tsv and _depth{N}_clean_ltr.tsv, between `tsd`
+#       and `domains`. Strand is TEsorter2's call, falling back to protein-domain
+#       order and then to the minimap2 pass-2 homology target. Family is the
+#       Kmer2LTR/mmseqs consensus cluster, labelled {OUT_PREFIX}_fam00001 onward.
+#   (b) ltr_tsv_to_gff3.py pools those tables into
+#       {OUT_PREFIX}_all_depth_LTR_cleaned.gff3, and - when round 1 produced a
+#       miniprot genic GFF - {OUT_PREFIX}_all_depth_protein_LTR_cleaned.gff3,
+#       which additionally carries every miniprot protein alignment.
+
 set -euo pipefail
 
 # Print the exact command for reproducibility
@@ -140,6 +151,12 @@ Post-detection FP-family correction runs automatically: it clusters the detected
 LTR-RTs with Kmer2LTR, purges false-positive families into
 <out_prefix>_depth{N}_clean_ltr.{tsv,fa}, and (when FPs are pervasive) masks the
 genome and re-runs. See the script header for details.
+
+Annotation add-ons then run automatically: every depth table gains `strand` and
+`family` columns, and the tables are pooled into
+<out_prefix>_all_depth_LTR_cleaned.gff3 (plus
+<out_prefix>_all_depth_protein_LTR_cleaned.gff3 when --proteins was given, which
+also carries the miniprot alignments).
 
 Extra ltrharvest5.py options:
   --ltrharvest5-args "KEY=VALUE [KEY2=VALUE2 ...]"
@@ -502,9 +519,13 @@ fi
 LTRHARVEST="${SCRIPT_PATH}/ltrharvest5.py"
 MASKLTR="${SCRIPT_PATH}/mask_ltr.py"
 RECONCILER="${SCRIPT_PATH}/reconcile_nests.py"
+ANNOTATOR="${SCRIPT_PATH}/ltr_annotate.py"
+GFF3_WRITER="${SCRIPT_PATH}/ltr_tsv_to_gff3.py"
 [[ -f "$LTRHARVEST" ]] || die "Missing: $LTRHARVEST"
 [[ -f "$MASKLTR" ]] || die "Missing: $MASKLTR"
 [[ -f "$RECONCILER" ]] || die "Missing: $RECONCILER"
+[[ -f "$ANNOTATOR" ]] || die "Missing: $ANNOTATOR"
+[[ -f "$GFF3_WRITER" ]] || die "Missing: $GFF3_WRITER"
 
 # ----------------------------
 # Orchestrator vs. worker
@@ -919,6 +940,45 @@ if (( ${#depth_fas[@]} > 0 )); then
       echo "FP fraction within --fp-mask-threshold (${FP_MASK_THRESHOLD}); no re-run needed."
     fi
   fi
+fi
+
+# ----------------------------
+# Annotation add-ons: strand + family columns, then GFF3.
+#
+# ltr_annotate.py rewrites every {OUT_PREFIX}_depth{N}[_clean]_ltr.tsv in place,
+# inserting `strand` and `family` after `tsd`. The columns go before
+# domains/nest_status because ltrharvest_plot_struct.py and TEGV.py read those
+# two from the end of the row.
+#
+# ltr_tsv_to_gff3.py then pools the annotated tables (FP-purged set preferred)
+# into {OUT_PREFIX}_all_depth_LTR_cleaned.gff3, plus
+# {OUT_PREFIX}_all_depth_protein_LTR_cleaned.gff3 when round 1 produced a
+# miniprot genic GFF (i.e. when --proteins was given).
+#
+# Both degrade gracefully on missing inputs, so a non-zero exit is a real fault
+# and is fatal -- unlike the advisory plotting stage.
+# ----------------------------
+shopt -s nullglob
+annot_tsvs=( "${OUT_PREFIX}"_depth*_ltr.tsv )
+shopt -u nullglob
+
+if (( ${#annot_tsvs[@]} > 0 )); then
+  echo ""
+  echo "============================================================"
+  echo "Annotating ${#annot_tsvs[@]} depth table(s) with strand + family..."
+  set -x
+  python "$ANNOTATOR" --prefix "$OUT_PREFIX" --indir .
+  set +x
+
+  echo ""
+  echo "============================================================"
+  echo "Writing LTR-RT GFF3..."
+  set -x
+  python "$GFF3_WRITER" --prefix "$OUT_PREFIX" --indir . --genome "$GENOME"
+  set +x
+else
+  echo "WARNING: no ${OUT_PREFIX}_depth<N>_ltr.tsv present; skipping the" >&2
+  echo "strand/family annotation and GFF3 stages." >&2
 fi
 
 # Cleanup

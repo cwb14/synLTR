@@ -66,7 +66,7 @@ Athal_tair10_chr2_LTRs_depth1_clean_ltr.fa
 
 ### 4.1 `depth<N>_clean_ltr.tsv` format
 
-Tab-separated, one row per element, 19 named columns
+Tab-separated, one row per element, 21 named columns
 (`#`-prefixed header line):
 
 | # | Column | Meaning |
@@ -88,9 +88,10 @@ Tab-separated, one row per element, 19 named columns
 | 15 | `ltr5_end` | Last bp of the 5′ LTR (1-based, relative to the element) |
 | 16 | `ltr3_start` | First bp of the 3′ LTR (1-based, relative to the element) |
 | 17 | `tsd` | Target-site duplication motif, or `.` if none found |
-| 18 | `domains` | Protein domains with genomic coords: `DOMAIN\|Clade@start-end;...` e.g. `RT\|Bianca@910695-911483;INT\|Bianca@912348-912953`, or `.` |
-| 19 | `nest_status` | Nesting relations: `nest-outer:chrom:s-e` (that element is inside me) and/or `nest-inner:chrom:s-e` (I am inside that element), `;`-joined; `.` if un-nested |
-
+| 18 | `strand` | `+`, `-`, or `.` if undetermined — see 4.1.1 |
+| 19 | `family` | `<prefix>_fam00001` … — see section 5 |
+| 20 | `domains` | Protein domains with genomic coords: `DOMAIN\|Clade@start-end;...` e.g. `RT\|Bianca@910695-911483;INT\|Bianca@912348-912953`, or `.` |
+| 21 | `nest_status` | Nesting relations: `nest-outer:chrom:s-e` (that element is inside me) and/or `nest-inner:chrom:s-e` (I am inside that element), `;`-joined; `.` if un-nested |
 
 ### 4.2 `depth<N>_clean_ltr.fa` format — nested regions are masked
 
@@ -118,18 +119,40 @@ awk '/^>/{if(s)print s; s=""; print; next}{gsub(/[^ACGTacgt]/,""); s=s $0}END{if
 
 `depth0` records contain no masked nest-ins, so this is only needed for depth ≥ 1.
 
-## 5. Families: `*_all_ltr.consensus_id0.75_cluster.tsv`
+## 6. GFF3 annotation
+
+Two files, pooled across all depths and built from the FP-purged
+`_clean_ltr.tsv` set (falling back to the raw set, with a warning, if the FP
+stage never ran):
+
+| Output | Contents |
+|---|---|
+| `<prefix>_all_depth_LTR_cleaned.gff3` | The LTR-RTs |
+| `<prefix>_all_depth_protein_LTR_cleaned.gff3` | The same, plus every miniprot protein alignment. Only written when the run had `--proteins` |
+
+Each element is one block:
 
 ```
-family_representative                 member
-Chr2:102001-110500#LTR/Gypsy/Reina    Chr2:102001-110500#LTR/Gypsy/Reina
-Chr2:102001-110500#LTR/Gypsy/Reina    Chr2:355010-361200#LTR/Gypsy/Reina
-Chr2:900444-905810#LTR/Copia/Ale      Chr2:900444-905810#LTR/Copia/Ale
+chr  synLTR  LTR_retrotransposon   13031  17307  .  -  .  ID=…_LTRRT_00001;Name=chr:13031-17307;
+                                                            classification=LTR/Gypsy/Tekay;superfamily=Gypsy;clade=Tekay;
+                                                            family=…_fam00001;family_size=5;depth=0;
+                                                            K2P_d=0.026305;K2P_T=438418;strand_source=tesorter
+chr  synLTR  long_terminal_repeat  13031  14048  .  -  .  ID=…_LTRRT_00001.lLTR;Parent=…_LTRRT_00001
+chr  synLTR  long_terminal_repeat  16290  17307  .  -  .  ID=…_LTRRT_00001.rLTR;Parent=…_LTRRT_00001
+chr  synLTR  protein_match         14482  14712  .  -  .  ID=…_LTRRT_00001.CHD.1;Parent=…;Name=CHD;clade=Tekay
+###
 ```
 
-A **family = all rows sharing the same representative**.
+Notes:
 
-## 6. Plots (`<prefix>_plots/`)
+- Nested elements are **flat top-level features**, not children of their host:
+  GFF3 `Parent` means part-of, and a nested LTR-RT is not a part of the element
+  it landed in. Use the `depth` and `nest_status` attributes instead.
+- Blocks are coordinate-sorted, and lines within a block are too, but
+  **overlapping blocks are not interleaved** — so a nested element's block
+  follows its host's in full.
+
+## 7. Plots (`<prefix>_plots/`)
 
 | Output | What it shows |
 |---|---|
@@ -139,7 +162,7 @@ A **family = all rows sharing the same representative**.
 | `<prefix>_summary.pdf` | Multi-page summary |
 | `<prefix>_TEGV.html` | Self-contained interactive genome browser (open in web browser) |
 
-## 7. Benchmarks
+## 8. Benchmarks
 
 On a simulated genome (PrinTE) with 4,468 true intact LTR-RTs, 20 threads,
 scored at ≥90% reciprocal overlap:

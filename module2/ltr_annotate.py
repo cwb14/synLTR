@@ -22,6 +22,11 @@ Strand is resolved by a four-tier cascade, most authoritative first:
   3. pass2        inherited from the minimap2 pass-2 homology target
   4. .            unknown
 
+A fifth tier was tried and removed: orienting an unstranded element against
+stranded members of its own family. See memo_module2_edits.md -- it returned
+'+' for every element it touched and was wrong on 5 of 5 elements whose own
+domains said '-'.
+
 Family labels ({prefix}_fam00001, ...) come from the Kmer2LTR/mmseqs consensus
 cluster table, numbered by descending family size.
 
@@ -51,6 +56,11 @@ FAMILY_COL = "family"
 ANCHOR_COL = "tsd"
 
 UNKNOWN = "."
+
+# Clade label for members whose name carries no '#Order/Superfamily/Clade'
+# suffix. Matches the token TEsorter itself writes for an unresolved clade, so
+# family compositions stay in one vocabulary.
+UNCLASSIFIED_CLADE = "unknown"
 
 # The wrapper hard-caps detection at 10 rounds, so depth cannot exceed 10.
 # Probing numerically (rather than globbing) keeps depth0, depth1, ... in
@@ -197,6 +207,19 @@ def superfamily_of(name: str) -> str:
         return ""
     bits = name.split("#", 1)[1].split("/")
     return bits[1] if len(bits) > 1 else ""
+
+
+def clade_of(name: str) -> str:
+    """Last field of the '#Order/Superfamily/Clade' suffix.
+
+    Falls back to UNCLASSIFIED_CLADE so that members carrying no classification
+    still count toward a family's denominator rather than silently vanishing
+    from its composition.
+    """
+    if "#" not in name:
+        return UNCLASSIFIED_CLADE
+    bits = name.split("#", 1)[1].split("/")
+    return (bits[2] if len(bits) > 2 else "") or UNCLASSIFIED_CLADE
 
 
 def parse_domains_field(field: str) -> List[Tuple[str, int, int]]:
@@ -405,7 +428,7 @@ def resolve_strands(elements: Dict[str, ElementInfo],
                     orientation: Dict[Tuple[str, str], str],
                     verbose: bool = False
                     ) -> Tuple[Dict[str, str], Dict[str, str]]:
-    """Run the four-tier cascade.
+    """Run the strand cascade.
 
     `elements` maps element key -> ElementInfo for the rows being annotated; it
     drives tier 2, which needs per-element evidence. Tiers 1 and 3 operate on the
@@ -461,6 +484,17 @@ class Family(NamedTuple):
     family_id: str
     representative: str
     size: int
+    # (clade, member count), most abundant first. Counted over exactly the
+    # members that `size` counts, so the two can never disagree.
+    clades: Tuple[Tuple[str, int], ...] = ()
+
+
+def clade_composition(members: Sequence[str]) -> Tuple[Tuple[str, int], ...]:
+    """(clade, count) pairs for a family's members, most abundant first."""
+    counts: Dict[str, int] = defaultdict(int)
+    for member in members:
+        counts[clade_of(member)] += 1
+    return tuple(sorted(counts.items(), key=lambda kv: (-kv[1], kv[0])))
 
 
 def load_families(prefix: str, indir: str = ".", verbose: bool = False,
@@ -508,7 +542,8 @@ def load_families(prefix: str, indir: str = ".", verbose: bool = False,
     ambiguous_coords = set()
     for index, rep in enumerate(order, start=1):
         family = Family(f"{prefix}_fam{index:0{width}d}", rep,
-                        len(members_by_rep[rep]))
+                        len(members_by_rep[rep]),
+                        clade_composition(members_by_rep[rep]))
         for member in members_by_rep[rep]:
             by_name[member] = family
             coord = element_key(member)
@@ -649,9 +684,9 @@ def annotate(prefix: str, indir: str = ".", verbose: bool = False) -> int:
 
     tesorter = load_tesorter_strands(prefix, indir, verbose)
     target_of, orientation = load_pass2_links(prefix, indir, verbose)
+    family_by_name, family_by_coord = load_families(prefix, indir, verbose)
     strand, source = resolve_strands(elements, tesorter, target_of, orientation,
                                      verbose)
-    family_by_name, family_by_coord = load_families(prefix, indir, verbose)
 
     total_rows = 0
     total_skipped = 0
@@ -667,7 +702,6 @@ def annotate(prefix: str, indir: str = ".", verbose: bool = False) -> int:
     log(f"strand: {tiers['tesorter']} tesorter, {tiers['domain_order']} "
         f"domain_order, {tiers['pass2']} pass2, {tiers['unknown']} unknown "
         f"({len(elements)} elements)")
-
     hits = [lookup_family(info.name, key, family_by_name, family_by_coord)
             for key, info in elements.items()]
     assigned = [f for f in hits if f is not None]

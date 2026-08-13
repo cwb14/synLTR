@@ -60,12 +60,14 @@
 #   (a) ltr_annotate.py inserts `strand` and `family` columns into every
 #       {OUT_PREFIX}_depth{N}_ltr.tsv and _depth{N}_clean_ltr.tsv, between `tsd`
 #       and `domains`. Strand is TEsorter2's call, falling back to protein-domain
-#       order and then to the minimap2 pass-2 homology target. Family is the
-#       Kmer2LTR/mmseqs consensus cluster, labelled {OUT_PREFIX}_fam00001 onward.
+#       order and then to the minimap2 pass-2 homology target; elements with no
+#       usable evidence keep '.'. Family is the Kmer2LTR/mmseqs consensus
+#       cluster, labelled {OUT_PREFIX}_fam00001 onward.
 #   (b) ltr_tsv_to_gff3.py pools those tables into
 #       {OUT_PREFIX}_all_depth_LTR_cleaned.gff3, and - when round 1 produced a
 #       miniprot genic GFF - {OUT_PREFIX}_all_depth_protein_LTR_cleaned.gff3,
-#       which additionally carries every miniprot protein alignment.
+#       which additionally carries every miniprot protein alignment. Each
+#       element carries its family's clade makeup as family_clades=.
 
 set -euo pipefail
 

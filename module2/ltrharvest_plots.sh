@@ -4,7 +4,8 @@
 # Discovers the final annotation files a wrapper run left behind (preferring
 # the FP-purged *_depth<N>_clean_ltr.* set), derives the small inputs the
 # plotters need (chrom sizes, combined TSV), and runs:
-#   1. ltrharvest_plot_struct.py  — per-family structure PDFs
+#   1. ltrharvest_plot_struct.py  — per-family structure PDFs, drawn both with
+#                                   nested insertions in place and excised
 #   2. ltrharvest_plot.py         — multi-page summary PDF (K2P, karyotype, sizes)
 #   3. TEGV.py                    — interactive HTML viewer
 # Each plotter is independent: a failure prints [WARN] and the others still
@@ -36,12 +37,22 @@ Options:
   --out-dir DIR        Plot output directory (default: <indir>/<prefix>_plots).
   --script_path DIR    Directory holding the plotting .py scripts
                        (default: directory of this script).
+  --nesting MODE       Structure PDFs: expanded | collapsed | both
+                       (default: both -- writes <family>_individual_expanded.pdf
+                       and <family>_individual_collapsed.pdf; any other mode
+                       writes a single <family>_individual.pdf).
+  --k2p-mode MODE      Summary PDF K2P panels: hist | kde (default: hist,
+                       i.e. binned density bars rather than a smoothed curve).
+  --k2p-bin-width F    Bin width for --k2p-mode hist (default: 0.0005).
+  --family-k2p-xmax F  Lock family-page K2P x-axes to [0, F]. Default: the
+                       99th percentile of the pooled K2P.
   -v, --verbose        Echo each plotter command before running it.
   -h, --help           This help.
 EOF
 }
 
 PREFIX="" GENOME="" INDIR="." OUT_DIR="" SCRIPT_PATH="" VERBOSE=false
+NESTING="both" K2P_MODE="hist" K2P_BIN_WIDTH="" FAMILY_K2P_XMAX=""
 [[ $# -eq 0 ]] && { usage; exit 1; }
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -50,6 +61,10 @@ while [[ $# -gt 0 ]]; do
     --indir) INDIR="${2:-}"; shift 2;;
     --out-dir) OUT_DIR="${2:-}"; shift 2;;
     --script_path) SCRIPT_PATH="${2:-}"; shift 2;;
+    --nesting) NESTING="${2:-}"; shift 2;;
+    --k2p-mode) K2P_MODE="${2:-}"; shift 2;;
+    --k2p-bin-width) K2P_BIN_WIDTH="${2:-}"; shift 2;;
+    --family-k2p-xmax) FAMILY_K2P_XMAX="${2:-}"; shift 2;;
     -v|--verbose) VERBOSE=true; shift;;
     -h|--help) usage; exit 0;;
     *) die "Unknown argument: $1 (use --help)";;
@@ -57,6 +72,8 @@ while [[ $# -gt 0 ]]; do
 done
 
 [[ -n "$PREFIX" ]] || die "--prefix is required"
+case "$NESTING" in expanded|collapsed|both) ;; *) die "--nesting must be expanded, collapsed or both (got: $NESTING)";; esac
+case "$K2P_MODE" in hist|kde) ;; *) die "--k2p-mode must be hist or kde (got: $K2P_MODE)";; esac
 [[ -n "$GENOME" ]] || die "--genome is required"
 [[ -f "$GENOME" ]] || die "Genome not found: $GENOME"
 [[ -d "$INDIR" ]] || die "Input directory not found: $INDIR"
@@ -121,15 +138,18 @@ run_plotter() {
 }
 
 plot_struct() {
-  vlog python "${SCRIPT_PATH}/ltrharvest_plot_struct.py" --prefix "$PREFIX" \
-    --indir "$INDIR" --out_dir "${OUT_DIR}/struct" --depth all
-  python "${SCRIPT_PATH}/ltrharvest_plot_struct.py" --prefix "$PREFIX" \
-    --indir "$INDIR" --out_dir "${OUT_DIR}/struct" --depth all
+  local args=(--prefix "$PREFIX" --indir "$INDIR" --out_dir "${OUT_DIR}/struct" \
+              --depth all --nesting "$NESTING")
+  vlog python "${SCRIPT_PATH}/ltrharvest_plot_struct.py" "${args[*]}"
+  python "${SCRIPT_PATH}/ltrharvest_plot_struct.py" "${args[@]}"
 }
 
 plot_summary() {
   local args=(--species "$PREFIX" --fai-suffix .chrom.sizes \
-              --aln-suffix _combined_ltr.tsv --outpdf "${PREFIX}_summary.pdf")
+              --aln-suffix _combined_ltr.tsv --outpdf "${PREFIX}_summary.pdf" \
+              --k2p-mode "$K2P_MODE")
+  [[ -n "$K2P_BIN_WIDTH" ]] && args+=(--k2p-bin-width "$K2P_BIN_WIDTH")
+  [[ -n "$FAMILY_K2P_XMAX" ]] && args+=(--family-k2p-xmax "$FAMILY_K2P_XMAX")
   local cluster="${INDIR}/${PREFIX}_all_ltr.consensus_id0.75_cluster.tsv"
   if [[ -s "$cluster" ]]; then
     args+=(--mmseqs-tsv "$cluster" --family-min-count 10)

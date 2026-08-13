@@ -37,6 +37,7 @@ from __future__ import annotations
 import argparse
 import glob
 import gzip
+import math
 import os
 import sys
 from typing import Dict, List, NamedTuple, Optional, Sequence, Tuple
@@ -79,7 +80,19 @@ def log(msg: str) -> None:
     print(f"[ltr_tsv_to_gff3] {msg}")
 
 
+class Raw(str):
+    """An attribute value that is already column-9 safe and must not be escaped.
+
+    Used for values whose ',' is meant as GFF3's own multi-value separator and
+    whose '%' is meant to read as a percent sign. '%' followed by a non-hex pair
+    is not a valid percent-escape, so a spec-compliant reader passes it through
+    unchanged rather than mis-decoding it.
+    """
+
+
 def escape(value: object) -> str:
+    if isinstance(value, Raw):
+        return str(value)
     return "".join(_ESCAPES.get(ch, ch) for ch in str(value))
 
 
@@ -94,8 +107,26 @@ def render_attributes(pairs: Sequence[Tuple[str, object]]) -> str:
         text = "" if value is None else str(value)
         if text in ("", UNKNOWN):
             continue
-        out.append(f"{escape(key)}={escape(text)}")
+        out.append(f"{escape(key)}={escape(value)}")
     return ";".join(out)
+
+
+def format_clade_composition(clades: Sequence[Tuple[str, int]], total: int) -> str:
+    """Family clade makeup as '50%_SIRE,30%_unknown,15%_CRM,5%_Tekay'.
+
+    Percentages are of family size, rounded half-up to whole numbers; a clade
+    that rounds to 0% is dropped rather than written as '0%_'. Because of that
+    (and of rounding generally) the printed percentages need not total 100.
+    """
+    if total <= 0:
+        return ""
+    parts = []
+    for clade, count in clades:
+        percent = int(math.floor(100.0 * count / total + 0.5))
+        if percent > 0:
+            parts.append((percent, clade))
+    parts.sort(key=lambda item: (-item[0], item[1]))
+    return ",".join(f"{percent}%_{clade}" for percent, clade in parts)
 
 
 def gff_line(seqid: str, ftype: str, start: int, end: int, strand: str,
@@ -280,6 +311,9 @@ def build_element_blocks(prefix: str, tables, ranker: SeqidRanker,
                 ("family", family_label),
                 ("family_rep", family.representative if family else ""),
                 ("family_size", family.size if family else ""),
+                ("family_clades",
+                 Raw(format_clade_composition(family.clades, family.size))
+                 if family else ""),
                 ("depth", table.depth),
                 ("ltr_len", _field(row, names, "LTR_len")),
                 ("aln_len", _field(row, names, "aln_len")),
@@ -481,8 +515,8 @@ def write_gff3(path: str,
 # -----------------------------
 # Strand provenance
 # -----------------------------
-def strand_provenance(prefix: str, indir: str, tables, verbose: bool = False
-                      ) -> Dict[str, Tuple[str, str]]:
+def strand_provenance(prefix: str, indir: str, tables, families,
+                      verbose: bool = False) -> Dict[str, Tuple[str, str]]:
     """Recompute the strand cascade purely to label each call's origin.
 
     Returns element key -> (strand the cascade would give, tier name). The
@@ -490,6 +524,7 @@ def strand_provenance(prefix: str, indir: str, tables, verbose: bool = False
     what the user sees in the TSV; this only supplies the strand_source
     attribute. A disagreement -- a hand-edited table, say -- is reported as
     'table' rather than a tier name.
+
     """
     elements = collect_elements(load_unannotated(t.path) for t in tables)
 
@@ -532,8 +567,8 @@ def convert(prefix: str, indir: str = ".", genome: Optional[str] = None,
             warn(f"genome not found: {genome}; omitting ##sequence-region")
 
     ranker = SeqidRanker(list(seq_lengths) if seq_lengths else ())
-    provenance = strand_provenance(prefix, indir, tables, verbose)
     families = load_families(prefix, indir, verbose=False, warn_missing=False)
+    provenance = strand_provenance(prefix, indir, tables, families, verbose)
     element_blocks, skipped = build_element_blocks(prefix, tables, ranker,
                                                    provenance, families, verbose)
     if skipped:

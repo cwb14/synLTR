@@ -23,6 +23,22 @@ Per species, the script can produce 5 plot types:
   4) LTR size distribution (stacked bars; 50 bp bins; col3)
   5) Internal size distribution (stacked bars; 50 bp bins; full - 2*ltr)
 
+Nested elements:
+- A nest-outer element spans every LTR-RT inserted into it, so its raw genomic
+  span is partly somebody else's element -- for a typical grass genome that is
+  over half the span of a nest-outer element. Full-length and internal sizes
+  therefore have the merged spans of the nested insertions (read from the
+  `nest_status` column) subtracted. --keep-nested-length restores the raw spans.
+- LTR length is left alone: nested insertions land in the internal region, and
+  the rare ones that clip an LTR do so by a few bp.
+
+Family pages:
+- The K2P x-axis is locked across every family page (see --family-k2p-xmax) so
+  panels can be compared by eye while paging through the PDF. The y-axis stays
+  per-family. A panel whose family loses more than 2% of its members off the
+  right-hand end says so in the corner, since a locked axis crops the oldest
+  families and a sparse panel would otherwise read as missing data.
+
 Legend behavior:
 - If --legend-page is set:
     * A single legend-only page is added (colors are global & consistent)
@@ -77,6 +93,13 @@ from matplotlib.patches import Patch
 
 
 COL1_RE = re.compile(r"^(?P<chrom>[^:]+):(?P<start>\d+)-(?P<end>\d+)#(?P<typ>.+)$")
+
+# One token of the `nest_status` column: an LTR-RT nested inside this element.
+# 'nest-inner:' tokens (this element's own hosts) deliberately do not match.
+NEST_OUTER_RE = re.compile(r"^nest-outer:(?P<chrom>.+):(?P<start>\d+)-(?P<end>\d+)$")
+
+# Percentile of the pooled K2P used for the automatic family-page x-axis lock.
+FAMILY_K2P_PERCENTILE = 99.0
 
 
 # -----------------------------
@@ -342,20 +365,89 @@ def report_chromosome_call(sp, chrom2len, all2len, info):
     tlog(f"[{sp}]   chromosomes: {preview}", enabled=True)
 
 
-def parse_alignment_file(path):
+def split_row(line):
+    """Tab-split a TSV row, whitespace-split anything else.
+
+    The depth tables this script is normally fed are tab-separated; the older
+    whitespace-delimited inputs it was written for are still accepted. Tabs win
+    when present so that an empty field cannot silently shift every column to
+    its left.
+    """
+    return line.split("\t") if "\t" in line else line.split()
+
+
+def nested_span_bp(nest_status, chrom, start, end):
+    """Bases of [start, end) occupied by LTR-RTs nested inside this element.
+
+    `nest_status` carries one 'nest-outer:chrom:s-e' token per element nested
+    within this one. Tokens routinely overlap -- a nested element that is
+    itself a host is listed alongside its own child -- so the spans are clipped
+    to the host and merged before being counted.
+
+    Anything that is not a nest-outer token on this element's own sequence
+    contributes nothing, which makes the field safe to read positionally.
+    """
+    if not nest_status or nest_status == ".":
+        return 0
+
+    spans = []
+    for token in nest_status.split(";"):
+        m = NEST_OUTER_RE.match(token.strip())
+        if not m or m.group("chrom") != chrom:
+            continue
+        s, e = int(m.group("start")), int(m.group("end"))
+        if e < s:
+            s, e = e, s
+        s, e = max(s, start), min(e, end)
+        if e > s:
+            spans.append((s, e))
+
+    if not spans:
+        return 0
+
+    spans.sort()
+    total = 0
+    cur_s, cur_e = spans[0]
+    for s, e in spans[1:]:
+        if s <= cur_e:
+            cur_e = max(cur_e, e)
+        else:
+            total += cur_e - cur_s
+            cur_s, cur_e = s, e
+    return total + (cur_e - cur_s)
+
+
+def parse_alignment_file(path, subtract_nested=True):
     """
     Parse alignment file:
-      col1 => chrom, start, end, type
-      col2 => LTR length
-      col11 => K2P
+      col1        => chrom, start, end, type
+      col2        => LTR length
+      col11       => K2P
+      nest_status => LTR-RTs nested inside this element (by header name when the
+                     file has a header, else the last column)
+
+    With subtract_nested (the default), full_len and internal_len exclude any
+    LTR-RT nested inside the element. A nest-outer element spans its insertions,
+    so counting them charges one element's length to another -- for a typical
+    nest-outer element that is over half of its genomic span, which visibly
+    stretches the right tail of every size distribution.
     """
     records = []
+    names = []
+    nest_index = None
     with open(path, "r") as f:
         for line in f:
-            line = line.strip()
-            if not line or line.startswith("#"):
+            line = line.rstrip("\n")
+            if not line.strip():
                 continue
-            parts = line.split()
+            if line.startswith("#"):
+                if not names:
+                    names = [c.lstrip("#").strip() for c in split_row(line)]
+                    if "nest_status" in names:
+                        nest_index = names.index("nest_status")
+                continue
+
+            parts = split_row(line)
             if len(parts) < 11:
                 continue
 
@@ -368,8 +460,14 @@ def parse_alignment_file(path):
             end = int(m.group("end"))
             te_type = m.group("typ")
 
+            nested_bp = 0
+            if subtract_nested:
+                index = nest_index if nest_index is not None else len(parts) - 1
+                if 0 <= index < len(parts):
+                    nested_bp = nested_span_bp(parts[index], chrom, start, end)
+
             # per your example: 100-200 => 100
-            full_len = max(0, end - start)
+            full_len = max(0, end - start - nested_bp)
 
             try:
                 ltr_len = int(float(parts[1]))  # column 2: LTR_len
@@ -384,9 +482,9 @@ def parse_alignment_file(path):
                 k2p = float(parts[10])  # column11
             except ValueError:
                 k2p = None
-            
+
             rec_id = parts[0]
-            
+
             records.append(
                 {
                     "id": rec_id,
@@ -398,6 +496,7 @@ def parse_alignment_file(path):
                     "full_len": full_len,
                     "ltr_len": ltr_len,
                     "internal_len": internal_len,
+                    "nested_bp": nested_bp,
                 }
             )
     return records
@@ -1155,6 +1254,25 @@ def plot_k2p_panel(ax, sp_label, k2p_data, type_colors, y_max=None,
     ax.grid(True, alpha=0.2)
     ax.tick_params(labelsize=8)
     
+def offaxis_note(records, x_max, min_fraction=0.02):
+    """'12% off axis (>0.21)' when a locked x-axis crops a real slice of a family.
+
+    Returns "" when nothing meaningful is cropped, so the annotation only shows
+    up on the panels where it changes how the plot should be read.
+    """
+    if x_max is None or not np.isfinite(x_max):
+        return ""
+    values = [r["k2p"] for r in records
+              if r["k2p"] is not None and np.isfinite(r["k2p"]) and r["k2p"] >= 0]
+    if not values:
+        return ""
+    over = sum(1 for v in values if v > x_max)
+    fraction = over / len(values)
+    if fraction < min_fraction:
+        return ""
+    return f"{fraction:.0%} off axis (>{x_max:.3g})"
+
+
 def filter_records_by_k2p_range(records, k2p_min, k2p_max, inclusive_max=False):
     """
     Keep only records with finite k2p in [k2p_min, k2p_max) by default.
@@ -1386,6 +1504,25 @@ def main():
         default=50,
         help="Minimum family member count to plot a per-family page (default: 50). Singletons are plotted on a separate page.",
     )
+    ap.add_argument(
+        "--family-k2p-xmax",
+        type=float,
+        default=None,
+        help="Lock every family-level K2P panel to x=[0, this]. Default: "
+             "--k2p-xmax when given, else the %gth percentile of the species' "
+             "pooled K2P, which keeps families visually comparable without "
+             "giving most of the axis to a sparse old tail. In hist mode the "
+             "area beyond the limit is dropped rather than rescaled, so a "
+             "family's drawn area is the fraction of it that is in range."
+             % FAMILY_K2P_PERCENTILE,
+    )
+    ap.add_argument(
+        "--keep-nested-length",
+        action="store_true",
+        help="Charge nested insertions to their host's length. Off by default: "
+             "a nest-outer element spans the LTR-RTs inserted into it, so its "
+             "raw span double-counts them into the size distributions.",
+    )
 
 
     ap.add_argument(
@@ -1468,7 +1605,19 @@ def main():
                 chrom2len = OrderedDict()
 
             with Timer(f"[{sp}] parse_alignment_file({aln})", enabled=timing):
-                records = parse_alignment_file(aln)
+                records = parse_alignment_file(
+                    aln, subtract_nested=not args.keep_nested_length)
+
+            if not args.keep_nested_length:
+                hosts = [r for r in records if r.get("nested_bp")]
+                if hosts:
+                    nested_total = sum(r["nested_bp"] for r in hosts)
+                    raw_total = sum(r["end"] - r["start"] for r in hosts)
+                    tlog(f"[{sp}] nested-length correction: {len(hosts)} host "
+                         f"element(s) shed {nested_total:,} bp "
+                         f"({100.0 * nested_total / raw_total:.1f}% of their "
+                         f"combined span) charged to elements nested inside them",
+                         enabled=True)
 
             with Timer(f"[{sp}] collect types + store species_data", enabled=timing):
                 for r in records:
@@ -1944,6 +2093,30 @@ def main():
                     #      assembly has no chromosomes to plot against ----
                     is_chrom_level = species_data[sp]["is_chrom_level"]
 
+                    # One K2P x-axis for every family page. Left to itself each
+                    # family rescales to its own spread, so two panels look alike
+                    # while sitting at completely different divergences -- the
+                    # comparison the pages exist to support is the one a floating
+                    # axis breaks.
+                    fam_k2p_xmax = args.family_k2p_xmax
+                    if fam_k2p_xmax is None:
+                        fam_k2p_xmax = args.k2p_xmax
+                    if fam_k2p_xmax is None:
+                        pooled = np.asarray(
+                            [r["k2p"] for r in records
+                             if r["k2p"] is not None and np.isfinite(r["k2p"])
+                             and r["k2p"] >= 0],
+                            dtype=float,
+                        )
+                        if pooled.size:
+                            fam_k2p_xmax = max(
+                                float(np.percentile(pooled, FAMILY_K2P_PERCENTILE)),
+                                0.05,
+                            )
+                    if fam_k2p_xmax is not None:
+                        tlog(f"[{sp}] family K2P x-axis locked to "
+                             f"[0, {fam_k2p_xmax:.4g}]", enabled=True)
+
                     def write_family_page(title_left, recs_left, title_right, recs_right, suptitle):
                         if is_chrom_level:
                             fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(11, 6))
@@ -1953,10 +2126,10 @@ def main():
 
                         # K2P
                         if args.k2p_mode == "kde":
-                            kdat = compute_species_k2p_stack(recs_left, k2p_xmax=args.k2p_xmax)
+                            kdat = compute_species_k2p_stack(recs_left, k2p_xmax=fam_k2p_xmax)
                         else:
                             kdat = compute_species_k2p_hist_stack(
-                                recs_left, k2p_xmax=args.k2p_xmax, bin_width=args.k2p_bin_width
+                                recs_left, k2p_xmax=fam_k2p_xmax, bin_width=args.k2p_bin_width
                             )
 
                         plot_k2p_panel(
@@ -1971,6 +2144,13 @@ def main():
                         )
                         ax1.set_xlabel("K2P divergence")
                         ax1.set_ylabel("Density")
+                        # A locked axis crops the oldest families. Say so on the
+                        # panel, or a nearly-empty one reads as missing data.
+                        note = offaxis_note(recs_left, fam_k2p_xmax)
+                        if note:
+                            ax1.text(0.98, 0.97, note, transform=ax1.transAxes,
+                                     ha="right", va="top", fontsize=7,
+                                     alpha=0.7)
 
                         # Chrom (NEVER rasterized for family pages)
                         if ax2 is not None:

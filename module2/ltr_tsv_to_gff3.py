@@ -544,7 +544,9 @@ def strand_provenance(prefix: str, indir: str, tables, families,
 # Driver
 # -----------------------------
 def convert(prefix: str, indir: str = ".", genome: Optional[str] = None,
-            miniprot_gff: Optional[str] = None, verbose: bool = False) -> int:
+            miniprot_gff: Optional[str] = None, verbose: bool = False,
+            consensus_cluster: Optional[str] = None,
+            family_prefix: Optional[str] = None) -> int:
     variant, tables = select_annotation_set(prefix, indir)
     if not tables:
         print(f"[ltr_tsv_to_gff3] ERROR: no {prefix}_depth<N>[_clean]_ltr.tsv "
@@ -567,7 +569,9 @@ def convert(prefix: str, indir: str = ".", genome: Optional[str] = None,
             warn(f"genome not found: {genome}; omitting ##sequence-region")
 
     ranker = SeqidRanker(list(seq_lengths) if seq_lengths else ())
-    families = load_families(prefix, indir, verbose=False, warn_missing=False)
+    families = load_families(prefix, indir, verbose=False, warn_missing=False,
+                             consensus_cluster=consensus_cluster,
+                             family_prefix=family_prefix)
     provenance = strand_provenance(prefix, indir, tables, families, verbose)
     element_blocks, skipped = build_element_blocks(prefix, tables, ranker,
                                                    provenance, families, verbose)
@@ -618,6 +622,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--miniprot-gff", default=None,
                         help="miniprot genic GFF to merge (default: autodetect "
                              "<prefix>_r1.work/*.genic.gff)")
+    parser.add_argument("--consensus-cluster", default=None,
+                        help="Kmer2LTR consensus cluster TSV to read families "
+                             "from. Default: glob "
+                             "<indir>/<prefix>_all_ltr.consensus_id*_cluster.tsv. "
+                             "Multi-genome runs point every genome at one pooled "
+                             "table.")
+    parser.add_argument("--family-prefix", default=None,
+                        help="Namespace for family labels (<NAME>_fam00001). "
+                             "Default: --prefix.")
     parser.add_argument("-v", "--verbose", action="store_true",
                         help="Per-step progress and per-file counts")
     args = parser.parse_args(argv)
@@ -627,7 +640,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
               file=sys.stderr)
         return 1
     return convert(args.prefix, args.indir, args.genome, args.miniprot_gff,
-                   args.verbose)
+                   args.verbose, args.consensus_cluster, args.family_prefix)
 
 
 if __name__ == "__main__":

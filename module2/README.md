@@ -29,7 +29,7 @@ Most runs only need three flags:
 
 | Flag | Meaning |
 |---|---|
-| `--genome` | Genome FASTA (`.fa`/`.fasta`, plain or `.gz`). **Required.** |
+| `--genome` | Genome FASTA (`.fa`/`.fasta`, plain or `.gz`). **Required.** Accepts several, space-separated — see [§5](#5-multiple-genomes-shared-family-names). |
 | `--proteins` | **Can come from any related species** — it does not have to match the genome. Recommended. |
 | `--threads` | CPU threads (default 20). |
 
@@ -38,7 +38,7 @@ Occasionally useful:
 | Flag | Meaning |
 |---|---|
 | `--max-rounds 1` | Run a single detection round. Use this if you don't care about nested elements. |
-| `--out_prefix` | Output prefix (default: `<genome>_LTRs`). |
+| `--out_prefix` | Output prefix (default: `<genome>_LTRs`). With several genomes it names the shared family namespace instead — see [§5](#5-multiple-genomes-shared-family-names). |
 | `--terminate_count` | Stop iterating when a round finds fewer than this many elements (default 100). |
 
 
@@ -118,6 +118,49 @@ awk '/^>/{if(s)print s; s=""; print; next}{gsub(/[^ACGTacgt]/,""); s=s $0}END{if
 ```
 
 `depth0` records contain no masked nest-ins, so this is only needed for depth ≥ 1.
+
+## 5. Multiple genomes: shared family names
+
+Pass several genomes to give closely-related species **one family vocabulary**,
+which is what makes between-species family comparisons meaningful:
+
+```bash
+bash ../module2/ltrharvest_wrapper2.sh \
+  --genome   ../test/Athal_tair10_chr2.fa.gz Alyrata_chr2.fa \
+  --proteins ../test/Athal.pep.gz \
+  --threads  40
+```
+
+Each genome is detected on its own, then **all** detected elements are pooled
+for a single clustering pass, so `family` means the same thing everywhere:
+
+```
+Athal_tair10_chr2_LTRs_depth0_clean_ltr.tsv     family = merged_fam00001
+Alyrata_chr2_LTRs_depth0_clean_ltr.tsv          family = merged_fam00001
+Athal_tair10_chr2_LTRs_all_depth_LTR_cleaned.gff3
+Alyrata_chr2_LTRs_all_depth_LTR_cleaned.gff3
+merged_all_ltr.consensus_id0.75_cluster.tsv     ← the one shared table
+```
+
+False-positive families are also called over the pooled set rather than one
+species at a time, so a repeat that looks convincing in isolation but wrong
+across species gets caught.
+
+Naming: every genome keeps its own `<basename>_LTRs` prefix. `--out_prefix`
+names only the shared pool — `--out_prefix Arabidopsis` gives
+`Arabidopsis_fam00001` and `Arabidopsis_all_ltr.*`, default `merged`. With a
+single genome the two are the same thing, so nothing changes.
+
+One `--proteins` file serves every genome.
+
+> **Sequence IDs must be unique across genomes.** Two files both calling a
+> chromosome `Chr2` are rejected before any work starts: pooled clustering keys
+> elements on `chrom:start-end`, so a shared ID would cross-assign families
+> *and* cross-purge real elements between species. Rename first:
+>
+> ```bash
+> awk '/^>/{sub(/^>/,">Aly_")}1' Alyrata.fa > Alyrata.renamed.fa
+> ```
 
 ## 6. GFF3 annotation
 

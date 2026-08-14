@@ -3,7 +3,7 @@
 # Iterative nested LTR-RT detection wrapper for synLTR/module2 pipeline.
 #
 # Usage:
-#   bash nest_ltr_detector.sh --genome genome.fa [--proteins prot.fa] [--terminate_count 100]
+#   bash nest_ltr_detector.sh --genome genome.fa [genome2.fa ...] [--proteins prot.fa] [--terminate_count 100]
 #       [--max-rounds N] [--script_path ./synLTR/module2/] [--threads 20] [--out_prefix PREFIX]
 #       [--wfa-align] [--ltrharvest5-args "KEY=VALUE ..."] [--ltrharvest5-args-from-round N "KEY=VALUE ..."]
 #
@@ -69,6 +69,27 @@
 #       which additionally carries every miniprot protein alignment. Each
 #       element carries its family's clade makeup as family_clades=.
 
+# MULTIPLE GENOMES (shared family nomenclature):
+#   --genome accepts several FASTAs. Closely-related species then share one
+#   family vocabulary, which is what makes between-species family comparisons
+#   meaningful. The pipeline splits into three phases:
+#     (1) per genome, sequentially: detection rounds + reconcile_nests.py,
+#         producing {P_g}_depth{N}_ltr.{tsv,fa} for each genome. This is the
+#         detect-only worker, re-exec'd once per genome.
+#     (2) pooled, once: every genome's depth FASTAs are concatenated into
+#         {RUN}_all_ltr.fa, clustered by a single Kmer2LTR pass, and
+#         FP-corrected by flag_fp_families.py -- so family membership and
+#         false-positive calls are computed over the union, not per species.
+#     (3) split back out, per genome: ltr_annotate.py and ltr_tsv_to_gff3.py
+#         run once per genome against that one pooled cluster table, so
+#         {RUN}_fam00001 denotes the same family in every genome's outputs.
+#   Naming: each genome keeps its own <basename>_LTRs prefix; --out_prefix
+#   names the shared pool (default 'merged'). With a single genome the two are
+#   the same thing, so nothing about single-genome runs changes.
+#   Sequence IDs must be unique across genomes -- pooled clustering keys
+#   elements on 'chrom:start-end', so a shared seqid would cross-assign
+#   families and cross-purge real elements. Checked before any work starts.
+
 set -euo pipefail
 
 # Print the exact command for reproducibility
@@ -85,7 +106,10 @@ ORIG_ARGS=( "$@" )
 # ----------------------------
 # Defaults
 # ----------------------------
-GENOME=""
+declare -a GENOMES=()
+GENOME=""          # GENOMES[0]; the worker only ever sees one genome
+N_GENOMES=0
+RUN_PREFIX=""      # names the shared family namespace + merged artifacts
 PROTEINS=""
 TERMINATE_COUNT=100
 MAX_ROUNDS_OVERRIDE=""   # empty = use IUPAC_SEQ length (10)
@@ -117,22 +141,34 @@ die() { echo "ERROR: $*" >&2; exit 1; }
 usage() {
   cat >&2 <<'USAGE_EOF'
 Usage:
-  bash nest_ltr_detector.sh --genome genome.fa [--proteins prot.fa] [--terminate_count 100]
+  bash nest_ltr_detector.sh --genome genome.fa [genome2.fa ...] [--proteins prot.fa]
+      [--terminate_count 100]
       [--max-rounds N] [--script_path ./synLTR/module2/] [--threads 20] [--out_prefix PREFIX]
       [--wfa-align] [--fp-mask-threshold 0.10]
       [--ltrharvest5-args "KEY=VALUE ..."] [--ltrharvest5-args-from-round N "KEY=VALUE ..."]
 
 Required:
-  --genome              Genome FASTA (.fa/.fasta)
+  --genome              Genome FASTA (.fa/.fasta, plain or .gz). One or more,
+                        space-separated. With 2+ genomes every genome is
+                        detected separately, then all detected elements are
+                        pooled for a single clustering pass, so the `family`
+                        column means the same thing in every genome's output.
+                        Sequence IDs must be unique across genomes (checked
+                        up front, before any work starts).
 
 Optional:
-  --proteins            Protein FASTA for ltrharvest5.py
+  --proteins            Protein FASTA for ltrharvest5.py. One file, shared by
+                        every genome.
   --terminate_count     Stop if detected LTR-RTs in latest library < this count (default 100)
   --max-rounds          Maximum number of rounds to run (default: up to 10, limited by IUPAC codes).
                         Use 1 for non-nested only, 2 for single-level nesting, etc.
   --script_path         Path containing ltrharvest5.py and mask_ltr.py (default: same dir as this script)
   --threads             Threads for ltrharvest5.py (default 20)
-  --out_prefix          Output prefix (default: <genome_prefix>_LTRs)
+  --out_prefix          With ONE genome: output prefix (default
+                        <genome_prefix>_LTRs), which also names the families.
+                        With 2+ genomes: names the shared family namespace and
+                        the merged cluster tables (default 'merged'); each
+                        genome always keeps its own <basename>_LTRs prefix.
   --run-trf             Run TRF tandem-repeat masking (default: on)
   --no-trf              Disable TRF tandem-repeat masking
   --wfa-align           Use WFA instead of mafft for Kmer2LTR pairwise alignment (~30-50x faster)
@@ -281,6 +317,74 @@ build_extra_args_for_round() {
   done
 }
 
+# Genome prefix = basename minus a trailing .gz and one FASTA extension.
+# e.g. Athal_tair10_chr2.fa.gz -> Athal_tair10_chr2
+genome_prefix_of() {
+  local b
+  b="$(basename "$1")"
+  b="${b%.gz}"
+  b="${b%.*}"
+  [[ -n "$b" ]] || die "Could not derive a genome prefix from: $1"
+  printf '%s' "$b"
+}
+
+# Two genomes whose basenames collapse to the same prefix would overwrite each
+# other's outputs in the shared staging directory.
+check_unique_basenames() {
+  local -A seen=()
+  local i p
+  for i in "${!OUT_PREFIXES[@]}"; do
+    p="${OUT_PREFIXES[$i]}"
+    if [[ -n "${seen[$p]+_}" ]]; then
+      die "Two genomes derive the same output prefix '${p}':
+    ${GENOMES[${seen[$p]}]}
+    ${GENOMES[$i]}
+  Rename one input file so the basenames differ."
+    fi
+    seen["$p"]=$i
+  done
+}
+
+# A seqid shared by two genomes is a correctness hazard, not a cosmetic one:
+# flag_fp_families.py purges by bare 'chrom:start-end', so one species' false
+# positives would delete the other species' real elements, and ltr_annotate.py's
+# by_coord fallback would silently drop the ambiguous coordinates.
+check_unique_seqids() {
+  local pairs dupes id i
+  pairs="$(mktemp "./${RUN_PREFIX}.seqids.XXXXXX")"
+  echo "Checking seqid uniqueness across ${N_GENOMES} genomes..."
+  for i in "${!GENOMES[@]}"; do
+    gzip -cdf "${GENOMES[$i]}" \
+      | awk -v tag="${OUT_PREFIXES[$i]}" \
+            '/^>/ { split(substr($0,2), a, /[ \t]/); print a[1] "\t" tag }'
+  done | LC_ALL=C sort -u > "$pairs"
+
+  dupes="$(cut -f1 "$pairs" | LC_ALL=C uniq -d)"
+  if [[ -n "$dupes" ]]; then
+    echo "" >&2
+    echo "ERROR: these sequence IDs appear in more than one genome:" >&2
+    while IFS= read -r id; do
+      [[ -z "$id" ]] && continue
+      printf '  %-30s %s\n' "$id" \
+        "$(awk -F'\t' -v k="$id" '$1==k {printf "%s ", $2}' "$pairs")" >&2
+    done <<< "$(printf '%s\n' "$dupes" | head -20)"
+    (( $(printf '%s\n' "$dupes" | wc -l) > 20 )) && echo "  ... (truncated)" >&2
+    cat >&2 <<'FIXEOF'
+
+Pooled clustering keys elements on 'chrom:start-end', so shared IDs would
+cross-assign families AND cross-purge real elements between genomes.
+
+Rename one genome's sequences before re-running, e.g.:
+  seqkit replace -p '^' -r 'Aly_' in.fa > out.fa
+  awk '/^>/{sub(/^>/,">Aly_")}1' in.fa > out.fa
+FIXEOF
+    rm -f "$pairs"
+    exit 1
+  fi
+  rm -f "$pairs"
+  echo "  seqids unique across all genomes."
+}
+
 # Resolve a file or directory to an absolute path (no realpath dependency).
 abspath() {
   local p="$1"
@@ -314,9 +418,11 @@ ensure_kmer2ltr_dir() {
 # FP-masked trigger file (never a final output). A same-named output from a prior
 # run in the destination is removed first so directory moves overwrite cleanly.
 promote_fp_outputs() {
-  local src="$1" dst="$2" e name
-  rm -f "${src}/${OUT_PREFIX}.input_genome.fa"* 2>/dev/null || true
-  rm -f "${src}/${OUT_PREFIX}_FP_masked.fa" 2>/dev/null || true
+  local src="$1" dst="$2" e name p
+  for p in "${OUT_PREFIXES[@]}"; do
+    rm -f "${src}/${p}.input_genome.fa"* 2>/dev/null || true
+    rm -f "${src}/${p}_FP_masked.fa" 2>/dev/null || true
+  done
 
   shopt -s nullglob
   local entries=( "${src}"/* )
@@ -332,78 +438,404 @@ promote_fp_outputs() {
   done
 }
 
-# Top-level driver. Runs one or more fully-isolated detection attempts, each in
-# its own staging directory. When an attempt hard-masks a pervasively-FP genome
-# ({OUT_PREFIX}_FP_masked.fa), the next attempt runs on that masked genome. When
-# an attempt produces no masked genome, its outputs are the final ones and are
-# promoted to the user's working directory. Detection is by file existence
-# because flag_fp_families.py returns 0 whether or not it masks.
+# ----------------------------
+# Merged stage: pooling, clustering, FP correction, annotation, GFF3
+# ----------------------------
+# Collect a genome's depth tables, excluding the FP-cleaned variants that the
+# merged stage itself produces ({p}_depth*_ltr.tsv would otherwise also match
+# {p}_depth0_clean_ltr.tsv). Today that only stays safe because every attempt
+# starts in a fresh directory; carry-forward breaks that assumption.
+depth_tables_for() {
+  local prefix="$1" kind="$2"
+  local -n _dt_out="$3"
+  local f
+  _dt_out=()
+  shopt -s nullglob
+  for f in "${prefix}"_depth*_ltr."${kind}"; do
+    [[ "$f" == *_clean_ltr."${kind}" ]] && continue
+    _dt_out+=( "$f" )
+  done
+  shopt -u nullglob
+}
+
+# The merged stage needs Kmer2LTR. Reuse a per-genome clone if the detection
+# workers left a complete one behind, else clone into a run-level dir.
+resolve_merged_tools_dir() {
+  local p
+  for p in "${OUT_PREFIXES[@]}"; do
+    if [[ -f "./${p}_tools/Kmer2LTR/Kmer2LTR.py" \
+       && -f "./${p}_tools/Kmer2LTR/flag_fp_families.py" ]]; then
+      TOOLS_DIR="./${p}_tools"
+      return
+    fi
+  done
+  TOOLS_DIR="./${RUN_PREFIX}_tools"
+}
+
+# One pooled flag_fp_families.py call: --domains-tsv takes nargs="+", so a
+# single call writes every genome's _clean_ltr.tsv. Stage C (masking) is per
+# genome, but its gate -- the FP fraction -- is computed from the cluster tables
+# alone (flag_fp_families.py: frac = fp_fraction(len(fp_members), len(member2rep)))
+# and is therefore identical for every genome. So parse the fraction from this
+# first call and only make the remaining per-genome masking calls when it
+# actually exceeded the threshold; below the threshold flag_fp_families.py
+# returns before the expensive mmseqs step anyway.
+run_fp_stage() {
+  local cons="$1" int="$2" cons_fa="$3" flag_fp="$4"; shift 4
+  local -a dtsvs=( "$@" )
+  local first="${OUT_PREFIXES[0]}"
+  local log="${first}_fpcheck.log"
+  local i p frac
+
+  # stderr is teed to $log via an fd swap, NOT process substitution: bash does
+  # not wait for >(...) to finish, so the log would still be empty when the
+  # fraction is parsed out of it a moment later. A pipeline is waited on.
+  set -x
+  { python "$flag_fp" \
+      --consensus-cluster "$cons" \
+      --internal-cluster "$int" \
+      --ltr-fasta "$cons_fa" \
+      --domains-tsv "${dtsvs[@]}" \
+      -o "${RUN_PREFIX}_fpcheck" \
+      --genome "${first}.input_genome.fa" \
+      --masked-out "${first}_FP_masked.fa" \
+      --threads "$THREADS" \
+      --fp-mask-threshold "$FP_MASK_THRESHOLD" \
+      2>&1 1>&3 | tee "$log" >&2; } 3>&1
+  set +x
+
+  frac="$(sed -n 's/^\[INFO\] FP fraction: [0-9]*\/[0-9]* = \([0-9.]*\).*/\1/p' "$log" | tail -1)"
+  if [[ -z "$frac" ]] || ! awk -v f="$frac" -v t="$FP_MASK_THRESHOLD" \
+        'BEGIN{exit !(f>t)}'; then
+    echo "FP fraction within --fp-mask-threshold (${FP_MASK_THRESHOLD}); no masking."
+    return 0
+  fi
+
+  echo "FP fraction ${frac} exceeded ${FP_MASK_THRESHOLD}; masking each genome."
+  for (( i=1; i<N_GENOMES; i++ )); do
+    p="${OUT_PREFIXES[$i]}"
+    set -x
+    { python "$flag_fp" \
+        --consensus-cluster "$cons" \
+        --internal-cluster "$int" \
+        --ltr-fasta "$cons_fa" \
+        -o "${RUN_PREFIX}_fpcheck" \
+        --no-plot \
+        --genome "${p}.input_genome.fa" \
+        --masked-out "${p}_FP_masked.fa" \
+        --threads "$THREADS" \
+        --fp-mask-threshold "$FP_MASK_THRESHOLD" \
+        2>&1 1>&3 | tee "${p}_fpcheck.log" >&2; } 3>&1
+    set +x
+  done
+}
+
+# Keep only records whose full header equals a surviving element id (cleaned TSV
+# column 1; the reconciler writes depth-FASTA headers as exactly that id).
+write_clean_fastas() {
+  local dtsv clean_tsv depth_fa clean_fa
+  for dtsv in "$@"; do
+    clean_tsv="${dtsv%_ltr.tsv}_clean_ltr.tsv"
+    depth_fa="${dtsv%_ltr.tsv}_ltr.fa"
+    clean_fa="${dtsv%_ltr.tsv}_clean_ltr.fa"
+    if [[ ! -s "$clean_tsv" || ! -s "$depth_fa" ]]; then
+      echo "WARNING: skipping cleaned FASTA for ${dtsv}: missing ${clean_tsv} or ${depth_fa}" >&2
+      continue
+    fi
+    awk -F'\t' 'NR==FNR { if ($0 !~ /^#/ && NF >= 2) keep[$1] = 1; next }
+                /^>/ { p = (substr($0, 2) in keep) } p' \
+      "$clean_tsv" "$depth_fa" > "$clean_fa"
+    echo "Cleaned FASTA: ${clean_fa} ($(count_fasta_headers "$clean_fa") records)"
+  done
+}
+
+# Every genome reads the one pooled cluster table and labels families from
+# RUN_PREFIX, so the family column is directly comparable across species.
+# --prefix still drives everything per-genome: TEsorter tables, PAFs,
+# {prefix}_LTRRT_00001 ids, miniprot GFF discovery, output GFF3 names.
+run_annotation_stage() {
+  local p
+  local -a fam_opts=() annot_tsvs=()
+  # Resolve the pooled cluster table from the filesystem rather than a variable:
+  # the orchestrator calls this in a different subshell from run_merged_stage,
+  # so anything set there is already gone. Missing table -> no override, and
+  # both scripts fall back to their own per-prefix glob.
+  shopt -s nullglob
+  local -a merged_cons=( "${RUN_PREFIX}"_all_ltr.consensus_id*_cluster.tsv )
+  shopt -u nullglob
+  if (( ${#merged_cons[@]} == 1 )); then
+    fam_opts=( --consensus-cluster "${merged_cons[0]}"
+               --family-prefix "$RUN_PREFIX" )
+  elif (( ${#merged_cons[@]} > 1 )); then
+    die "Expected exactly 1 pooled consensus cluster TSV, found ${#merged_cons[@]}"
+  fi
+
+  for p in "${OUT_PREFIXES[@]}"; do
+    depth_tables_for "$p" tsv annot_tsvs
+    if (( ${#annot_tsvs[@]} == 0 )); then
+      echo "WARNING: no ${p}_depth<N>_ltr.tsv present; skipping the" >&2
+      echo "strand/family annotation and GFF3 stages for ${p}." >&2
+      continue
+    fi
+    echo ""
+    echo "============================================================"
+    echo "Annotating ${#annot_tsvs[@]} depth table(s) for ${p} with strand + family..."
+    set -x
+    python "$ANNOTATOR" --prefix "$p" --indir . "${fam_opts[@]}"
+    set +x
+
+    echo ""
+    echo "============================================================"
+    echo "Writing LTR-RT GFF3 for ${p}..."
+    set -x
+    python "$GFF3_WRITER" --prefix "$p" --indir . \
+      --genome "${p}.input_genome.fa" "${fam_opts[@]}"
+    set +x
+  done
+}
+
+# Pooled post-detection stage: concatenate every genome's depth FASTAs, cluster
+# them once, and FP-correct. Runs with cwd = the attempt's staging dir.
+# Annotation is NOT done here -- an attempt is only known to be final after the
+# FP logs it writes have been read, so the orchestrator calls
+# run_annotation_stage separately once it knows.
+run_merged_stage() {
+  local all_ltr_fa="${RUN_PREFIX}_all_ltr.fa"
+  local p cons_fa
+  local -a depth_fas=() depth_tsvs=() dfas=() dtsvs=()
+
+  for p in "${OUT_PREFIXES[@]}"; do
+    depth_tables_for "$p" fa  dfas
+    depth_tables_for "$p" tsv dtsvs
+    depth_fas+=( "${dfas[@]}" )
+    depth_tsvs+=( "${dtsvs[@]}" )
+  done
+
+  if (( ${#depth_fas[@]} == 0 )); then
+    echo "WARNING: no depth-bucketed FASTA present; skipping the merged stage." >&2
+    return 0
+  fi
+
+  echo ""
+  echo "============================================================"
+  echo "Merged stage: ${#depth_fas[@]} depth FASTA(s) from ${N_GENOMES} genome(s)"
+
+  # (1) Pool, stripping non-ACGT -- the reconciler's IUPAC-masked nested inners
+  #     -- so only the outermost putative LTR-RT of each element remains.
+  cat "${depth_fas[@]}" \
+    | awk '/^>/{printf "\n%s\n",$0;next}{gsub(/[^ACGTacgt]/,"");printf "%s",$0}END{print ""}' \
+    > "$all_ltr_fa"
+
+  if [[ ! -s "$all_ltr_fa" ]]; then
+    # Degenerate (near-impossible) case: nothing to cluster. The primary depth
+    # detection already succeeded, so warn and skip the optional FP add-on rather
+    # than aborting and discarding good results.
+    echo "WARNING: ${all_ltr_fa} is empty after stripping non-ACGT; skipping FP-family correction." >&2
+    return 0
+  fi
+
+  resolve_merged_tools_dir
+  ensure_kmer2ltr_dir
+  local KMER2LTR_PY="${TOOLS_DIR}/Kmer2LTR/Kmer2LTR.py"
+  local FLAG_FP_PY="${TOOLS_DIR}/Kmer2LTR/flag_fp_families.py"
+
+  # (2) One clustering pass over the pooled elements -> the shared family basis.
+  set -x
+  python "$KMER2LTR_PY" \
+    -i "$all_ltr_fa" \
+    -o "${RUN_PREFIX}_all_ltr" \
+    --ltr-cluster --internal-cluster \
+    -p "$THREADS" \
+    --min-seq-id 0.75
+  set +x
+
+  # Resolve the produced cluster tables by glob (robust to id-tag formatting);
+  # a single --min-seq-id yields exactly one of each.
+  shopt -s nullglob
+  local -a cons_cluster=( "${RUN_PREFIX}"_all_ltr.consensus_id*_cluster.tsv )
+  local -a int_cluster=(  "${RUN_PREFIX}"_all_ltr.internal_id*_cluster.tsv )
+  shopt -u nullglob
+  cons_fa="${RUN_PREFIX}_all_ltr.consensus.fa"
+  (( ${#cons_cluster[@]} == 1 )) || die "Expected exactly 1 consensus cluster TSV, found ${#cons_cluster[@]}"
+  (( ${#int_cluster[@]}  == 1 )) || die "Expected exactly 1 internal cluster TSV, found ${#int_cluster[@]}"
+  [[ -s "$cons_fa" ]] || die "Missing consensus FASTA: $cons_fa"
+
+  # (3) Flag FP families, purge their rows from every depth TSV, and -- only if
+  #     the FP fraction exceeds --fp-mask-threshold -- write each genome's
+  #     masked FASTA, which the orchestrator detects to trigger a re-run.
+  run_fp_stage "${cons_cluster[0]}" "${int_cluster[0]}" "$cons_fa" \
+               "$FLAG_FP_PY" "${depth_tsvs[@]}"
+
+  # (4) Emit an FP-cleaned FASTA next to each cleaned TSV.
+  write_clean_fastas "${depth_tsvs[@]}"
+}
+
+# True when this genome's mask actually changed bases.
+# flag_fp_families.py writes --masked-out unconditionally once Stage C starts,
+# even when it masks 0 bp. Gating on file existence alone therefore re-runs
+# forever on an unchanged genome, burning every FP round before warning "not
+# converged". Gate on the bp count it reports instead. An unparseable count
+# means re-run, which is the safe direction.
+genome_needs_rerun() {
+  local prefix="$1" log="$2" bp
+  [[ -s "./${prefix}_FP_masked.fa" ]] || return 1
+  bp="$(sed -n 's/^\[INFO\] masked \([0-9,]*\) bp.*/\1/p' "$log" 2>/dev/null \
+        | tail -1 | tr -d ',')"
+  if [[ -z "$bp" ]]; then
+    echo "WARNING: could not parse masked bp for ${prefix}; assuming it changed." >&2
+    return 0
+  fi
+  (( bp > 0 ))
+}
+
+# Reuse a genome's detection outputs when its input did not change. .work dirs
+# are hardlinked (bulk data, never rewritten downstream -- only read by
+# reconcile_nests.py and the miniprot GFF lookup). Everything else is a real
+# copy, because ltr_annotate.py rewrites the depth TSVs IN PLACE and a hardlink
+# there would corrupt the previous attempt's directory. The input symlink is
+# re-created per attempt, and _clean_/_FP_masked outputs belong to the attempt
+# that produced them, so all three are skipped.
+carry_forward_genome() {
+  local prev="$1" adir="$2" prefix="$3" e name
+  shopt -s nullglob
+  local entries=( "${prev}/${prefix}"* )
+  shopt -u nullglob
+  for e in "${entries[@]}"; do
+    name="$(basename "$e")"
+    # Skip anything the next attempt regenerates or owns itself. The last three
+    # patterns only overlap when --out_prefix makes RUN_PREFIX equal to a
+    # genome's own prefix, but a stale cluster table or FP log leaking into the
+    # next attempt would be a very quiet way to get wrong families.
+    case "$name" in
+      "${prefix}.input_genome.fa"*|"${prefix}_FP_masked.fa") continue;;
+      *_clean_ltr.*|*_fpcheck*|*_all_ltr.*) continue;;
+    esac
+    if [[ -d "$e" && ( "$name" == *.work || "$name" == *_tools ) ]]; then
+      cp -al "$e" "${adir}/"
+    else
+      cp -a "$e" "${adir}/"
+    fi
+  done
+  echo "  reusing detection outputs for ${prefix} (input unchanged)"
+}
+
+# Top-level driver. Runs one or more fully-isolated attempts, each in its own
+# staging directory. An attempt detects every genome (sequentially, skipping any
+# whose input is unchanged), then runs the pooled merged stage over all of them.
+# Genomes that flag_fp_families.py actually masked are re-detected on their
+# masked FASTA in the next attempt; when none were masked -- or attempts run out
+# -- the attempt is final, gets annotated, and is promoted to the user's
+# working directory.
 run_fp_orchestrator() {
-  local final_dir staging abs_self abs_genome abs_proteins abs_script
+  local final_dir staging abs_self abs_proteins abs_script
   final_dir="$PWD"
   abs_self="$(abspath "${BASH_SOURCE[0]}")"
-  abs_genome="$(abspath "$GENOME")"
   abs_script="$(abspath "$SCRIPT_PATH")"
   [[ -n "$PROTEINS" ]] && abs_proteins="$(abspath "$PROTEINS")"
 
-  staging="${final_dir}/${OUT_PREFIX}_FPstaging"
+  staging="${final_dir}/${RUN_PREFIX}_FPstaging"
   rm -rf "$staging"                 # defensive: clear a stale/partial staging dir
   mkdir -p "$staging"
 
   echo ""
   echo "############################################################"
   echo "FP-correction orchestrator: up to ${MAX_FP_ROUNDS} attempt(s)"
+  echo "  genomes:     ${N_GENOMES}"
   echo "  staging dir: ${staging}"
   echo "############################################################"
 
-  local attempt=1 cur_genome="$abs_genome" final_adir="" rc masked adir sym
+  local attempt=1 final_adir="" prev_adir="" adir rc i p is_final any_rerun
+  local -a cur_genome=() reuse=() abs_genomes=()
+  for i in "${!GENOMES[@]}"; do
+    abs_genomes+=( "$(abspath "${GENOMES[$i]}")" )
+    cur_genome+=( "${abs_genomes[$i]}" )
+    reuse+=( false )
+  done
+
   while (( attempt <= MAX_FP_ROUNDS )); do
     adir="${staging}/round${attempt}"
     mkdir -p "$adir"
-    sym="${adir}/${OUT_PREFIX}.input_genome.fa"
-    ln -sf "$cur_genome" "$sym"
 
     echo ""
     echo "======================= FP round ${attempt} ======================="
-    echo "  input genome: ${cur_genome}"
     echo "  work dir:     ${adir}"
 
-    # Replay the original argv, then append overrides so the parser's last-wins
-    # semantics pin genome/proteins/out_prefix/script_path to isolated, absolute
-    # values. The env var flips the re-exec'd script into worker mode.
-    local worker_args=( "${ORIG_ARGS[@]}"
-        --genome "${OUT_PREFIX}.input_genome.fa"
-        --out_prefix "$OUT_PREFIX"
-        --script_path "$abs_script" )
-    [[ -n "${abs_proteins:-}" ]] && worker_args+=( --proteins "$abs_proteins" )
+    for i in "${!GENOMES[@]}"; do
+      p="${OUT_PREFIXES[$i]}"
+      ln -sf "${cur_genome[$i]}" "${adir}/${p}.input_genome.fa"
 
-    rc=0
-    ( cd "$adir" && _LTRHARVEST_WRAPPER2_WORKER=1 bash "$abs_self" "${worker_args[@]}" ) || rc=$?
-    if (( rc != 0 )); then
-      die "FP round ${attempt} failed (exit ${rc}). Staging left at: ${adir}"
-    fi
-
-    masked="${adir}/${OUT_PREFIX}_FP_masked.fa"
-    if [[ -s "$masked" ]]; then
-      if (( attempt >= MAX_FP_ROUNDS )); then
-        echo "" >&2
-        echo "WARNING: FP masking still triggered after ${MAX_FP_ROUNDS} attempt(s); not" >&2
-        echo "converged. Promoting the last attempt's cleaned outputs anyway." >&2
-        final_adir="$adir"
-        break
+      if [[ "${reuse[$i]}" == true && -n "$prev_adir" ]]; then
+        carry_forward_genome "$prev_adir" "$adir" "$p"
+        continue
       fi
-      echo "FP round ${attempt}: FPs pervasive -> re-running on the masked genome."
-      cur_genome="$(abspath "$masked")"
-      attempt=$((attempt + 1))
-      continue
+
+      echo "  detecting ${p}: ${cur_genome[$i]}"
+
+      # Replay the original argv, then append overrides so the parser's last-wins
+      # semantics pin genome/proteins/out_prefix/script_path to isolated, absolute
+      # values. The env var flips the re-exec'd script into worker mode.
+      local worker_args=( "${ORIG_ARGS[@]}"
+          --genome "${p}.input_genome.fa"
+          --out_prefix "$p"
+          --script_path "$abs_script" )
+      [[ -n "${abs_proteins:-}" ]] && worker_args+=( --proteins "$abs_proteins" )
+
+      rc=0
+      ( cd "$adir" && _LTRHARVEST_WRAPPER2_WORKER=1 bash "$abs_self" "${worker_args[@]}" ) || rc=$?
+      if (( rc != 0 )); then
+        die "Detection failed for genome '${GENOMES[$i]}' (prefix ${p}, FP round ${attempt}, exit ${rc}).
+  A genome that yields no LTR-RTs aborts the whole run rather than producing a
+  'cross-species' family set built from fewer species than were requested.
+  Staging left at: ${adir}"
+      fi
+    done
+
+    # Annotation is deferred: finality cannot be known until the FP logs exist,
+    # and annotating an attempt whose outputs get discarded is pure waste.
+    ( cd "$adir" && run_merged_stage )
+
+    any_rerun=false
+    for i in "${!GENOMES[@]}"; do
+      p="${OUT_PREFIXES[$i]}"
+      if ( cd "$adir" && genome_needs_rerun "$p" "${p}_fpcheck.log" ); then
+        reuse[$i]=false; any_rerun=true
+        echo "FP round ${attempt}: ${p} was masked -> re-detecting next attempt."
+      else
+        reuse[$i]=true
+      fi
+    done
+
+    is_final=false
+    if [[ "$any_rerun" == false ]]; then
+      echo "FP round ${attempt}: no genome was masked -> final pass."
+      is_final=true
+    elif (( attempt >= MAX_FP_ROUNDS )); then
+      echo "" >&2
+      echo "WARNING: FP masking still triggered after ${MAX_FP_ROUNDS} attempt(s); not" >&2
+      echo "converged. Promoting the last attempt's cleaned outputs anyway." >&2
+      is_final=true
     fi
 
-    echo "FP round ${attempt}: no masked genome produced -> final pass."
-    final_adir="$adir"
-    break
+    if [[ "$is_final" == true ]]; then
+      ( cd "$adir" && run_annotation_stage )
+      final_adir="$adir"
+      break
+    fi
+
+    for i in "${!GENOMES[@]}"; do
+      p="${OUT_PREFIXES[$i]}"
+      if [[ "${reuse[$i]}" == false ]]; then
+        cur_genome[$i]="$(abspath "${adir}/${p}_FP_masked.fa")"
+      fi
+    done
+    prev_adir="$adir"
+    attempt=$((attempt + 1))
   done
 
   [[ -n "$final_adir" ]] || die "FP orchestrator produced no final attempt (internal error)"
+
+  for p in "${OUT_PREFIXES[@]}"; do rm -rf "${final_adir}/${p}_tools"; done
+  rm -rf "${final_adir}/${RUN_PREFIX}_tools"
 
   echo ""
   echo "Promoting final outputs: ${final_adir} -> ${final_dir}"
@@ -422,14 +854,20 @@ run_fp_orchestrator() {
   if [[ "$RUN_PLOTS" == true ]]; then
     echo ""
     echo "Post-completion plotting (disable with --no-plots)..."
-    if bash "${SCRIPT_PATH}/ltrharvest_plots.sh" \
-         --prefix "$OUT_PREFIX" --genome "$abs_genome" \
-         --indir "$final_dir" --script_path "$SCRIPT_PATH"; then
-      echo "Plots written to: ${final_dir}/${OUT_PREFIX}_plots"
-    else
-      echo "[WARN] plotting stage reported failures; annotation outputs are unaffected." >&2
-    fi
+    for i in "${!GENOMES[@]}"; do
+      p="${OUT_PREFIXES[$i]}"
+      if bash "${SCRIPT_PATH}/ltrharvest_plots.sh" \
+           --prefix "$p" --genome "${abs_genomes[$i]}" \
+           --indir "$final_dir" --script_path "$SCRIPT_PATH"; then
+        echo "Plots written to: ${final_dir}/${p}_plots"
+      else
+        echo "[WARN] plotting stage reported failures for ${p}; annotation outputs are unaffected." >&2
+      fi
+    done
   fi
+
+  echo ""
+  echo "Done."
 }
 
 # ----------------------------
@@ -439,7 +877,17 @@ run_fp_orchestrator() {
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --genome) GENOME="${2:-}"; shift 2;;
+    --genome)
+      # Variadic: consume every following token that is not a flag. RESETS the
+      # list rather than appending, because run_fp_orchestrator replays the
+      # original argv and then appends an overriding --genome; last must win.
+      shift
+      GENOMES=()
+      while [[ $# -gt 0 && "$1" != --* ]]; do
+        GENOMES+=( "$1" ); shift
+      done
+      (( ${#GENOMES[@]} > 0 )) || die "--genome requires at least one FASTA"
+      ;;
     --proteins) PROTEINS="${2:-}"; shift 2;;
     --terminate_count) TERMINATE_COUNT="${2:-}"; shift 2;;
     --max-rounds) MAX_ROUNDS_OVERRIDE="${2:-}"; shift 2;;
@@ -469,8 +917,12 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-[[ -z "$GENOME" ]] && die "--genome is required"
-[[ -f "$GENOME" ]] || die "Genome not found: $GENOME"
+(( ${#GENOMES[@]} > 0 )) || die "--genome is required"
+for _g in "${GENOMES[@]}"; do
+  [[ -f "$_g" ]] || die "Genome not found: $_g"
+done
+N_GENOMES=${#GENOMES[@]}
+GENOME="${GENOMES[0]}"
 if [[ -n "$PROTEINS" ]]; then
   [[ -f "$PROTEINS" ]] || die "Proteins not found: $PROTEINS"
 fi
@@ -486,31 +938,54 @@ awk -v x="$FP_MASK_THRESHOLD" 'BEGIN{exit !(x>=0 && x<=1)}' \
 # ----------------------------
 # Derived names
 # ----------------------------
-# Genome prefix = basename minus a trailing .gz and one FASTA extension.
-# e.g. Athal_tair10_chr2.fa.gz -> Athal_tair10_chr2
-genome_base="$(basename "$GENOME")"
-genome_base="${genome_base%.gz}"
-genome_prefix="${genome_base%.*}"
-[[ -n "$genome_prefix" ]] || die "Could not derive a genome prefix from: $GENOME"
+declare -a GENOME_PREFIXES=() OUT_PREFIXES=()
+for _g in "${GENOMES[@]}"; do
+  GENOME_PREFIXES+=( "$(genome_prefix_of "$_g")" )
+done
+genome_prefix="${GENOME_PREFIXES[0]}"
 
-# Tools-dir basename: user's --out_prefix if given, else the genome prefix.
-# (Captured before OUT_PREFIX is defaulted below so the no-prefix case keeps
-#  the historic ./<genome_prefix>_tools name.)
-if [[ -n "$OUT_PREFIX" ]]; then
-  tools_base="$OUT_PREFIX"
+if (( N_GENOMES == 1 )); then
+  # Single genome: --out_prefix names this genome's outputs AND the family
+  # namespace, exactly as before. tools_base keeps the historic rule so a run
+  # without --out_prefix still gets ./<genome_prefix>_tools.
+  if [[ -n "$OUT_PREFIX" ]]; then
+    tools_base="$OUT_PREFIX"
+  else
+    tools_base="$genome_prefix"
+    OUT_PREFIX="${genome_prefix}_LTRs"
+  fi
+  OUT_PREFIXES=( "$OUT_PREFIX" )
+  RUN_PREFIX="$OUT_PREFIX"
+  TOOLS_DIR="./${tools_base}_tools"
 else
-  tools_base="$genome_prefix"
+  # Multi genome: every genome keeps its own auto-derived prefix; --out_prefix
+  # names only the shared pool (families, merged cluster tables, staging).
+  RUN_PREFIX="${OUT_PREFIX:-merged}"
+  for _p in "${GENOME_PREFIXES[@]}"; do
+    OUT_PREFIXES+=( "${_p}_LTRs" )
+  done
+  OUT_PREFIX="${OUT_PREFIXES[0]}"
+  TOOLS_DIR="./${RUN_PREFIX}_tools"
 fi
 
-# Default output prefix to <genome_prefix>_LTRs unless the user set --out_prefix.
-[[ -z "$OUT_PREFIX" ]] && OUT_PREFIX="${genome_prefix}_LTRs"
-
-# Per-tools directory for cloned helper tools
-# (e.g. ./minimap2_tools when --out_prefix minimap2, else ./Athal_tair10_chr2_tools).
-TOOLS_DIR="./${tools_base}_tools"
-
-echo "Output prefix:   ${OUT_PREFIX}"
+if (( N_GENOMES > 1 )); then
+  echo "Genomes:         ${N_GENOMES}"
+  for _i in "${!GENOMES[@]}"; do
+    echo "  [$((_i+1))] ${GENOMES[$_i]}  ->  ${OUT_PREFIXES[$_i]}"
+  done
+  echo "Run prefix:      ${RUN_PREFIX}"
+else
+  echo "Output prefix:   ${OUT_PREFIX}"
+fi
 echo "Tools directory: ${TOOLS_DIR}"
+
+# Preflight guards. Multi-genome only, so the single-genome path is untouched
+# and pays no extra genome read. The worker always receives exactly one genome,
+# so these only ever fire in the orchestrator.
+if (( N_GENOMES > 1 )); then
+  check_unique_basenames
+  check_unique_seqids
+fi
 
 if [[ -z "$SCRIPT_PATH" ]]; then
   SCRIPT_PATH="$(abspath_dir "${BASH_SOURCE[0]}")"
@@ -622,7 +1097,9 @@ overlap_for_round() {
 }
 
 orig_genome="$GENOME"
-temp_lib="temp_ltr_2pass_lib.fa"
+# Namespaced by prefix: several genomes share one staging directory, and a
+# fixed name would let genome 2 clobber genome 1's pass-2 library.
+temp_lib="temp_ltr_2pass_lib_${OUT_PREFIX}.fa"
 
 # ----------------------------
 # Main loop
@@ -843,149 +1320,10 @@ if (( ${#completed_round_prefixes[@]} > 0 )); then
   set +x
 fi
 
-# ----------------------------
-# FP-family correction (Kmer2LTR). Runs on the reconciled depth outputs. Must
-# run BEFORE the TOOLS_DIR cleanup below (Kmer2LTR lives in TOOLS_DIR/Kmer2LTR).
-# Produces {OUT_PREFIX}_depth{N}_clean_ltr.{tsv,fa}, and — only when the FP
-# fraction exceeds --fp-mask-threshold — {OUT_PREFIX}_FP_masked.fa, which the
-# orchestrator detects to trigger an automatic re-run.
-# ----------------------------
-shopt -s nullglob
-depth_fas=( "${OUT_PREFIX}"_depth*_ltr.fa )
-depth_tsvs=( "${OUT_PREFIX}"_depth*_ltr.tsv )
-shopt -u nullglob
-
-if (( ${#depth_fas[@]} > 0 )); then
-  all_ltr_fa="${OUT_PREFIX}_all_ltr.fa"
-
-  echo ""
-  echo "============================================================"
-  echo "FP-family correction on ${#depth_fas[@]} depth-bucketed FASTA(s)..."
-
-  # (1) Concatenate all nest-level FASTAs, stripping non-ACGT characters. Those
-  #     characters are the reconciler's IUPAC-masked nested inners; removing them
-  #     leaves only the outermost putative LTR-RT of each element.
-  cat "${depth_fas[@]}" \
-    | awk '/^>/{printf "\n%s\n",$0;next}{gsub(/[^ACGTacgt]/,"");printf "%s",$0}END{print ""}' \
-    > "$all_ltr_fa"
-
-  if [[ ! -s "$all_ltr_fa" ]]; then
-    # Degenerate (near-impossible) case: nothing to cluster. The primary depth
-    # detection already succeeded, so warn and skip the optional FP add-on rather
-    # than aborting and discarding good results.
-    echo "WARNING: ${all_ltr_fa} is empty after stripping non-ACGT; skipping FP-family correction." >&2
-  else
-    # Locate Kmer2LTR (cloned into TOOLS_DIR by ltrharvest5.py during the rounds).
-    ensure_kmer2ltr_dir
-    KMER2LTR_PY="${TOOLS_DIR}/Kmer2LTR/Kmer2LTR.py"
-    FLAG_FP_PY="${TOOLS_DIR}/Kmer2LTR/flag_fp_families.py"
-
-    # (2) Build the consensus + internal LTR clusters at id 0.75 (developer-fixed).
-    set -x
-    python "$KMER2LTR_PY" \
-      -i "$all_ltr_fa" \
-      -o "${OUT_PREFIX}_all_ltr" \
-      --ltr-cluster --internal-cluster \
-      -p "$THREADS" \
-      --min-seq-id 0.75
-    set +x
-
-    # Resolve the produced cluster tables by glob (robust to id-tag formatting);
-    # a single --min-seq-id yields exactly one of each.
-    shopt -s nullglob
-    cons_cluster=( "${OUT_PREFIX}"_all_ltr.consensus_id*_cluster.tsv )
-    int_cluster=(  "${OUT_PREFIX}"_all_ltr.internal_id*_cluster.tsv )
-    shopt -u nullglob
-    cons_fa="${OUT_PREFIX}_all_ltr.consensus.fa"
-    (( ${#cons_cluster[@]} == 1 )) || die "Expected exactly 1 consensus cluster TSV, found ${#cons_cluster[@]}"
-    (( ${#int_cluster[@]}  == 1 )) || die "Expected exactly 1 internal cluster TSV, found ${#int_cluster[@]}"
-    [[ -s "$cons_fa" ]] || die "Missing consensus FASTA: $cons_fa"
-
-    # (3) Flag FP families, purge their rows from each depth TSV (-> *_clean_ltr.tsv),
-    #     and — only if the FP fraction exceeds --fp-mask-threshold — write the
-    #     masked genome that triggers an orchestrator re-run. --masked-out pins the
-    #     name to the prefix (default naming keys off the genome basename instead).
-    set -x
-    python "$FLAG_FP_PY" \
-      --consensus-cluster "${cons_cluster[0]}" \
-      --internal-cluster "${int_cluster[0]}" \
-      --ltr-fasta "$cons_fa" \
-      --domains-tsv "${depth_tsvs[@]}" \
-      -o "${OUT_PREFIX}_fpcheck" \
-      --genome "$GENOME" \
-      --masked-out "${OUT_PREFIX}_FP_masked.fa" \
-      --threads "$THREADS" \
-      --fp-mask-threshold "$FP_MASK_THRESHOLD"
-    set +x
-
-    # (4) Emit an FP-cleaned FASTA next to each cleaned TSV: keep only records
-    #     whose full header equals a surviving element id (TSV column 1; the
-    #     reconciler writes depth-FASTA headers as exactly that id).
-    for dtsv in "${depth_tsvs[@]}"; do
-      clean_tsv="${dtsv%_ltr.tsv}_clean_ltr.tsv"
-      depth_fa="${dtsv%_ltr.tsv}_ltr.fa"
-      clean_fa="${dtsv%_ltr.tsv}_clean_ltr.fa"
-      if [[ ! -s "$clean_tsv" || ! -s "$depth_fa" ]]; then
-        echo "WARNING: skipping cleaned FASTA for ${dtsv}: missing ${clean_tsv} or ${depth_fa}" >&2
-        continue
-      fi
-      awk -F'\t' 'NR==FNR { if ($0 !~ /^#/ && NF >= 2) keep[$1] = 1; next }
-                  /^>/ { p = (substr($0, 2) in keep) } p' \
-        "$clean_tsv" "$depth_fa" > "$clean_fa"
-      echo "Cleaned FASTA: ${clean_fa} ($(count_fasta_headers "$clean_fa") records)"
-    done
-
-    if [[ -s "${OUT_PREFIX}_FP_masked.fa" ]]; then
-      echo "FP fraction exceeded --fp-mask-threshold (${FP_MASK_THRESHOLD}); wrote ${OUT_PREFIX}_FP_masked.fa."
-      echo "The orchestrator will re-run detection on the masked genome."
-    else
-      echo "FP fraction within --fp-mask-threshold (${FP_MASK_THRESHOLD}); no re-run needed."
-    fi
-  fi
-fi
-
-# ----------------------------
-# Annotation add-ons: strand + family columns, then GFF3.
-#
-# ltr_annotate.py rewrites every {OUT_PREFIX}_depth{N}[_clean]_ltr.tsv in place,
-# inserting `strand` and `family` after `tsd`. The columns go before
-# domains/nest_status because ltrharvest_plot_struct.py and TEGV.py read those
-# two from the end of the row.
-#
-# ltr_tsv_to_gff3.py then pools the annotated tables (FP-purged set preferred)
-# into {OUT_PREFIX}_all_depth_LTR_cleaned.gff3, plus
-# {OUT_PREFIX}_all_depth_protein_LTR_cleaned.gff3 when round 1 produced a
-# miniprot genic GFF (i.e. when --proteins was given).
-#
-# Both degrade gracefully on missing inputs, so a non-zero exit is a real fault
-# and is fatal -- unlike the advisory plotting stage.
-# ----------------------------
-shopt -s nullglob
-annot_tsvs=( "${OUT_PREFIX}"_depth*_ltr.tsv )
-shopt -u nullglob
-
-if (( ${#annot_tsvs[@]} > 0 )); then
-  echo ""
-  echo "============================================================"
-  echo "Annotating ${#annot_tsvs[@]} depth table(s) with strand + family..."
-  set -x
-  python "$ANNOTATOR" --prefix "$OUT_PREFIX" --indir .
-  set +x
-
-  echo ""
-  echo "============================================================"
-  echo "Writing LTR-RT GFF3..."
-  set -x
-  python "$GFF3_WRITER" --prefix "$OUT_PREFIX" --indir . --genome "$GENOME"
-  set +x
-else
-  echo "WARNING: no ${OUT_PREFIX}_depth<N>_ltr.tsv present; skipping the" >&2
-  echo "strand/family annotation and GFF3 stages." >&2
-fi
-
-# Cleanup
+# Cleanup. TOOLS_DIR is deliberately left in place: the merged stage runs in the
+# orchestrator and needs the Kmer2LTR clone that lives inside it. The
+# orchestrator removes every tools dir once the merged stage is done.
 rm -f "$temp_lib" 2>/dev/null || true
-rm -rf "$TOOLS_DIR" 2>/dev/null || true
 
 WRAPPER_ELAPSED=$((SECONDS - WRAPPER_START))
 WRAPPER_H=$((WRAPPER_ELAPSED / 3600))
@@ -997,5 +1335,4 @@ else
   WRAPPER_TIME="${WRAPPER_M}:$(printf '%02d' $WRAPPER_S)"
 fi
 echo ""
-echo "Wrapper total runtime: ${WRAPPER_TIME}"
-echo "Done."
+echo "Detection complete for ${OUT_PREFIX} (${WRAPPER_TIME})."

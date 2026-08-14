@@ -498,7 +498,9 @@ def clade_composition(members: Sequence[str]) -> Tuple[Tuple[str, int], ...]:
 
 
 def load_families(prefix: str, indir: str = ".", verbose: bool = False,
-                  warn_missing: bool = True
+                  warn_missing: bool = True, *,
+                  consensus_cluster: Optional[str] = None,
+                  family_prefix: Optional[str] = None
                   ) -> Tuple[Dict[str, Family], Dict[str, Family]]:
     """Return (by full element name, by bare coordinate key).
 
@@ -506,17 +508,30 @@ def load_families(prefix: str, indir: str = ".", verbose: bool = False,
     representative and member; a family is every row sharing a representative.
     Families are numbered by descending size, ties broken on representative
     name, so labels are stable across reruns of the same data.
+
+    consensus_cluster pins the table explicitly instead of globbing on prefix,
+    and family_prefix names the labels. Multi-genome runs set both so every
+    genome reads one pooled table and emits one shared family vocabulary.
     """
-    pattern = os.path.join(indir, f"{prefix}_all_ltr.consensus_id*_cluster.tsv")
-    paths = sorted(glob.glob(pattern))
-    if not paths:
-        if warn_missing:
-            warn(f"no consensus cluster table matched {pattern}; family will be "
-                 f"'{UNKNOWN}'")
-        return {}, {}
-    if len(paths) > 1:
-        warn(f"{len(paths)} consensus cluster tables matched {pattern}; "
-             f"using {os.path.basename(paths[0])}")
+    if consensus_cluster:
+        if not os.path.isfile(consensus_cluster):
+            if warn_missing:
+                warn(f"consensus cluster table not found: {consensus_cluster}; "
+                     f"family will be '{UNKNOWN}'")
+            return {}, {}
+        paths = [consensus_cluster]
+    else:
+        pattern = os.path.join(indir,
+                               f"{prefix}_all_ltr.consensus_id*_cluster.tsv")
+        paths = sorted(glob.glob(pattern))
+        if not paths:
+            if warn_missing:
+                warn(f"no consensus cluster table matched {pattern}; family will "
+                     f"be '{UNKNOWN}'")
+            return {}, {}
+        if len(paths) > 1:
+            warn(f"{len(paths)} consensus cluster tables matched {pattern}; "
+                 f"using {os.path.basename(paths[0])}")
 
     members_by_rep: Dict[str, List[str]] = defaultdict(list)
     seen: Dict[str, str] = {}
@@ -537,11 +552,12 @@ def load_families(prefix: str, indir: str = ".", verbose: bool = False,
     order = sorted(members_by_rep, key=lambda r: (-len(members_by_rep[r]), r))
     width = max(5, len(str(len(order))))
 
+    label_prefix = family_prefix or prefix
     by_name: Dict[str, Family] = {}
     by_coord: Dict[str, Family] = {}
     ambiguous_coords = set()
     for index, rep in enumerate(order, start=1):
-        family = Family(f"{prefix}_fam{index:0{width}d}", rep,
+        family = Family(f"{label_prefix}_fam{index:0{width}d}", rep,
                         len(members_by_rep[rep]),
                         clade_composition(members_by_rep[rep]))
         for member in members_by_rep[rep]:
@@ -670,7 +686,9 @@ def write_annotated_table(table: DepthTable,
 # -----------------------------
 # Driver
 # -----------------------------
-def annotate(prefix: str, indir: str = ".", verbose: bool = False) -> int:
+def annotate(prefix: str, indir: str = ".", verbose: bool = False,
+             consensus_cluster: Optional[str] = None,
+             family_prefix: Optional[str] = None) -> int:
     tables = discover_depth_tables(prefix, indir)
     if not tables:
         print(f"[ltr_annotate] ERROR: no {prefix}_depth<N>[_clean]_ltr.tsv found "
@@ -684,7 +702,9 @@ def annotate(prefix: str, indir: str = ".", verbose: bool = False) -> int:
 
     tesorter = load_tesorter_strands(prefix, indir, verbose)
     target_of, orientation = load_pass2_links(prefix, indir, verbose)
-    family_by_name, family_by_coord = load_families(prefix, indir, verbose)
+    family_by_name, family_by_coord = load_families(
+        prefix, indir, verbose,
+        consensus_cluster=consensus_cluster, family_prefix=family_prefix)
     strand, source = resolve_strands(elements, tesorter, target_of, orientation,
                                      verbose)
 
@@ -725,6 +745,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                         help="Wrapper output prefix, e.g. Athal_tair10_chr2_LTRs")
     parser.add_argument("--indir", default=".",
                         help="Directory holding the wrapper outputs (default: .)")
+    parser.add_argument("--consensus-cluster", default=None,
+                        help="Kmer2LTR consensus cluster TSV to read families "
+                             "from. Default: glob "
+                             "<indir>/<prefix>_all_ltr.consensus_id*_cluster.tsv. "
+                             "Multi-genome runs point every genome at one pooled "
+                             "table.")
+    parser.add_argument("--family-prefix", default=None,
+                        help="Namespace for family labels (<NAME>_fam00001). "
+                             "Default: --prefix.")
     parser.add_argument("-v", "--verbose", action="store_true",
                         help="Per-step progress and per-file counts")
     args = parser.parse_args(argv)
@@ -733,7 +762,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print(f"[ltr_annotate] ERROR: not a directory: {args.indir}",
               file=sys.stderr)
         return 1
-    return annotate(args.prefix, args.indir, args.verbose)
+    return annotate(args.prefix, args.indir, args.verbose,
+                    args.consensus_cluster, args.family_prefix)
 
 
 if __name__ == "__main__":

@@ -40,6 +40,7 @@ Line 2 (inner) is nested in line 1 (outer). Line 2 inner looks like Bianca. Line
 
 import argparse
 import gzip
+import heapq
 import os
 import re
 import shutil
@@ -952,6 +953,310 @@ def filter_scn_by_lengths(
     return counts
 
 # -----------------------------
+# Step 6c: sdust low-complexity filtering of full-length candidates
+# -----------------------------
+
+# Deleting the bases we want to keep and measuring the shortfall counts ACGT in
+# a single C-level pass -- ~3x faster than one str.count per base, which matters
+# once a genome yields six figures of candidates.
+_DROP_ACGT = str.maketrans("", "", "ACGTacgt")
+
+
+def _acgt_bp(seq: str) -> int:
+    return len(seq) - len(seq.translate(_DROP_ACGT))
+
+
+def _covered_bp(intervals: List[Tuple[int, int]]) -> int:
+    """Total bp covered by 0-based half-open intervals, merging any overlap."""
+    if not intervals:
+        return 0
+    intervals.sort()
+    total = 0
+    cur_s, cur_e = intervals[0]
+    for s, e in intervals[1:]:
+        if s > cur_e:
+            total += cur_e - cur_s
+            cur_s, cur_e = s, e
+        elif e > cur_e:
+            cur_e = e
+    return total + (cur_e - cur_s)
+
+
+def parse_sdust_args(raw: str) -> List[str]:
+    """Validate a user-supplied sdust argument string.
+
+    sdust takes only -w INT and -t INT. Anything else -- an unknown flag, a
+    non-numeric value -- it silently ignores, leaving the default in place and
+    still exiting 0. -t is a deliberate sensitivity choice here (15 rather than
+    sdust's own 20), so a typo that quietly reverted it would change which
+    elements get dropped with nothing in the log to show for it. Reject it up
+    front instead of trusting the tool.
+
+    Raises ValueError with a message suitable for argparse.
+    """
+    toks = raw.split()
+    out: List[str] = []
+    i = 0
+    while i < len(toks):
+        tok = toks[i]
+        if tok in ("-w", "-t"):
+            if i + 1 >= len(toks):
+                raise ValueError(f"'{tok}' requires an integer value")
+            flag, val = tok, toks[i + 1]
+            i += 2
+        elif len(tok) > 2 and tok[:2] in ("-w", "-t"):
+            flag, val = tok[:2], tok[2:]
+            i += 1
+        else:
+            raise ValueError(
+                f"unsupported option '{tok}'. sdust accepts only -w and -t, and "
+                f"silently ignores anything else rather than failing."
+            )
+        if not re.fullmatch(r"[0-9]+", val) or int(val) <= 0:
+            raise ValueError(f"'{flag}' requires a positive integer (got '{val}')")
+        out += [flag, val]
+    return out
+
+
+def _balanced_shards(lengths: List[int], n_shards: int) -> List[int]:
+    """Longest-processing-time-first packing: hand each element (largest first)
+    to the currently-lightest shard. Returns the shard index of each element."""
+    assign = [0] * len(lengths)
+    heap = [(0, i) for i in range(n_shards)]
+    heapq.heapify(heap)
+    for idx in sorted(range(len(lengths)), key=lambda i: -lengths[i]):
+        load, shard = heapq.heappop(heap)
+        assign[idx] = shard
+        heapq.heappush(heap, (load + lengths[idx], shard))
+    return assign
+
+
+def filter_scn_by_sdust(
+    in_scn: str,
+    out_scn: str,
+    genome_fa: str,
+    sdust_bin: str,
+    sdust_args: List[str],
+    max_dust_frac: float,
+    threads: int,
+    scratch_dir: Path,
+    report_tsv: Optional[str] = None,
+    verbose: bool = False,
+) -> Dict[str, int]:
+    """
+    Drop SCN candidates whose full-length sequence is dominated by low-complexity
+    (sdust-masked) sequence -- satellite/microsatellite arrays that seed spurious
+    LTR pairs. Runs before TEBinSorter so the wasted classification, TSD, and
+    Kmer2LTR work is never spent on them.
+
+    The fraction is taken over ACGT bases ONLY, which is what makes it a statement
+    about the element itself rather than about its nested inners. Every other
+    character in an extracted candidate is either a nested inner element (an IUPAC
+    round letter painted in by mask_ltr.py, so from round 2 on the inner arrives
+    pre-masked in the genome this round was called on) or far-mask filler ('V').
+    sdust maps every non-ACGT byte to 4 and treats it as a hard break -- such
+    positions are never reported as masked -- so numerator and denominator agree:
+    dust_frac is the masked fraction of the element's own, non-nested sequence.
+
+    Round 1 is the one gap: nothing is masked yet, so a same-round inner still sits
+    in its host's denominator. That only dilutes the fraction -- real LTR sequence
+    is not low-complexity -- so the filter stays conservative and cannot drop an
+    element on account of what is nested in it.
+
+    sdust is single-threaded but stateless per record, so candidates are packed
+    into `threads` length-balanced shards and one process is run per shard. That is
+    exactly equivalent to one process per element, at a fraction of the spawn cost.
+
+    Returns a counts dict: total, kept, dropped, judged, no_acgt, malformed.
+    """
+    counts = {
+        "kept": 0,
+        "total": 0,
+        "dropped": 0,
+        "judged": 0,
+        "no_acgt": 0,
+        "malformed": 0,
+    }
+
+    inp = Path(in_scn)
+    if not inp.exists() or inp.stat().st_size == 0:
+        Path(out_scn).touch()
+        return counts
+
+    # ---- collect one entry per distinct element interval. merge_stitched_scns
+    # can emit two rows sharing chrom/s(ret)/e(ret) but differing in LTR
+    # coordinates; they are the same sequence, so judge it once.
+    order: List[str] = []
+    key_pos: Dict[str, Tuple[str, int, int]] = {}
+    by_chrom: Dict[str, List[str]] = {}
+
+    with open(in_scn, "r") as fin:
+        for line in fin:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = re.split(r"\s+", line)
+            if len(parts) < 12 or not (parts[0].isdigit() and parts[1].isdigit()):
+                counts["malformed"] += 1
+                continue
+            counts["total"] += 1
+            s1, e1 = int(parts[0]), int(parts[1])
+            if e1 < s1:
+                s1, e1 = e1, s1
+            chrom = parts[-1]
+            key = f"{chrom}:{s1}-{e1}"
+            if key not in key_pos:
+                key_pos[key] = (chrom, s1, e1)
+                order.append(key)
+                by_chrom.setdefault(chrom, []).append(key)
+
+    if not order:
+        Path(out_scn).touch()
+        return counts
+
+    # ---- extract candidates into length-balanced shards, one genome pass,
+    # one chromosome resident at a time.
+    n_shards = max(1, min(int(threads), len(order), 256))
+    shard_of = dict(zip(
+        order,
+        _balanced_shards([key_pos[k][2] - key_pos[k][1] + 1 for k in order], n_shards),
+    ))
+
+    mkdirp(scratch_dir)
+    shard_fa = [str(scratch_dir / f"shard{i:04d}.fa") for i in range(n_shards)]
+    shard_bed = [str(scratch_dir / f"shard{i:04d}.bed") for i in range(n_shards)]
+
+    acgt_bp: Dict[str, int] = {}
+    handles: List = []
+    try:
+        for path in shard_fa:
+            handles.append(open(path, "w"))
+        for chrom, seq in iter_fasta(genome_fa):
+            keys = by_chrom.get(chrom)
+            if not keys:
+                continue
+            slen = len(seq)
+            for key in keys:
+                _, s1, e1 = key_pos[key]
+                start0, end0 = s1 - 1, e1
+                if start0 < 0 or end0 > slen:
+                    continue  # out of range: no verdict, candidate is kept
+                frag = seq[start0:end0]
+                acgt_bp[key] = _acgt_bp(frag)
+                out = handles[shard_of[key]]
+                out.write(f">{key}\n")
+                for i in range(0, len(frag), 60):
+                    out.write(frag[i:i + 60] + "\n")
+    finally:
+        for h in handles:
+            h.close()
+
+    # ---- one sdust per shard, in parallel
+    def _run_shard(i: int) -> Tuple[int, int, str]:
+        # sdust handed a path it cannot open writes nothing and still exits 0,
+        # which would read downstream as "no low-complexity found" and silently
+        # drop nothing at all. Check the file rather than trust the exit code.
+        if not Path(shard_fa[i]).is_file():
+            raise RuntimeError(f"sdust input shard missing: {shard_fa[i]}")
+        with open(shard_bed[i], "wb") as bed:
+            r = subprocess.run(
+                [sdust_bin] + list(sdust_args) + [shard_fa[i]],
+                stdout=bed, stderr=subprocess.PIPE,
+            )
+        return i, r.returncode, (r.stderr or b"").decode("utf-8", "replace").strip()
+
+    if verbose:
+        print(f"  sdust: {len(order)} candidates over {n_shards} shard(s)", file=sys.stderr)
+
+    with ThreadPoolExecutor(max_workers=n_shards) as ex:
+        for fut in as_completed([ex.submit(_run_shard, i) for i in range(n_shards)]):
+            i, rc, err = fut.result()
+            if rc != 0:
+                raise RuntimeError(
+                    f"sdust failed on {shard_fa[i]} (exit {rc}):\n{err}"
+                )
+
+    # ---- accumulate masked bp per candidate (BED3, 0-based half-open).
+    # sdust emits one record's intervals contiguously and already merged
+    # (sdust.c:save_masked_regions), and each candidate lives in exactly one
+    # shard, so only one record's intervals are ever held at a time -- the
+    # interval list never scales with the number of candidates.
+    dust_bp: Dict[str, int] = {}
+
+    def _flush(name: Optional[str], ivs: List[Tuple[int, int]]) -> None:
+        if name is not None:
+            dust_bp[name] = dust_bp.get(name, 0) + _covered_bp(ivs)
+
+    for bed in shard_bed:
+        cur_name: Optional[str] = None
+        cur: List[Tuple[int, int]] = []
+        with open(bed, "r") as f:
+            for line in f:
+                p = line.rstrip("\n").split("\t")
+                if len(p) < 3:
+                    continue
+                try:
+                    iv = (int(p[1]), int(p[2]))
+                except ValueError:
+                    continue
+                if p[0] != cur_name:
+                    _flush(cur_name, cur)
+                    cur_name, cur = p[0], []
+                cur.append(iv)
+        _flush(cur_name, cur)
+
+    # ---- verdicts, reported as they are decided
+    drop: Set[str] = set()
+    rf = open(report_tsv, "w") if report_tsv else None
+    try:
+        if rf:
+            rf.write("#name\tret_len\tacgt_bp\tdust_bp\tdust_frac\tverdict\n")
+        for key in order:
+            n_acgt = acgt_bp.get(key)
+            if n_acgt is None:
+                continue  # never extracted: unjudgeable, so left alone
+            counts["judged"] += 1
+            d_bp = dust_bp.get(key, 0)
+            if n_acgt <= 0:
+                counts["no_acgt"] += 1
+                frac, verdict = 0.0, "keep"
+            else:
+                frac = d_bp / n_acgt
+                verdict = "drop" if frac >= max_dust_frac else "keep"
+            if verdict == "drop":
+                drop.add(key)
+            if rf:
+                _, s1, e1 = key_pos[key]
+                rf.write(f"{key}\t{e1 - s1 + 1}\t{n_acgt}\t{d_bp}\t{frac:.4f}\t{verdict}\n")
+    finally:
+        if rf:
+            rf.close()
+
+    # ---- rewrite the SCN without the dropped elements
+    with open(in_scn, "r") as fin, open(out_scn, "w") as out:
+        for line in fin:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = re.split(r"\s+", line)
+            if len(parts) < 12 or not (parts[0].isdigit() and parts[1].isdigit()):
+                continue
+            s1, e1 = int(parts[0]), int(parts[1])
+            if e1 < s1:
+                s1, e1 = e1, s1
+            if f"{parts[-1]}:{s1}-{e1}" in drop:
+                counts["dropped"] += 1
+                continue
+            out.write("  ".join(parts) + "\n")
+            counts["kept"] += 1
+
+    if counts["kept"] == 0:
+        Path(out_scn).touch()
+
+    shutil.rmtree(scratch_dir, ignore_errors=True)
+    return counts
+
+# -----------------------------
 # Step 7: build LTR FASTA from stitched SCN
 # -----------------------------
 
@@ -1810,6 +2115,37 @@ def ensure_trfmod(tools_dir: Path) -> str:
             raise RuntimeError(f"TRF-mod build failed or binary unusable at: {trf_bin}")
 
     return str(trf_bin)
+
+def tool_usable_sdust(bin_path: Path) -> bool:
+    if not bin_path.exists() or not os.access(str(bin_path), os.X_OK):
+        return False
+    try:
+        # With no input file sdust prints its usage to stderr and exits 1.
+        r = subprocess.run(
+            [str(bin_path)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        return "sdust" in ((r.stdout or "") + "\n" + (r.stderr or "")).lower()
+    except Exception:
+        return False
+
+
+def ensure_sdust(tools_dir: Path) -> str:
+    tools_dir = mkdirp(tools_dir)
+    sd_dir = tools_dir / "sdust"
+    sd_bin = sd_dir / "sdust"
+
+    if not tool_usable_sdust(sd_bin):
+        if not sd_dir.exists():
+            run(["git", "clone", "https://github.com/lh3/sdust.git", str(sd_dir)], check=True)
+        run(["make"], cwd=str(sd_dir), check=True)
+
+        if not tool_usable_sdust(sd_bin):
+            raise RuntimeError(f"sdust build failed or binary unusable at: {sd_bin}")
+
+    return str(sd_bin)
 
 def run_tebinsorter(stitched_fa: str, pipeline_py_path: str, outdir: Path,
                     db: str, rule: str, threads: int,
@@ -3618,6 +3954,42 @@ def main():
     )
 
     ap.add_argument(
+        "--sdust",
+        dest="use_sdust",
+        action="store_true",
+        default=False,
+        help="Run sdust on each full-length LTR-RT candidate after the LTRharvest/LTRfinder "
+             "merge and drop those dominated by low-complexity sequence, before TEBinSorter "
+             "ever sees them (default: disabled)."
+    )
+    ap.add_argument(
+        "--no-sdust",
+        dest="use_sdust",
+        action="store_false",
+        help="Disable the sdust low-complexity candidate filter."
+    )
+    ap.add_argument(
+        "--sdust-args",
+        default="-w 64 -t 15",
+        help="Quoted args passed to sdust; only -w INT (window) and -t INT (score threshold) "
+             "are accepted, and are validated here because sdust silently ignores anything it "
+             "does not recognise. Default: '-w 64 -t 15' (sdust's own default is -t 20, so this "
+             "masks a little more aggressively)."
+    )
+    ap.add_argument(
+        "--max-dust-frac",
+        type=float,
+        default=0.55,
+        help="Drop a candidate when this fraction or more of its ACGT bases are sdust-masked "
+             "(default: 0.55). Nested inner elements and far-mask filler are neither counted "
+             "nor judged, so the fraction describes the element's own sequence. Calibrated against "
+             "curated ground truth: 1105 intact LTR-RTs (TAIR12-TE, riceTElib, MTEC) top out at "
+             "0.333, and 3951 plant entries in a 20703-element cross-species database top out at "
+             "0.5205, so 0.55 loses none of either. Raise it toward 0.80 for AT-rich genomes: "
+             "RIP-degraded Ascomycete elements reach 0.98 and are genuine."
+    )
+
+    ap.add_argument(
         "--tsd-pass2",
         action="store_true",
         help="Scan all SCN candidates for TSDs BEFORE TEBinSorter and feed TSD+ full-length sequences into TEBinSorter via --pass2-classified-fasta (default: off)."
@@ -3721,6 +4093,17 @@ def main():
         trfmod_path = ensure_trfmod(tools_dir)
         trf_args = args.trf_args.strip().split()
 
+    sdust_bin = None
+    sdust_args: List[str] = []
+    if args.use_sdust:
+        if not (0.0 < args.max_dust_frac <= 1.0):
+            ap.error("--max-dust-frac must be in (0, 1]")
+        try:
+            sdust_args = parse_sdust_args(args.sdust_args)
+        except ValueError as e:
+            ap.error(f"--sdust-args: {e}")
+        sdust_bin = ensure_sdust(tools_dir)
+
     if args.proteins or args.te_library:
         which_or_die("bedtools")
 
@@ -3746,6 +4129,9 @@ def main():
         print(f"  ltr_tools:     {args.ltr_tools}", file=sys.stderr)
         print(f"  tebinsorter:   {args.use_tesorter}", file=sys.stderr)
         print(f"  trf masking:   {args.use_trf}", file=sys.stderr)
+        print(f"  sdust filter:  {args.use_sdust}"
+              + (f" (sdust {args.sdust_args}; max_dust_frac={args.max_dust_frac:g})"
+                 if args.use_sdust else ""), file=sys.stderr)
         if exclude_run_char:
             print(f"  exclude_run:   {exclude_run_char} (>=10bp run)", file=sys.stderr)
         print("", file=sys.stderr)
@@ -3753,6 +4139,7 @@ def main():
     # Timing accumulators for core modules
     _t_miniprot = 0.0
     _t_ltr_annotation = 0.0
+    _t_sdust = 0.0
     _t_tesorter = 0.0
     _t_kmer2ltr = 0.0
     _t_total_start = time.monotonic()
@@ -3991,6 +4378,41 @@ def main():
         print("[Step6b] skipping SCN length filtering (no --scn-* filters set).")
 
     _t_ltr_annotation = time.monotonic() - _t0
+
+    # Optional: drop low-complexity candidates before anything expensive runs on
+    # them. Everything downstream reads merged_scn, so one rebind removes them
+    # from TEBinSorter, the TSD pass, Kmer2LTR, and the round's library alike.
+    if args.use_sdust:
+        _t0 = time.monotonic()
+        sdust_scn = str(workdir / f"{out_prefix}.ltrtools.stitched.sdust.scn")
+        sdust_report = str(workdir / f"{out_prefix}.sdust.tsv")
+        print(f"[Step6c] sdust low-complexity filter -> {sdust_scn}")
+
+        sd = filter_scn_by_sdust(
+            in_scn=merged_scn,
+            out_scn=sdust_scn,
+            genome_fa=args.genome,
+            sdust_bin=sdust_bin,
+            sdust_args=sdust_args,
+            max_dust_frac=args.max_dust_frac,
+            threads=args.threads,
+            scratch_dir=workdir / f"{out_prefix}.sdust_work",
+            report_tsv=sdust_report,
+            verbose=verbose,
+        )
+
+        print(
+            f"[Step6c] sdust filter: kept {sd['kept']}/{sd['total']} | "
+            f"dropped={sd['dropped']} (>= {args.max_dust_frac:g} of ACGT bp masked) "
+            f"elements_judged={sd['judged']} no_acgt={sd['no_acgt']} "
+            f"malformed={sd['malformed']}"
+        )
+        print(f"[Step6c] per-candidate report -> {sdust_report}")
+
+        merged_scn = sdust_scn
+        _t_sdust = time.monotonic() - _t0
+    else:
+        print("[Step6c] skipping sdust low-complexity filtering (--sdust not set).")
 
     internals_fa = str(workdir / f"{out_prefix}.ltrtools.internals.fa")
     intact_for_tesorter_fa = str(workdir / f"{out_prefix}.ltrtools.intact_for_tesorter.fa")
@@ -4234,6 +4656,8 @@ def main():
     print("Runtimes:")
     print(f"  Miniprot/masking:   {_format_hms(_t_miniprot)}")
     print(f"  LTR annotation:    {_format_hms(_t_ltr_annotation)}")
+    if args.use_sdust:
+        print(f"  sdust filter:      {_format_hms(_t_sdust)}")
     print(f"  TEBinSorter:       {_format_hms(_t_tesorter)}")
     print(f"  Kmer2LTR:          {_format_hms(_t_kmer2ltr)}")
     print(f"  Total:             {_format_hms(_t_total)}")

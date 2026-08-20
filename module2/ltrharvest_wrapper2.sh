@@ -5,7 +5,7 @@
 # Usage:
 #   bash nest_ltr_detector.sh --genome genome.fa [genome2.fa ...] [--proteins prot.fa] [--terminate_count 100]
 #       [--max-rounds N] [--script_path ./synLTR/module2/] [--threads 20] [--out_prefix PREFIX]
-#       [--wfa-align] [--ltrharvest5-args "KEY=VALUE ..."] [--ltrharvest5-args-from-round N "KEY=VALUE ..."]
+#       [--wfa-align] [--run-sdust] [--ltrharvest5-args "KEY=VALUE ..."] [--ltrharvest5-args-from-round N "KEY=VALUE ..."]
 #
 # Notes:
 # - Runs Round 1 on the original genome, then masks the ORIGINAL genome each round to build genome_r{N}.fa for next round.
@@ -22,6 +22,14 @@
 # - Builds temp_ltr_2pass_lib.fa by concatenating *all prior* libraries (r1..rK) and cleaning to A/T/C/G only.
 # - Deletes temp_ltr_2pass_lib.fa at end.
 # - Rounds 2+ automatically add --exclude-run-char V.
+# - --run-sdust (off by default) adds a low-complexity gate to every round: right
+#   after the LTRharvest/LTRfinder merge and before TEsorter2, each full-length
+#   candidate is run through sdust and dropped when >= --max-dust-frac of its ACGT
+#   bases come back masked. Nested inners arrive IUPAC-masked in the round genome
+#   and sdust treats any non-ACGT base as a hard break, so neither the numerator
+#   nor the denominator counts them -- the fraction describes the element itself.
+#   Filtering here rather than later spares TEsorter2, the TSD pass, and Kmer2LTR
+#   the work of classifying satellite arrays.
 #
 # Extra ltrharvest5.py args:
 #   --ltrharvest5-args "KEY=VALUE [KEY2=VALUE2 ...]"
@@ -117,6 +125,9 @@ SCRIPT_PATH=""
 THREADS=20
 OUT_PREFIX=""
 RUN_TRF=true
+RUN_SDUST=false
+SDUST_ARGS="-w 64 -t 15"
+MAX_DUST_FRAC="0.55"
 WFA_ALIGN=false
 KEEP_WEAK_HMM_PASS2=false
 PASS2_ALIGNER="minimap2"
@@ -144,7 +155,7 @@ Usage:
   bash nest_ltr_detector.sh --genome genome.fa [genome2.fa ...] [--proteins prot.fa]
       [--terminate_count 100]
       [--max-rounds N] [--script_path ./synLTR/module2/] [--threads 20] [--out_prefix PREFIX]
-      [--wfa-align] [--fp-mask-threshold 0.10]
+      [--wfa-align] [--run-sdust] [--fp-mask-threshold 0.10]
       [--ltrharvest5-args "KEY=VALUE ..."] [--ltrharvest5-args-from-round N "KEY=VALUE ..."]
 
 Required:
@@ -171,6 +182,15 @@ Optional:
                         genome always keeps its own <basename>_LTRs prefix.
   --run-trf             Run TRF tandem-repeat masking (default: on)
   --no-trf              Disable TRF tandem-repeat masking
+  --run-sdust           Filter LTR-RT candidates through sdust after the
+                        LTRharvest/LTRfinder merge and before TEsorter2,
+                        dropping those made mostly of low-complexity sequence
+                        (default: off). Nested inner elements are excluded
+                        from the calculation.
+  --sdust-args          Quoted args for sdust (default: '-w 64 -t 15')
+  --max-dust-frac       Drop a candidate when this fraction or more of its
+                        ACGT bases are sdust-masked (default: 0.55).
+                        Raise toward 0.80 for AT-rich/fungal genomes.
   --wfa-align           Use WFA instead of mafft for Kmer2LTR pairwise alignment (~30-50x faster)
   --keep-weak-hmm-pass2-matches
                         Include in cls.lib.fa the pass-2 matches whose target is a weak-HMM
@@ -896,6 +916,9 @@ while [[ $# -gt 0 ]]; do
     --out_prefix) OUT_PREFIX="${2:-}"; shift 2;;
     --run-trf) RUN_TRF=true; shift;;
     --no-trf) RUN_TRF=false; shift;;
+    --run-sdust) RUN_SDUST=true; shift;;
+    --sdust-args) SDUST_ARGS="${2:-}"; shift 2;;
+    --max-dust-frac) MAX_DUST_FRAC="${2:-}"; shift 2;;
     --wfa-align) WFA_ALIGN=true; shift;;
     --keep-weak-hmm-pass2-matches) KEEP_WEAK_HMM_PASS2=true; shift;;
     --pass2-aligner) PASS2_ALIGNER="${2:-}"; shift 2;;
@@ -934,6 +957,13 @@ awk -v x="$FP_MASK_THRESHOLD" 'BEGIN{exit !(x>=0 && x<=1)}' \
   || die "--fp-mask-threshold must be in [0,1] (got '$FP_MASK_THRESHOLD')"
 [[ "$MAX_FP_ROUNDS" =~ ^[1-9][0-9]*$ ]] \
   || die "--dev-max-fp-rounds must be a positive integer (got '$MAX_FP_ROUNDS')"
+
+# Validate the sdust knobs. Checked even when --run-sdust is absent so a typo
+# never sits silently until someone turns the filter on.
+[[ "$MAX_DUST_FRAC" =~ ^[0-9]*\.?[0-9]+$ ]] \
+  || die "--max-dust-frac must be a number in (0,1] (got '$MAX_DUST_FRAC')"
+awk -v x="$MAX_DUST_FRAC" 'BEGIN{exit !(x>0 && x<=1)}' \
+  || die "--max-dust-frac must be in (0,1] (got '$MAX_DUST_FRAC')"
 
 # ----------------------------
 # Derived names
@@ -1067,6 +1097,11 @@ else
   TRF_OPTS=(--no-trf)
 fi
 
+SDUST_OPTS=()
+if [[ "$RUN_SDUST" == true ]]; then
+  SDUST_OPTS=(--sdust --sdust-args "$SDUST_ARGS" --max-dust-frac "$MAX_DUST_FRAC")
+fi
+
 WFA_OPTS=()
 if [[ "$WFA_ALIGN" == true ]]; then
   WFA_OPTS=(--wfa-align)
@@ -1172,6 +1207,9 @@ for (( round=1; round<=MAX_ROUNDS; round++ )); do
     echo "  require-run-chars:  $req"
     echo "  exclude-run-char:   $FAR_CHARACTER"
   fi
+  if [[ "$RUN_SDUST" == true ]]; then
+    echo "  sdust filter:       ${SDUST_ARGS} (max-dust-frac ${MAX_DUST_FRAC})"
+  fi
   if [[ "${#extra_round_args[@]}" -gt 0 ]]; then
     echo "  extra ltrharvest5:  ${extra_round_args[*]}"
   fi
@@ -1193,6 +1231,7 @@ for (( round=1; round<=MAX_ROUNDS; round++ )); do
     --ltrharvest-args "$ltrharvest_args" \
     --ltrfinder-args "$ltrfinder_args" \
     "${TRF_OPTS[@]}" \
+    "${SDUST_OPTS[@]}" \
     --size "$SIZE" \
     --overlap "$overlap" \
     --tesorter-use-ret \

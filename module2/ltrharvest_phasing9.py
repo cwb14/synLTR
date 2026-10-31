@@ -63,6 +63,10 @@ usage: ltrharvest_phasing9.py --ltr_fasta LTR.fa --annotation ANNOT.gff3 [--fai 
 
 Developer notes (environment, benchmark results vs v5/v6/SubPhaser, per-genome notes, dead ends, gotchas, tests to
 rebuild, leads): the NOTES FOR FUTURE WORK block at the end of this file.
+
+Future update: If unphasable, its likely because The tool reads subgenomes from LTR-RT copies that are present in only one subgenome. Such copies come only from insertions made after the progenitors split and before they merged.
+  LTR-RTs are short-lived (most surviving copies here are under about 2 Myr old by their LTR divergence). If the polyploid formed long enough ago, those copies have decayed, and everything still intact was
+  inserted after the merger and spread across both subgenomes. Lineage sharing is then even across subgenomes (ratio 1.00). To mitigate, if failure, it could maybe run maskeraid/repeatmasker on the genome using the LTR-RT library to identify fragmented/decayed LTR-RTs after split and pre-merger. 
 """
 from __future__ import annotations
 

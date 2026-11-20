@@ -1,0 +1,50 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ltrtrace"
+version = "0.1.0"
+description = "LTR retrotransposon presence/absence, gene flow, subgenomes and read genotyping in one package"
+readme = "README.md"
+requires-python = ">=3.12"
+license = "GPL-3.0-or-later"
+license-files = ["LICENSE"]
+authors = [{ name = "Chris Benson", email = "oulab.osu@gmail.com" }]
+dependencies = [
+    "numpy",
+    "numba",
+    "scipy",
+    "matplotlib",
+    "pysam",
+    "mappy",
+    "edlib",
+    "parasail",
+]
+
+[project.optional-dependencies]
+sim = ["msprime", "tskit"]
+dev = ["pytest", "ruff"]
+
+[project.scripts]
+ltrtrace = "ltrtrace.cli:entry"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+addopts = "--import-mode=importlib"
+pythonpath = ["tests"]
+testpaths = ["tests"]
+markers = ["slow: long-running test, deselect with -m 'not slow'"]
+filterwarnings = ["error"]
+
+[tool.ruff]
+line-length = 120
+
+[tool.ruff.lint.per-file-ignores]
+# style rules the subgenomes analysis, its figure and their tests do not follow
+"src/ltrtrace/analyses/subgenomes/*.py" = ["B023", "C401", "C408", "FURB122", "FURB136", "ISC004", "PIE808", "PLR1730", "RUF046", "RUF059", "SIM102", "UP033"]
+"src/ltrtrace/plot/subgenomes.py" = ["C408", "FURB122", "PIE808", "RUF059", "SIM102"]
+"tests/analyses/subgenomes/*.py" = ["B023", "C408", "F841", "FURB122", "FURB167", "FURB192", "PIE808", "PLC3002", "PLW1510", "RUF015", "RUF059"]
+"tests/plot/test_subgenomes.py" = ["C408"]

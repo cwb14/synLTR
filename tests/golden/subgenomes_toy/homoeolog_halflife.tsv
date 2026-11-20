@@ -1,0 +1,3 @@
+lost_in	copies_from	split_divergence	inherited_pairs	retention_1.5x	retention_2x	old_copies	half_life_k2p	low	high	half_life_years	years_low	years_high	copies_per_mb_lost_in	qc
+SG2	SG1	0.05368	54	0.4074	0.3636	81	0.04144	0.03635	0.04772	1.594e+06	1.398e+06	1.835e+06	57.50	pass
+SG1	SG2	0.05368	54	0.4091	0.4286	88	0.04163	0.03535	0.05064	1.601e+06	1.36e+06	1.948e+06	58.50	pass

@@ -1,0 +1,5 @@
+sequence	length	n_ltr	n_informative	subgenome	status	support	oe_own	oe_other	pvalue	partner	partner_support	partner_excess	core
+chr001	4000000	229	224	SG1	assigned	1.000	1.065	0.9678	NA	chr003	1.00	NA	yes
+chr002	4000000	250	247	SG2	assigned	1.000	1.066	0.9693	NA	chr004	1.00	NA	yes
+chr003	4000000	239	232	SG1	assigned	1.000	1.065	0.9667	NA	chr001	1.00	NA	yes
+chr004	4000000	210	207	SG2	assigned	1.000	1.066	0.9652	NA	chr002	1.00	NA	yes

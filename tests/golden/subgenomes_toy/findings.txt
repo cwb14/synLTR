@@ -1,0 +1,8 @@
+
+Homoeologs SG1-SG2: 2 of 2 SG1 and 2 of 2 SG2 sequences paired.
+Orientation: every called homoeolog pair runs in the same direction in this assembly.
+Exchanges: no stretch of near-identical inherited insertions on the called homoeologs (replacing exchanges >= 1 Mb are found 9 times in 10 in simulations; smaller or older ones can be missed).
+Half-life of intact LTR retrotransposons in SG2: 0.0414 LTR divergence [0.0364-0.0477] = 1.59 Myr [1.40 Myr-1.84 Myr] at mu 1.3e-08 (share of SG1's pre-split copies whose SG2 ortholog is still intact: 41%); intact copies per Mb in SG2: 57.5.
+Half-life of intact LTR retrotransposons in SG1: 0.0416 LTR divergence [0.0353-0.0506] = 1.60 Myr [1.36 Myr-1.95 Myr] at mu 1.3e-08 (share of SG2's pre-split copies whose SG1 ortholog is still intact: 41%); intact copies per Mb in SG1: 58.5.
+Lineages alike: half-lives in SG2 and SG1 do not differ detectably (ratio 1.00 [0.74-1.31]).
+Half-life notes: copies the assembly or annotation missed count as lost, so these are lower bounds on persistence; in simulations 94% of estimates that pass the checks fall within 25% of the truth (splits of 1-5 Myr; very young splits read ~25% short).

@@ -1,0 +1,8 @@
+index	type	time	recipient	donor	chrom	start	end	n_moved
+1	nonreciprocal	18073.7	A	D	chr006	127594	164791	6
+3	reciprocal	11516.7	C	D	chr005	147278	177851	4
+3	reciprocal	11516.7	D	C	chr001	147278	177851	4
+4	reciprocal	9406.37	C	A	chr005	107913	133657	4
+4	reciprocal	9406.37	A	C	chr006	107913	133657	4
+0	nonreciprocal	3936.66	A	D	chr006	128818	173604	4
+2	nonreciprocal	2204.01	C	D	chr004	58519	77924	0

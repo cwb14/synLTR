@@ -1,0 +1,5 @@
+sequence	subgenome	other_subgenome	status	homoeolog	reciprocal	best_candidate	anchors	anchors_oe	chain	chain_z	chain_p	orientation	span	candidate_span
+chr001	SG1	SG2	homoeolog	chr004	yes	chr004	31	1.68	28	19.2	0.0123	+	0.963	0.963
+chr002	SG2	SG1	homoeolog	chr003	yes	chr003	35	1.56	26	14.2	0.0123	+	0.955	0.955
+chr003	SG1	SG2	homoeolog	chr002	yes	chr002	35	1.56	26	14.2	0.0123	+	0.955	0.955
+chr004	SG2	SG1	homoeolog	chr001	yes	chr001	31	1.68	28	19.2	0.0123	+	0.963	0.963

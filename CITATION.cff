@@ -1,0 +1,21 @@
+cff-version: 1.2.0
+message: "If you use LTRtrace, please cite it as below."
+type: software
+title: LTRtrace
+abstract: >-
+  LTRtrace genotypes LTR retrotransposon insertions across genome assemblies and from long reads, tests for gene flow
+  between genomes with them, and finds the subgenomes of a polyploid from its LTR retrotransposons, with their
+  homoeologs and the ages of their split and merger.
+authors:
+  - given-names: Chris
+    family-names: Benson
+version: 0.1.0
+license: GPL-3.0-or-later
+keywords:
+  - transposable elements
+  - LTR retrotransposons
+  - presence/absence variation
+  - introgression
+  - polyploidy
+  - subgenomes
+  - long reads

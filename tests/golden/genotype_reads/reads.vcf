@@ -1,0 +1,26 @@
+##fileformat=VCFv4.3
+##contig=<ID=chr1,length=193630>
+##contig=<ID=chr2,length=74410>
+##contig=<ID=chr3,length=44805>
+##ALT=<ID=DEL:ME:LTR,Description="Empty site: the element and one TSD copy absent (pre-insertion allele)">
+##ALT=<ID=DEL:ME:SOLO,Description="Solo LTR: internal region and one LTR absent">
+##INFO=<ID=SVTYPE,Number=1,Type=String,Description="Structural variant type">
+##INFO=<ID=END,Number=1,Type=Integer,Description="Last base of the reference sequence the empty site lacks: the element and one TSD copy (POS plus their length)">
+##INFO=<ID=SVLEN,Number=A,Type=Integer,Description="Length change of each ALT allele">
+##INFO=<ID=ELEMENT,Number=1,Type=String,Description="Element ID from the annotation">
+##INFO=<ID=FAMILY,Number=1,Type=String,Description="Family">
+##INFO=<ID=CLADE,Number=1,Type=String,Description="Clade">
+##FORMAT=<ID=GT,Number=1,Type=String,Description="Genotype: 0 full, 1 empty site, 2 solo LTR, . null (haplotype without the site)">
+##FORMAT=<ID=GQ,Number=1,Type=Integer,Description="Genotype quality (phred)">
+##FORMAT=<ID=AD,Number=R,Type=Integer,Description="Informative reads per allele (full, empty, solo)">
+##FORMAT=<ID=FT,Number=1,Type=String,Description="Per-sample flags">
+#CHROM	POS	ID	REF	ALT	QUAL	FILTER	INFO	FORMAT	full
+chr1	20005	E1_het_empty	A	<DEL:ME:LTR>,<DEL:ME:SOLO>	.	.	SVTYPE=DEL;END=24810;SVLEN=-4805,-4400;ELEMENT=E1_het_empty;FAMILY=famA;CLADE=test	GT:GQ:AD:FT	0/1:99:24,14,0:PASS
+chr1	49810	E2_het_solo	G	<DEL:ME:LTR>,<DEL:ME:SOLO>	.	.	SVTYPE=DEL;END=54615;SVLEN=-4805,-4400;ELEMENT=E2_het_solo;FAMILY=famA;CLADE=test	GT:GQ:AD:FT	0/2:99:19,0,16:PASS
+chr1	79615	E3_hom	T	<DEL:ME:LTR>,<DEL:ME:SOLO>	.	.	SVTYPE=DEL;END=86820;SVLEN=-7205,-6600;ELEMENT=E3_hom;FAMILY=famB;CLADE=test	GT:GQ:AD:FT	0/0:8:40,0,0:PASS
+chr1	111820	E4_hemi	T	<DEL:ME:LTR>,<DEL:ME:SOLO>	.	.	SVTYPE=DEL;END=116625;SVLEN=-4805,-4400;ELEMENT=E4_hemi;FAMILY=famA;CLADE=test	GT:GQ:AD:FT	0/.:6:25,0,0:flank_depth_low
+chr1	146625	E5_nested_outer	C	<DEL:ME:LTR>,<DEL:ME:SOLO>	.	.	SVTYPE=DEL;END=158635;SVLEN=-12010,-11405;ELEMENT=E5_nested_outer;FAMILY=famB;CLADE=test	GT:GQ:AD:FT	0/0:6:44,0,0:full_other_length
+chr1	150230	E5_nested_outer_inner	A	<DEL:ME:LTR>,<DEL:ME:SOLO>	.	.	SVTYPE=DEL;END=155035;SVLEN=-4805,-4400;ELEMENT=E5_nested_outer_inner;FAMILY=famA;CLADE=test	GT:GQ:AD:FT	0/1:99:15,14,0:PASS
+chr2	15005	E7_hom	T	<DEL:ME:LTR>,<DEL:ME:SOLO>	.	.	SVTYPE=DEL;END=22210;SVLEN=-7205,-6600;ELEMENT=E7_hom;FAMILY=famB;CLADE=test	GT:GQ:AD:FT	0/0:16:49,0,0:PASS
+chr2	47210	E8_decoy_hom	A	<DEL:ME:LTR>,<DEL:ME:SOLO>	.	.	SVTYPE=DEL;END=54415;SVLEN=-7205,-6600;ELEMENT=E8_decoy_hom;FAMILY=famB;CLADE=test	GT:GQ:AD:FT	0/0:27:60,0,0:PASS
+chr3	18005	E9_internal_del	T	<DEL:ME:LTR>,<DEL:ME:SOLO>	.	.	SVTYPE=DEL;END=22810;SVLEN=-4805,-4400;ELEMENT=E9_internal_del;FAMILY=famA;CLADE=test	GT:GQ:AD:FT	0/0:26:54,0,0:full_other_length

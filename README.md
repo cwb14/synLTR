@@ -52,19 +52,6 @@ from `sim pop` (`assemblies/`: A1, B1, C1 annotated, outgroup O1 not, 20% of A's
 R, S, D and an outgroup O (`libraries/`: R carries D's haplotype in three tracts), a diploid's long reads (`reads/`)
 and an allotetraploid's library from `sim nucleus` (`polyploid/`). They only check that everything runs.
 
-## Example figures
-
-`ltrtrace geneflow` on maize chromosome 10 (recipient B73, sister *parviglumis* TIL01, donor *mexicana* TIL18,
-outgroup *Zea diploperennis*): donor-like tracts painted along the chromosome, one tract and one insertion with its
-TSDs, how absences arose, and the D statistics. The PDF beside it adds the figure legends.
-
-![geneflow on maize chromosome 10](docs/img/geneflow_maize_chr10.png)
-
-`ltrtrace subgenomes` on quinoa (*Chenopodium quinoa*, allotetraploid): chromosomes painted by subgenome, the tests
-behind the subgenome count, LTR-RT birth histories per subgenome, and the split and merger dates.
-
-![subgenomes on quinoa](docs/img/subgenomes_quinoa.png)
-
 ## Run
 
 These are the quick start's lines, each run in its toy's folder:

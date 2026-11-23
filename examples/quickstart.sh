@@ -14,7 +14,7 @@ T=4
 export OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1   # numpy's math libraries stay single-threaded
 
 for exe in python synltr lastz minimap2 samtools; do
-  command -v "$exe" > /dev/null || { echo "error: $exe not on PATH; activate the environment (mamba activate synltr) and install this checkout (pip install --no-deps -e .)" >&2; exit 1; }
+  command -v "$exe" > /dev/null || { echo "error: $exe not on PATH; activate the environment (mamba activate synltr_pkg) and install this checkout (pip install --no-deps -e .)" >&2; exit 1; }
 done
 python -c "import msprime" 2> /dev/null || { echo "error: msprime not installed (synltr sim pop needs it); it is in environment.yml" >&2; exit 1; }
 if [ -e "$W" ]; then

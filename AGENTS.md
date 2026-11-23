@@ -16,7 +16,7 @@ A guide for developers of this repository, human or AI. Users start at [README.m
 ## Set up and check
 
 ```bash
-mamba env create -f environment.yml && mamba activate synltr
+mamba env create -f environment.yml && mamba activate synltr_pkg
 pip install --no-deps -e .
 ruff check src tests            # lint (line length 120)
 pytest -m "not slow"            # fast tests

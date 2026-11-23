@@ -2,7 +2,7 @@
 
 The hand-built synLTR pipeline ("Discovery and characterization of syntenic LTR-RTs for phylogenetic analyses"), kept intact and runnable in place as a source of approaches for future work. It is not the user-facing tool (that is the `synltr` package in `src/synltr`) and it is not covered by the package's tests. All paths below are relative to `legacy/`.
 
-Every file is as it was at the repository root before version 0.2.0, moved here without a change, so `git log --follow --first-parent legacy/<file>` and `git blame` show its history (the move is part of a merge commit, which plain `--follow` does not look into). Usage lines inside the scripts still say `synLTR/module2/...`: read them as `legacy/module2/...`. The wrappers find their helper scripts from their own location or from `--script_dir`, so they run from here. This file is the only one in `legacy/` to keep current: when an approach is ported into the package, set its status to `ported`.
+Every file was moved here from the repository root in version 0.2.0 with its code unchanged, so `git log --follow --first-parent legacy/<file>` and `git blame` show its history (the move is part of a merge commit, which plain `--follow` does not look into). Usage lines inside the scripts still say `synLTR/module2/...`: read them as `legacy/module2/...`. The wrappers find their helper scripts from their own location or from `--script_dir`, so they run from here. This file is the only one in `legacy/` to keep current: when an approach is ported into the package, set its status to `ported`.
 
 ## Map
 

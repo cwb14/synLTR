@@ -6,7 +6,8 @@ LTRtrace becomes synLTR: the package moved into the synLTR repository (github.co
 No method or number changed.
 
 - The command `ltrtrace` is now `synltr`, the Python package `ltrtrace` is `synltr`, and the conda environment in
-  environment.yml is named `synltr`. Options, the samples sheet and every output file and column are unchanged.
+  environment.yml is named `synltr_pkg` (not `synltr`, which differs only by case from the env `synLTR` of the
+  earlier pipeline). Options, the samples sheet and every output file and column are unchanged.
 - Outputs that name the program now name `synltr` and its version: the GFF3 source column (`synltr-0.2.0`), the
   VCF's `##source` line, the first line of `findings.txt` and `manifest.json`'s `tool`.
 - A rerun in a folder written by LTRtrace 0.1.0 recomputes every stage (stage keys hold the version and the code).
@@ -14,7 +15,7 @@ No method or number changed.
 - The quick start writes `./synltr_quickstart` (was `./ltrtrace_quickstart`).
 - The hand-built synLTR pipeline that this repository held before (gene-synteny anchors, LTR-RT discovery with
   nesting, solo LTRs, the numbered `ltrharvest_phasing` scripts, and the tarballs of LTRpav, LTRmix and ltrkin) is
-  kept unchanged under `legacy/`; [legacy/README.md](legacy/README.md) indexes it. The package does not use it.
+  kept under `legacy/`; [legacy/README.md](legacy/README.md) indexes it. The package does not use it.
 
 ## 0.1.0 (2026-11-19)
 

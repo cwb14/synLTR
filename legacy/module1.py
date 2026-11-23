@@ -25,7 +25,7 @@ Features:
 - Parallel per-pair anchors processing, capped by --threads.
 - Verbose mode to stream underlying tool output; quiet mode prints high-level progress.
 
-Author: Chris Benson & ChatGPT
+Author: Chris Benson
 """
 
 import argparse

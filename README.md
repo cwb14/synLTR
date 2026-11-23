@@ -8,7 +8,7 @@ identical when it inserted, so their divergence dates it. synLTR merges four too
 
 synLTR 0.2.0 is the package released before as LTRtrace 0.1.0: the command `ltrtrace` is now `synltr`, nothing else
 changed. The hand-built synLTR pipeline this repository held before (gene-synteny anchors, LTR-RT discovery with
-nesting, solo LTRs) is kept, unchanged and not maintained, in [legacy/](legacy/README.md).
+nesting, solo LTRs) is kept, not maintained, in [legacy/](legacy/README.md).
 
 | Command | What it answers | Input |
 |---|---|---|
@@ -33,8 +33,8 @@ How well it works, in brief (measured with the original tools; [details](#how-we
 From the repository root, on Linux or macOS, not Windows; tested on Linux.
 
 ```bash
-mamba env create -f environment.yml    # env "synltr": Python 3.12, LASTZ, minimap2, samtools, msprime
-mamba activate synltr
+mamba env create -f environment.yml    # env "synltr_pkg": Python 3.12, LASTZ, minimap2, samtools, msprime
+mamba activate synltr_pkg
 pip install --no-deps -e .             # this checkout
 synltr --version
 ```

@@ -1,5 +1,5 @@
 # synLTR's environment: mamba env create -f environment.yml, then, in this checkout, pip install --no-deps -e .
-name: synltr
+name: synltr_pkg
 channels: [conda-forge, bioconda, nodefaults]   # nodefaults: no Anaconda commercial channel
 dependencies:
   - python=3.12.16

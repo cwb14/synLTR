@@ -6,7 +6,7 @@ Catalog VCF (`write_vcf`, LTRpav): the locus catalog with haploid genotypes, on 
 An insertion is anchored VCF-style on the base before it: a locus present in the reference genome (P, S, T) has
 POS = start - 1; one empty there (E) has POS = the last base of the target-site copy, or, for an E site without a
 readable TSD copy (its site is then the flank junction), the junction's last base: the insertion point to within
-1 bp (the header's LTRpav_POS line says so). REF is the reference base at POS, ALT <INS:ME:LTR>, END = POS, SVLEN
+1 bp (the header's synltr_POS line says so). REF is the reference base at POS, ALT <INS:ME:LTR>, END = POS, SVLEN
 the locus length. GT: 1 present, 0 absent (E), missing for D, O, G, U. Loci the VCF cannot hold go to a side file
 (lid, ref_state, reason).
 
@@ -40,7 +40,7 @@ if TYPE_CHECKING:
     from synltr.routes.reads.genotype import SampleCalls
     from synltr.routes.reads.reads import Target
 
-# the header's description of POS (##LTRpav_POS): where each site is anchored, the E site's too
+# the header's description of POS (##synltr_POS): where each site is anchored, the E site's too
 POS_NOTE = ("POS is the base before the insertion: start - 1 where the reference genome holds the element (ST P, "
             "S or T); at its empty site (ST E), the last base of the target-site (TSD) copy, or, without a "
             "readable TSD copy, the flank junction, to within 1 bp (within the few extra bases, at most two TSD "
@@ -122,7 +122,7 @@ def _header(samples: list[Sample], fasta: Fasta) -> pysam.VariantHeader:
     h = pysam.VariantHeader()
     h.add_meta("fileformat", "VCFv4.2")
     h.add_meta("source", PROGRAM)
-    h.add_meta("LTRpav_POS", POS_NOTE)
+    h.add_meta("synltr_POS", POS_NOTE)
     for seqid, n in _contigs(fasta):
         h.contigs.add(seqid, length=n)
     h.add_meta("ALT", items=[("ID", "INS:ME:LTR"), ("Description", "LTR retrotransposon insertion")])

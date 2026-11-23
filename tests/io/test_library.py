@@ -306,7 +306,7 @@ def test_library_files(tmp_path):
     assert library_files(str(fa)) == ([fa], [])
     with pytest.raises(LibraryError, match="y.tsv"):
         library_files(f"{fa},{tmp_path / 'y.tsv'}")
-    with pytest.raises(LibraryError, match="no LTRquest libraries"):
+    with pytest.raises(LibraryError, match="no LTR_peel libraries"):
         library_files(str(tmp_path / "H_LTRs"))
     (tmp_path / "G_LTRs_depth9_clean_ltr.tsv").unlink()
     with pytest.raises(LibraryError, match="G_LTRs_depth9_clean_ltr.tsv"):

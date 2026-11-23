@@ -85,7 +85,7 @@ def _dispatch(spec: str, genome: str, fasta: Fasta | None, ltr_rule: str, class_
         return load_table(Path(spec), genome, class_rule=class_rule, tsd_rule=tsd_rule, table_rule=table_rule)
     raise AnnotationError(
         f"cannot detect annotation format of {spec!r}: expected .gff3/.gff/.bed (optionally .gz), "
-        "an LTRquest prefix with {prefix}_depth*_clean_ltr.tsv files, or a table file"
+        "an LTR_peel prefix with {prefix}_depth*_clean_ltr.tsv files, or a table file"
     )
 
 

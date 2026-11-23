@@ -115,7 +115,7 @@ GZ_LEVEL = 6  # zlib's default level: near level 9's size in a fraction of its t
 MANIFEST = "manifest.json"  # a finished run's record in its output folder: the run's command, inputs and tools
 
 # calls.vcf, calls.tracks, io.annotation.gff3, analyses.geneflow.run, analyses.subgenomes and sim.nucleus: how an output
-# names the program that made it (the names of columns and fields, such as ##LTRpav_POS, stay as users' scripts read them)
+# names the program that made it (the names of columns, such as v8_exchanges, stay as users' scripts read them)
 PROGRAM = f"synltr {__version__}"  # VCF ##source and findings headers: the package and the version that wrote them
 GFF3_SOURCE = f"synltr-{__version__}"  # GFF3 source column: the same without a space, which awk-style splitting breaks
 

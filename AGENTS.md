@@ -6,7 +6,7 @@ A guide for developers of this repository, human or AI. Users start at [README.m
 
 | Path | What it is | Rule |
 |---|---|---|
-| `src/synltr/` | The package, command `synltr` (was LTRtrace, command `ltrtrace`, until 0.2.0) | All new work goes here |
+| `src/synltr/` | The package, command `synltr` | All new work goes here |
 | `tests/` | pytest suite; its folders mirror `src/synltr/` | Every change comes with a test on a small synthetic fixture |
 | `tests/golden/` | Pinned outputs of four end-to-end toy runs | Change only on purpose (see Golden pins) |
 | `docs/` | `outputs.md` (every output file), `benchmarks.md` (accuracy, time, memory) | Keep in step with the code |
@@ -55,6 +55,11 @@ Other rules the tests enforce:
 - Stages are checkpointed (`base/checkpoint.py`): a stage's key hashes its inputs, parameters, the version and the
   code it runs, so a rerun reuses a stage only when none of these changed.
 - `-t` is the total CPU budget across all processes.
+- Names users do not know stay out of everything a user reads (`tests/test_names.py`): the README, the changelog,
+  `docs/`, `examples/`, help text, messages and output files never name the four programs the package was built
+  from (LTRpav, LTRmix, ltrkin, ltrharvest_phasing10), its earlier name (LTRtrace) or LTRquest (now LTR_peel).
+  Docstrings, comments and tests may: there a name says which program a rule came from (LTRpav: assemblies; LTRmix:
+  the screen; ltrkin: reads; ltrharvest_phasing10 or "phasing": subgenomes), and `legacy/` holds each of them.
 
 ## Coordinates
 
@@ -83,7 +88,8 @@ test pass.
 
 `legacy/` holds the hand-built synLTR pipeline as it was before the merge, laid out as it was so that its wrappers
 still run in place, plus the original LTRpav, LTRmix and ltrkin as tarballs. [legacy/README.md](legacy/README.md)
-indexes every file, says which approaches the package has and which exist only there.
+indexes every file, says which approaches the package has and which exist only there, and where each benchmark's
+record is; `legacy/changes_from_original_tools.md` lists what changed when the four programs became commands.
 
 - Do not edit, reformat, lint or delete anything under `legacy/`. It is the record of how each method was first
   worked out. The one file to keep current is `legacy/README.md`.

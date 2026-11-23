@@ -80,7 +80,7 @@ def _trio(text: str) -> tuple[str, str, str]:
 def _sheet_option(p: argparse.ArgumentParser, library: bool = False) -> None:
     p.add_argument("sheet", type=Path, metavar="SHEET",
                    help="samples sheet: TSV with the header line 'label fasta annotation' and optional 'group' and "
-                        + ("'role', or 'label library' (an LTRquest prefix, FASTA or FASTA,TABLE) for the screen"
+                        + ("'role', or 'label library' (an LTR_peel prefix, FASTA or FASTA,TABLE) for the screen"
                            if library else
                            "'role'; for read sets 'reads' (a BAM of long reads aligned to the row of role reference)")
                         + "; '.' or empty means none; relative paths resolve against the sheet's folder")
@@ -121,7 +121,7 @@ def _geneflow_options(p: argparse.ArgumentParser) -> None:
 
 def _subgenomes_options(p: argparse.ArgumentParser) -> None:
     p.add_argument("sheet", type=Path, metavar="SHEET",
-                   help="samples sheet with one row: label, library (the LTR-RT FASTA), annotation (LTRquest GFF3 or a "
+                   help="samples sheet with one row: label, library (the LTR-RT FASTA), annotation (LTR_peel GFF3 or a "
                         "K2P table) and optionally fasta (the genome FASTA with its .fai beside it, or the .fai); "
                         "relative paths resolve against the sheet's folder")
     p.add_argument("-n", type=int, metavar="N",

@@ -146,7 +146,7 @@ def check_screen(samples: list[Sample]) -> None:
     none = [s.label for s in samples if not s.library]
     if none:
         raise UsageError(f"the library screen reads LTR-RT libraries: {', '.join(none)} has no library in the "
-                         "samples sheet (column library: an LTRquest prefix, a FASTA, or FASTA,TABLE)")
+                         "samples sheet (column library: an LTR_peel prefix, a FASTA, or FASTA,TABLE)")
     if len(samples) < 2:
         raise UsageError("the library screen needs at least two genomes")
 

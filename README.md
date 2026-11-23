@@ -2,13 +2,10 @@
 
 synLTR reads the history of genomes from their LTR retrotransposon (LTR-RT) insertions. An insertion is a derived
 state (its absence is ancestral), its target-site duplication (TSD) marks one insertion event, and its two LTRs were
-identical when it inserted, so their divergence dates it. synLTR merges four tools: LTRpav 0.1.0 (`genotype`,
-`geneflow`), LTRmix (`geneflow --screen`), ltrkin 0.2.1 (`genotype` on reads, `source`) and ltrharvest_phasing10
-10.1.0 (`subgenomes`); [CHANGELOG.md](CHANGELOG.md) lists what changed for their users.
+identical when it inserted, so their divergence dates it.
 
-synLTR 0.2.0 is the package released before as LTRtrace 0.1.0: the command `ltrtrace` is now `synltr`, nothing else
-changed. The hand-built synLTR pipeline this repository held before (gene-synteny anchors, LTR-RT discovery with
-nesting, solo LTRs) is kept, not maintained, in [legacy/](legacy/README.md).
+The scripts this repository held before version 0.2.0 (gene-synteny anchors, LTR-RT discovery with nesting, solo
+LTRs) are kept, not maintained, in [legacy/](legacy/README.md).
 
 | Command | What it answers | Input |
 |---|---|---|
@@ -21,12 +18,13 @@ nesting, solo LTRs) is kept, not maintained, in [legacy/](legacy/README.md).
 | `synltr plot` | Redraws the figure of a finished `geneflow` or `subgenomes` run | a run folder |
 | `synltr sim pop`, `sim nucleus`, `sim score` | Genomes with known truth (populations with gene flow; polyploid origins), and calls scored against the truth | a scenario |
 
-How well it works, in brief (measured with the original tools; [details](#how-well-it-works)):
-- `genotype` on assemblies: 99.7% of high-tier P and E calls right in simulations (LTRpav).
-- `geneflow`: gene flow found in all three real cases; largest |Z| 3.14 in 60 simulations without it (LTRpav).
-- `geneflow --screen`: maize-*mexicana* gene flow found from three LTR-RT libraries alone, Z 4.4-8.4 (LTRmix).
-- `genotype` on reads: 93-94% (HiFi) and 91-92% (ONT) of genotypes right at 20x (ltrkin).
-- `subgenomes`: 90 of 122 natural allotetraploids phased correctly (ltrharvest_phasing10).
+How well it works, in brief (measured with each command's earlier standalone version;
+[details](#how-well-it-works)):
+- `genotype` on assemblies: 99.7% of high-tier P and E calls right in simulations.
+- `geneflow`: gene flow found in all three real cases; largest |Z| 3.14 in 60 simulations without it.
+- `geneflow --screen`: maize-*mexicana* gene flow found from three LTR-RT libraries alone, Z 4.4-8.4.
+- `genotype` on reads: 93-94% (HiFi) and 91-92% (ONT) of genotypes right at 20x.
+- `subgenomes`: 90 of 122 natural allotetraploids phased correctly.
 
 ## Install
 
@@ -91,27 +89,30 @@ end, and not `all`.
 | Input | Columns | Example row |
 |---|---|---|
 | assemblies | `label fasta annotation`, optional `group role` (role `outgroup`) | `B73  B73.fa.gz  B73.gff3  maize  .` |
-| LTR-RT libraries | `label library` (an LTRquest prefix, a FASTA, or `FASTA,TABLE` with `seq_id` and any of `k2p tsd strand ltr5_len ltr3_len`; plain or gzip; record names `chrom:start-end[#class]`, 1-based closed, and bedtools' 0-based `name::chrom:start-end` converted), optional `role`; a sheet without genome FASTAs runs the screen | `B73  run/B73v5_LTRs  .` |
+| LTR-RT libraries | `label library` (an LTR_peel prefix, a FASTA, or `FASTA,TABLE` with `seq_id` and any of `k2p tsd strand ltr5_len ltr3_len`; plain or gzip; record names `chrom:start-end[#class]`, 1-based closed, and bedtools' 0-based `name::chrom:start-end` converted), optional `role`; a sheet without genome FASTAs runs the screen | `B73  run/B73v5_LTRs  .` |
 | long reads | `label fasta annotation role reads`: one row of role `reference` with its FASTA and annotation, then one row per sample with its BAM | `ref  ref.fa  ltr.gff3  reference  .` |
-| a polyploid | one row: `label library annotation`, optional `fasta`: the LTR-RT FASTA (several comma-separated), LTRquest's GFF3 or a K2P table, the genome FASTA with its `.fai` beside it or the `.fai` | `quinoa  LTRs.fa.gz  LTRs.gff3  genome.fa.fai` |
+| a polyploid | one row: `label library annotation`, optional `fasta`: the LTR-RT FASTA (several comma-separated), LTR_peel's GFF3 or a K2P table, the genome FASTA with its `.fai` beside it or the `.fai` | `quinoa  LTRs.fa.gz  LTRs.gff3  genome.fa.fai` |
 
 - Genome FASTA: plain or bgzip, not plain gzip; its `.fai` is built beside it, or in `work/` if its folder is read-only.
-- Annotation: GFF3 (LTRquest, EDTA, LTR_retriever, LTRharvest, DANTE_LTR), BED (LTRs found by aligning each element's
-  ends) or an LTRquest prefix (`<prefix>_depth*_clean_ltr.tsv`). GFF3 and LTRquest tables are 1-based closed, BED
-  0-based half-open. A genome without annotation is genotyped only; the first row sets the VCF's coordinates.
+- Annotation: GFF3 ([LTR_peel](https://github.com/cwb14/LTR_peel), EDTA, LTR_retriever, LTRharvest, DANTE_LTR), BED
+  (LTRs found by aligning each element's ends) or an LTR_peel prefix (`<prefix>_depth*_clean_ltr.tsv`). GFF3 and
+  LTR_peel tables are 1-based closed, BED 0-based half-open. A genome without annotation is genotyped only; the first
+  row sets the VCF's coordinates.
 - Reads: coordinate-sorted, indexed BAMs that keep the supplementary alignments (`map-ont` for ONT reads), e.g.
   `minimap2 -ax map-hifi ref.fa reads.fq | samtools sort -o s1.bam - && samtools index s1.bam`. An indexed CRAM
   works too, written against the reference row's FASTA, which decodes it.
 
 ## How well it works
 
-The benchmarks were measured with the original tools. synLTR reproduces their outputs on the runs recorded before
-the merge (maize chromosome 10, maize LTR-RT libraries, *Cardamine amara* HiFi reads, five polyploids and a diploid
-control, simulations), apart from the changes in CHANGELOG.md, so the accuracy numbers should carry over; time and
-memory are the originals' unless marked as synLTR's. LTRpav's and more: [docs/benchmarks.md](docs/benchmarks.md).
+Each command began as a standalone program, and the benchmarks were measured with those programs. synLTR reproduces
+their outputs on the runs recorded from them (maize chromosome 10, maize LTR-RT libraries, *Cardamine amara* HiFi
+reads, five polyploids and a diploid control, simulations), apart from the changes listed in
+[legacy/changes_from_original_tools.md](legacy/changes_from_original_tools.md), so the accuracy numbers should carry
+over; time and memory are the earlier programs' unless marked as synLTR's. More numbers:
+[docs/benchmarks.md](docs/benchmarks.md). The record behind each benchmark:
+[legacy/README.md](legacy/README.md#benchmark-records).
 
-**LTR-RT libraries only (`geneflow --screen`).** LTRmix's benchmark (`benchmark/REPORT.md` in
-`legacy/module2/LTRmix.tar.gz`; LTRmix is unpublished). On maize B73, *mexicana* TIL18 and *parviglumis* TIL01 the four
+**LTR-RT libraries only (`geneflow --screen`).** On maize B73, *mexicana* TIL18 and *parviglumis* TIL01 the four
 statistics gave Z = 4.4-8.4 (an outgroup-based SNP test on the same assemblies: Z = 9.2), and chromosomes 5, 8 and 9
 ranked lowest in *mexicana*-like signal by every recipient-side statistic, the three Yang et al. 2023 report as
 depleted of *mexicana* ancestry (*Science*, https://doi.org/10.1126/science.adg8940). In sweet orange the haplotype
@@ -119,7 +120,7 @@ with 12.6% mandarin ancestry gave Z = 4.0-5.3, and every mandarin tract of at le
 et al. 2023 (*Horticulture Research*, https://doi.org/10.1093/hr/uhac247) was painted.
 
 Uneven annotation can fake the screen's statistics. False signals (|Z| > 3) in simulated genomes without gene flow
-(LTRpav's simulated genome sets, 2026-11-14 and 2026-11-17; records outside this repository):
+(simulated genome sets of 2026-11-14 and 2026-11-17; records outside this repository):
 
 | Annotation | D_ins | D_kmer | D3 | D_self | D_pav (`geneflow`) |
 |---|---|---|---|---|---|
@@ -137,9 +138,8 @@ Uneven annotation can fake the screen's statistics. False signals (|Z| > 3) in s
   the check fails). Confirm any screen result with `geneflow` on the genome assemblies, whose D_pav gave no false
   signal at either gap. The screen's overview draws the painting panels only; the others say they need assemblies.
 
-**Long reads (`genotype`, `source`).** ltrkin 0.2.1's README, `docs/benchmark_v0.2.md` and `benchmark/`
-(rerunnable), all in `legacy/module2/ltrkin.tar.gz`. Truth: haplotype-resolved assemblies of two outcrossing plants;
-ranges span the two reference haplotypes.
+**Long reads (`genotype`, `source`).** Truth: haplotype-resolved assemblies of two outcrossing plants; ranges span the
+two reference haplotypes.
 
 | | PacBio HiFi (*Cardamine amara*) | ONT (*Medicago sativa* subsp. *falcata*) |
 |---|---|---|
@@ -147,11 +147,11 @@ ranges span the two reference haplotypes.
 | same at 20x: Sniffles2 / kanpig | 54-55% / 46-47% | 50-51% / 34-35% |
 | new insertions (F/E) at 20x: recall / precision | 0.96-0.97 / 0.97-0.98 | 0.94-0.95 / 0.93-0.94 |
 
-**Subgenomes (`subgenomes`).** ltrharvest_phasing10 10.1.0's README and its script's closing notes (V10, V10.1, in
-`legacy/module2/ltrharvest_phasing10.py`; the harness and runs are not in this repository): 90 of 122 natural allotetraploids phased correctly; false structure in
+**Subgenomes (`subgenomes`).** 90 of 122 natural allotetraploids phased correctly; false structure in
 7 of 67 control libraries (diploids and others); the right number of subgenomes in 128 of 129 simulations and in 35 of
 40 polyploids with progenitor truth (33 perfect); split ages against gene Ks in 78 genomes, Spearman 0.599; mergers of
-correctly phased genomes 32 dated, 30 bounded, 26 not datable (both v10.0).
+correctly phased genomes 32 dated, 30 bounded, 26 not datable (both measured one version
+earlier).
 
 ## Outputs
 

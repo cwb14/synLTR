@@ -85,5 +85,5 @@ folder.
 | Command | Files | Coordinates |
 |---|---|---|
 | `sim pop` | `<label>.fa`, `<label>.gff3` (annotated taxa), `samples.tsv`, `params.json`; `truth/<X>__<Y>.tsv`, `truth/insertions.tsv`, `truth/tracts.<label>.bed`, `truth/fractions.tsv` | GFF3 and `<X>__<Y>.tsv` 1-based closed; `insertions.tsv` `pos` 0-based; BED 0-based half-open |
-| `sim nucleus` | `ltr.fa`, `k2p.tsv`, `annotation.gff3`, `genome.fai`; in `--truthdir`: `copies.tsv`, `exchanges.tsv`, `chromosomes.tsv`, `orthologs.tsv`, `paralogs.tsv`, `history.json` | record names and GFF3 1-based closed; `k2p.tsv` LTR offsets 1-based along the copy's genome span from its start, the genome-left LTR first on either strand (as LTRquest writes them) |
+| `sim nucleus` | `ltr.fa`, `k2p.tsv`, `annotation.gff3`, `genome.fai`; in `--truthdir`: `copies.tsv`, `exchanges.tsv`, `chromosomes.tsv`, `orthologs.tsv`, `paralogs.tsv`, `history.json` | record names and GFF3 1-based closed; `k2p.tsv` LTR offsets 1-based along the copy's genome span from its start, the genome-left LTR first on either strand (as LTR_peel writes them) |
 | `sim score` | `PREFIX.score.tsv` (precision and recall per state and tier), `PREFIX.confusion.tsv` | |

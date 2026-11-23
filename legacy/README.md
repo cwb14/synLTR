@@ -75,6 +75,7 @@ bash ../legacy/module2/ltrharvest_wrapper2.sh --genome ../legacy/test/Athal_tair
 
 | File | What it does | External tools | Status |
 |---|---|---|---|
+| `changes_from_original_tools.md` | What changed for LTRpav, LTRmix, ltrkin and ltrharvest_phasing10 when they became `synltr` commands: options, outputs, defaults, fixes | | notes |
 | `module1.py` | Genome FASTAs + proteome -> runs the module1 steps above -> consolidated syntenic block files per genome pair | the module1 scripts | current |
 | `module2.py` | Genome (+ proteome) -> runs the module2 steps above -> classified, purged LTR-RT table and FASTA | git, bedtools, awk; clones LTR_HARVEST_parallel, Kmer2LTR, TEsorter | current |
 
@@ -208,6 +209,19 @@ Notable documents inside the tarballs:
 | `Athal_tair10_chr2.fa.gz` | *A. thaliana* TAIR10 chromosome 2 | | data |
 | `Athal.pep.gz` | *A. thaliana* proteome | | data |
 
+## Benchmark records
+
+The package's README and `docs/benchmarks.md` quote accuracy, time and memory measured with the four original programs, without naming them. Where each record is:
+
+| Command | Measured with | Record |
+|---|---|---|
+| `synltr genotype`, `synltr geneflow` (assemblies) | LTRpav, development versions shortly before 0.1.0 | `module2/LTRpav.tar.gz`: `README.md` ("How well it works", "Resources", "Limitations"), `docs/METHODS.md` |
+| `synltr geneflow --screen` | LTRmix (unpublished) | `module2/LTRmix.tar.gz`: `benchmark/REPORT.md` |
+| `synltr genotype` (reads), `synltr source` | ltrkin 0.2.1 | `module2/ltrkin.tar.gz`: `README.md` ("How good is it"), `docs/benchmark_v0.2.md`, `benchmark/` (rerunnable) |
+| `synltr subgenomes` | ltrharvest_phasing10 10.1.0 (two numbers 10.0) | `module2/ltrharvest_phasing10.py`, closing notes (V10, V10.1); its README ("Limitations"), harness and runs are not in this repository |
+
+Not in this repository: the simulated genome sets of 2026-11-14 and 2026-11-17 (LTRpav's; the screen's false-signal rates and the evenness check) and the speed comparison of the screen against LTRmix (2026-11-19).
+
 ## Approaches that exist only here
 
 - **Gene-synteny anchoring with JCVI.** `module1.py`, `module1/liftover.py`, `module1/jcvi_diploid.py`: one trusted proteome is lifted onto every genome with miniprot so all genomes share gene IDs, then JCVI finds pairwise syntenic anchors.
@@ -231,8 +245,8 @@ Notable documents inside the tarballs:
 - **LTR-RT plots and browser.** `module2/ltrharvest_plot_struct.py`, `ltrharvest_plot.py`, `TEGV.py`.
 - **Config-based subgenome phasing.** `module2/ltrharvest_phasing.py`, `ltrharvest_phasing2.py`, `ltrharvest_phasing3.py`: differential k-mers between homoeologous chromosome sets given in a config, counted with jellyfish, clustered with KMeans.
 - **Genome painting from the assembly.** `module2/ltrharvest_phasing4.py`, `ltrharvest_phasing5.py` (`--genome`): 50-kb windows painted with subgenome-confined k-mers, including unplaced scaffolds. Later versions take no genome sequence; the v10 closing notes record a dropped genome/RepeatMasker mode.
-- **Developer options of v10.** `module2/ltrharvest_phasing10.py`: hidden `--dev_*` options, `--label`, and non-default settings that the package CHANGELOG lists as removed.
-- **In the tarballs, removed from the package (package CHANGELOG):** LTRpav anchoring routes `mm2`, `fastga`, `flank-blast`, `hybrid` (`src/ltrpav/anchor/`), its direction test (`src/ltrpav/analysis/direction.py`) and single-stage commands; LTRmix's `--mu` age axis in `ltrmix_plot.py`.
+- **Developer options of v10.** `module2/ltrharvest_phasing10.py`: hidden `--dev_*` options, `--label`, and non-default settings that `changes_from_original_tools.md` lists as removed.
+- **In the tarballs, removed from the package (`changes_from_original_tools.md`):** LTRpav anchoring routes `mm2`, `fastga`, `flank-blast`, `hybrid` (`src/ltrpav/anchor/`), its direction test (`src/ltrpav/analysis/direction.py`) and single-stage commands; LTRmix's `--mu` age axis in `ltrmix_plot.py`.
 
 ## Running legacy code
 

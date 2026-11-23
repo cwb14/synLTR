@@ -45,7 +45,7 @@ def sample_inputs(sample) -> tuple[list[str], list[str], list[str] | None]:
     if not sample.library:
         raise UsageError(f"sample {sample.label}: subgenomes needs a library (the LTR-RT FASTA)")
     if not sample.annotation:
-        raise UsageError(f"sample {sample.label}: subgenomes needs an annotation (LTRquest GFF3 or a K2P table)")
+        raise UsageError(f"sample {sample.label}: subgenomes needs an annotation (LTR_peel GFF3 or a K2P table)")
     fai = None
     if sample.fasta is not None:
         fai = Path(sample.fasta) if str(sample.fasta).endswith(".fai") else Path(f"{sample.fasta}.fai")

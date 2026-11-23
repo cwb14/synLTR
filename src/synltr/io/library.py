@@ -416,7 +416,7 @@ def load_library(fastas, elements, *, rule: str = "phasing", min_match: float = 
     if unnamed and screen:
         if unnamed > UNPLACED_MAX * len(names):
             raise LibraryError(f"{unnamed} of {len(names)} FASTA records have no seqid:start-end in their name (a "
-                               "library needs LTRquest-style names, chrom:start-end)")
+                               "library needs LTR_peel-style names, chrom:start-end)")
         log.warning("%d of %d FASTA records have no seqid:start-end; kept unplaced (no element, no call)", unnamed,
                     len(names))
     total = len(names) + repeats
@@ -461,7 +461,7 @@ def library_files(spec: str) -> tuple[list[Path], list[Path]]:
         found = [(int(m[1]), p) for p in glob.glob(glob.escape(spec) + "_depth*_clean_ltr.fa")
                  if (m := _DEPTH_FA.search(p))]
         if not found:
-            raise LibraryError(f"no LTRquest libraries {spec}_depth*_clean_ltr.fa")
+            raise LibraryError(f"no LTR_peel libraries {spec}_depth*_clean_ltr.fa")
         fastas = [Path(p) for _, p in sorted(found)]
         tables = [p.with_suffix(".tsv") for p in fastas]
     missing = [str(p) for p in (*fastas, *tables) if not p.is_file()]

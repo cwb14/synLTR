@@ -33,7 +33,7 @@ def test_vcf_encoding(tmp_path, loci, fa):
     assert rec.info["K"] == pytest.approx(0.02) and rec.info["DISC"] == ("A",)
     assert Path(str(vcf) + ".tbi").is_file()
     assert list(v.header.contigs) == ["chr1", "chr2"] and v.header.contigs["chr2"].length == 500
-    [note] = [r.value for r in v.header.records if r.key == "LTRpav_POS"]  # the E site's POS
+    [note] = [r.value for r in v.header.records if r.key == "synltr_POS"]  # the E site's POS
     assert [r.value for r in v.header.records if r.key == "source"] == [f"synltr {__version__}"]
     assert "without a readable TSD copy, the flank junction, to within 1 bp" in note
 

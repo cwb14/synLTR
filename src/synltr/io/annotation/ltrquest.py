@@ -59,7 +59,7 @@ def load_ltrquest(prefix: str, genome: str, class_rule: str = "split", tsd_rule:
     pattern = f"{glob.escape(prefix)}_depth*_clean_ltr.tsv"
     files = sorted((f for f in glob.glob(pattern) if _DEPTH.search(f)), key=lambda f: int(_DEPTH.search(f).group(1)))
     if not files:
-        raise FileNotFoundError(f"no LTRquest files match {prefix}_depth*_clean_ltr.tsv")
+        raise FileNotFoundError(f"no LTR_peel files match {prefix}_depth*_clean_ltr.tsv")
     return _load(files, genome, class_rule, tsd_rule, table_rule)
 
 
@@ -158,7 +158,7 @@ def _read_ltrquest(path, genome: str, class_rule: str, tsd_rule: str, elements: 
         col = {name: i for i, name in enumerate(header)}
         missing = [c for c in REQUIRED if c not in col]
         if missing:
-            raise ValueError(f"{path}: LTRquest table header lacks required column(s) {', '.join(missing)}")
+            raise ValueError(f"{path}: LTR_peel table header lacks required column(s) {', '.join(missing)}")
         need = max(col[c] for c in REQUIRED) + 1
         width = len(header)
         ix = {name: col.get(name, -1) for name in _OPTIONAL}  # -1 reads the None appended to each row

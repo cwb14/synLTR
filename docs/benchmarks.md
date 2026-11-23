@@ -1,15 +1,14 @@
 # Benchmarks
 
-The README's "How well it works" gives each benchmark's headline numbers; this page gives the rest, with their
-sources. They were measured with the four original tools, whose outputs synLTR reproduces on the runs recorded
-before the merge (the README lists them), so the accuracy numbers should carry over. Time and memory are the
-originals' unless marked as synLTR's.
+The README's "How well it works" gives each benchmark's headline numbers; this page gives the rest. They
+were measured with the standalone program each command began as, whose outputs synLTR reproduces on the runs
+recorded from it (the README lists them), so the accuracy numbers should carry over. Time and memory are the earlier
+programs' unless marked as synLTR's. The record behind each benchmark:
+[legacy/README.md](../legacy/README.md#benchmark-records).
 
 ## Assemblies (`genotype`, `geneflow`)
 
-LTRpav 0.1.0's README ("How well it works", "Resources", "Limitations") and docs/METHODS.md
-(both in `legacy/module2/LTRpav.tar.gz`), measured with development versions shortly before 0.1.0 on 144 simulated genome sets and
-on real genomes:
+Measured on 144 simulated genome sets and on real genomes:
 
 - Gene flow found in all three real cases: *mexicana* into maize B73 (D_pav +0.290, Z 7.39), *Zea nicaraguensis*
   into *Z. mays* ssp. *huehuetenangensis* (Z 6.36), mandarin ancestry in sweet orange (Z 16.85). With other
@@ -32,22 +31,22 @@ on real genomes:
 
 ## LTR-RT libraries only (`geneflow --screen`)
 
-- More of LTRmix's benchmark (`benchmark/REPORT.md` in `legacy/module2/LTRmix.tar.gz`). At HPC1, whose highland allele
+- At HPC1, whose highland allele
   entered maize from *mexicana* (Barnes et al. 2022, *PNAS*, https://doi.org/10.1073/pnas.2100036119), the highland
   landrace Palomero Toluqueño was painted *mexicana*-like (with *mexicana* TIL25 as donor) and B73 was not. Inv4m was
   found within 0.03 and 0.3 Mb of its breakpoints. Across 7 trios of 6 genomes LTR-RT D tracked gene-space SNP D with
   an outgroup (k-mers r = 0.99, insertions r = 1.00).
-- The every-pair evenness check, on LTRpav's simulated genome sets (2026-11-14 and 2026-11-17; records outside this
+- The every-pair evenness check, on simulated genome sets (2026-11-14 and 2026-11-17; records outside this
   repository; nothing was fitted to them): it passed all 118 evenly annotated runs (lowest value 0.947) and held back
   all 13 runs at the 30-point gap and 10 of 13 at the 10-point gap.
-- Speed and memory, synLTR's screen against LTRmix side by side on one server (2026-11-19; records outside this
-  repository): the maize trio at 32 threads took 278-281 s and 12.43-12.48 GB at peak against 503-513 s and
-  53.08 GB; two simulated trios at 8 threads took 96-117 s and 3.79-3.87 GB against 115-136 s and 5.16-5.35 GB.
+- Speed and memory, synLTR's screen against its earlier standalone version side by side on one server (2026-11-19;
+  records outside this repository): the maize trio at 32 threads took 278-281 s and 12.43-12.48 GB at peak against
+  503-513 s and 53.08 GB; two simulated trios at 8 threads took 96-117 s and 3.79-3.87 GB against 115-136 s and
+  5.16-5.35 GB.
 
 ## Long reads (`genotype`, `source`)
 
-The rest of ltrkin 0.2.1's table (its README, "How good is it"; the full benchmark in its `docs/benchmark_v0.2.md`
-and `benchmark/`, rerunnable). Truth: haplotype-resolved assemblies of two outcrossing plants; ranges span the two
+The rest of the README's table. Truth: haplotype-resolved assemblies of two outcrossing plants; ranges span the two
 reference haplotypes.
 
 | | PacBio HiFi (*Cardamine amara*) | ONT (*Medicago sativa* subsp. *falcata*) |
@@ -65,7 +64,7 @@ reference haplotypes.
 
 ## Subgenomes (`subgenomes`)
 
-Limits, from ltrharvest_phasing10 10.1.0's README ("Limitations"):
+Limits:
 
 - When the merger is older than LTR-RT turnover no subgenome-specific lineages survive and the result is "no
   structure" (22 of the 122 benchmark genomes, all woody bamboos among them).

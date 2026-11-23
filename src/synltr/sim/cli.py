@@ -103,7 +103,7 @@ _NUCLEUS_EPILOG = "\n".join([
     ("truth/copies.tsv: root identifies the original insertion a copy descends from (copies inherited across a "
      "split or moved by an exchange share it); source is the root of the copy it was transposed from, or \".\" when "
      "the source was a master. LTR offsets in k2p.tsv are 1-based positions along the copy's genome span, counted "
-     "from its start (as LTRquest writes them), the genome-left LTR first, on either strand."),
+     "from its start (as LTR_peel writes them), the genome-left LTR first, on either strand."),
 ])
 
 
@@ -126,7 +126,7 @@ def add_options(parser: argparse.ArgumentParser, common: argparse.ArgumentParser
                    help="a backbone region, 1-based inclusive; repeat it for more chromosomes (disjoint, at most "
                         f"{SIM_MAX_CHROMS}, each at least 2 x {WINDOW_PAD} bp plus the longest donor)")
     p.add_argument("--annotation", required=True, metavar="ANNOT",
-                   help="the FASTA's LTR-RT annotation (GFF3, BED or LTRquest prefix): the backbone elements (those "
+                   help="the FASTA's LTR-RT annotation (GFF3, BED or LTR_peel prefix): the backbone elements (those "
                         f"wholly inside a region) and up to {SIM_MAX_DONORS} donors (top-level, childless, "
                         "high-confidence where the annotation rates confidence)")
     p.add_argument("-o", "--outdir", required=True, type=Path, metavar="DIR",
@@ -157,7 +157,7 @@ def add_options(parser: argparse.ArgumentParser, common: argparse.ArgumentParser
     p.set_defaults(func=_pop)
     n = sub.add_parser(
         "nucleus", parents=[common], allow_abbrev=False,
-        help="LTR-RTs through progenitor splits and polyploid mergers, as an LTRquest-style library with truth",
+        help="LTR-RTs through progenitor splits and polyploid mergers, as an LTR_peel-style library with truth",
         formatter_class=_Lines, epilog=_NUCLEUS_EPILOG,
         description="Forward-simulate LTR-retrotransposon families through a tree of progenitor lineages (leaves = "
                     "subgenomes) and the mergers that join their nuclei, with insertions sourced from masters or "

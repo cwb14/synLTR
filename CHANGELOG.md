@@ -27,7 +27,7 @@ every number it reported is reproduced, apart from the changes below.
 |---|---|---|
 | ltrharvest_phasing10 (`ltrharvest_phasing10.py` and its simulator `simallo.py`, in `legacy/module2/`) | 10.1.0 | `synltr subgenomes`; `synltr sim nucleus` |
 | LTRmix (unpublished; `legacy/module2/LTRmix.tar.gz`, sha256 `1dc3439985a2e4c55a5ac72bccb71421a75792bcf6dd3cfd29e7937fcd46a181`) | | `synltr geneflow --screen` |
-| LTRpav (github.com/cwb14/LTRpav) | 0.1.0 | `synltr genotype` and `synltr geneflow` on assemblies; `synltr sim pop`, `sim score` |
+| LTRpav (`legacy/module2/LTRpav.tar.gz`) | 0.1.0 | `synltr genotype` and `synltr geneflow` on assemblies; `synltr sim pop`, `sim score` |
 | ltrkin | 0.2.1 | `synltr genotype` on read sets; `synltr source` |
 
 **Every command**

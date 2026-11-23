@@ -8,7 +8,7 @@ originals' unless marked as synLTR's.
 ## Assemblies (`genotype`, `geneflow`)
 
 LTRpav 0.1.0's README ("How well it works", "Resources", "Limitations") and docs/METHODS.md
-(github.com/cwb14/LTRpav), measured with development versions shortly before 0.1.0 on 144 simulated genome sets and
+(both in `legacy/module2/LTRpav.tar.gz`), measured with development versions shortly before 0.1.0 on 144 simulated genome sets and
 on real genomes:
 
 - Gene flow found in all three real cases: *mexicana* into maize B73 (D_pav +0.290, Z 7.39), *Zea nicaraguensis*

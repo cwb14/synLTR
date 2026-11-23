@@ -147,24 +147,34 @@ def test_self_ltr_z():
     assert self_ltr_z(lib, [], np.zeros(4)).size == 0
 
 
+def _same_to_last_bits(got, want, ulps: int = 4) -> bool:
+    """`got` is NaN where `want` is and within `ulps` units in the last place of it elsewhere. K2P's d adds two
+    logarithms, and numpy's log is not the same code on every CPU (it has an AVX-512 version) nor the same as math's:
+    two correct logs can differ by one unit in the last place, which moves d by up to 3 (2 measured)."""
+    got, want = np.asarray(got, float), np.asarray(want, float)
+    ok = ~np.isnan(want)
+    return (np.array_equal(np.isnan(got), ~ok)
+            and bool(np.all(np.abs(got[ok] - want[ok]) <= ulps * np.spacing(np.abs(want[ok])))))
+
+
 def test_k2p_matches_ltrmix():
     """K2P and its standard error on LTRmix's inputs (whole counts; none, saturated and empty comparisons), one
-    comparison at a time as the library route calls it: LTRmix's scalar math form bit for bit, d and se. On arrays d
-    still agrees; se may differ in its last bit (numpy squares an array where Python's ** 2 calls pow; 1 in 3,000
-    here)."""
+    comparison at a time as the library route calls it: LTRmix's scalar math form, d to its last bits (bit for bit
+    where numpy's log is math's; `_same_to_last_bits`) and se bit for bit. On arrays d still agrees; se may differ
+    in its last bit (numpy squares an array where Python's ** 2 calls pow; 1 in 3,000 here)."""
     with np.load(Path(__file__).resolve().parent.parent / "golden" / "ltrmix_route.npz") as z:
         sites, ts, tv, want_d, want_se = (z[f"kp_{c}"] for c in ("sites", "ts", "tv", "d", "se"))
     one = [k2p(int(s), int(a), int(b)) for s, a, b in zip(sites, ts, tv)]
     d, se = (np.array([float(v[j]) for v in one]) for j in (0, 1))
-    assert np.array_equal(d, want_d, equal_nan=True) and np.array_equal(se, want_se, equal_nan=True)
+    assert _same_to_last_bits(d, want_d) and np.array_equal(se, want_se, equal_nan=True)
     assert np.array_equal(np.signbit(d), np.signbit(want_d)) and np.isnan(want_d).sum() > 100
     d, se = k2p(sites.astype(np.int64), ts.astype(np.int64), tv.astype(np.int64))
-    assert np.array_equal(d, want_d, equal_nan=True) and np.allclose(se, want_se, rtol=1e-15, atol=0, equal_nan=True)
+    assert _same_to_last_bits(d, want_d) and np.allclose(se, want_se, rtol=1e-15, atol=0, equal_nan=True)
 
 
 def test_k2p_shares_is_k2p_on_one_comparison():
-    """k2p_shares (one comparison's shares, math's log) gives k2p's sum-form values bit for bit, and (nan, nan) where
-    the comparison is saturated."""
+    """k2p_shares (one comparison's shares, math's log) gives k2p's sum-form values to their last bits (bit for bit
+    where numpy's log is math's), and (nan, nan) where the comparison is saturated."""
     rng = np.random.default_rng(4)
     n = rng.integers(1, 3000, 2000)
     ts, tv = np.floor(rng.random(2000) * 0.4 * n), np.floor(rng.random(2000) * 0.3 * n)
@@ -175,7 +185,7 @@ def test_k2p_shares_is_k2p_on_one_comparison():
             assert all(math.isnan(x) for x in got)
         else:
             assert got == (float(d[i]), float(se[i])) or abs(got[1] - se[i]) <= 2 * np.spacing(se[i]), i
-            assert got[0] == float(d[i]), i
+            assert _same_to_last_bits(got[0], d[i]), i
     assert all(math.isnan(x) for x in k2p_shares(0.5, 0.0))  # 1 - 2P - Q = 0
     assert all(math.isnan(x) for x in k2p_shares(0.0, 0.5))  # 1 - 2Q = 0
     assert k2p_shares(0.0, 0.0) == (0.0, 0.0)

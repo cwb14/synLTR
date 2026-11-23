@@ -1,0 +1,10 @@
+# mu=1.3e-08 substitutions/site/year (default); K2P = 2 mu years
+subgenome_a	subgenome_b	event	estimator	reported	status	k2p	k2p_low	k2p_high	years	years_low	years_high	n
+SG1	SG2	split	inherited	yes	dated	0.05186	0.04702	0.0572	1.994e+06	1.808e+06	2.2e+06	23
+SG1	SG2	split	consensus	no	dated	0.04272	0.03652	0.05644	1.643e+06	1.405e+06	2.171e+06	6406
+SG1	SG2	split	orthologs	no	dated	0.04886	0.04705	0.05045	1.879e+06	1.81e+06	1.94e+06	31
+SG1	SG2	split	confinement	no	dated	0.004991	0.0005051	0.1205	1.919e+05	1.943e+04	4.635e+06	910
+SG1	SG2	split	profile	no	dated	0.04272	0.03652	0.05644	1.643e+06	1.405e+06	2.171e+06	5465
+SG1	SG2	merger	ltr_clock	no	dated	0.002842	0.001434	0.004633	1.093e+05	5.514e+04	1.782e+05	767
+SG1	SG2	merger	genealogy_clock	yes	bound	NA	0	0.004567	NA	0	1.756e+05	767
+SG1	SG2	merger_if_random	landing	no	none	NA	NA	NA	NA	NA	NA	767

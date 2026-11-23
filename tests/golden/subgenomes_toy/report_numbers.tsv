@@ -1,0 +1,32 @@
+key	value	source
+groups	two	report_data.json:N
+phased	4	report_data.json:names (count)
+ltr_rts	928	report_data.json:lib.n
+A_set_chr001	1	report_data.json:ph.homoeologs.sets (numbered from 1, ordered by their first member in their lowest subgenome)
+A_set_chr003	2	report_data.json:ph.homoeologs.sets (numbered from 1, ordered by their first member in their lowest subgenome)
+A_set_chr004	1	report_data.json:ph.homoeologs.sets (numbered from 1, ordered by their first member in their lowest subgenome)
+A_set_chr002	2	report_data.json:ph.homoeologs.sets (numbered from 1, ordered by their first member in their lowest subgenome)
+A_SG1_sequences	2	report_data.json:z (sequences of SG1)
+A_SG1_Mb	8	report_data.json:L (sum over SG1, Mb)
+A_SG2_sequences	2	report_data.json:z (sequences of SG2)
+A_SG2_Mb	8	report_data.json:L (sum over SG2, Mb)
+C_axis1_variance	65%	report_data.json:ph.W (PCA of the log observed/expected rows), variance share of axis 1
+C_axis2_variance	27%	report_data.json:ph.W (PCA of the log observed/expected rows), variance share of axis 2
+C_half_libraries	100	report_data.json:ph.halves (count)
+C_kept_group	4	report_data.json:ph.support (>= SUPPORT_OK)
+C_kept_group_of	4	report_data.json:ph.support (finite)
+C_kept_group_level	90%	base.constants:SUPPORT_OK
+D_split1	SG1 vs SG2	report_data.json:ph.tree[0].part_a, part_b (sizes and groups), copies
+D_split1_replicability	1.00	report_data.json:ph.tree[0].replicability_all
+D_split1_result	kept	report_data.json:ph.tree[0].accepted, forced, rule
+E_SG1_copies	468	report_data.json:hist[0, all].n (copies with an LTR age)
+E_SG2_copies	460	report_data.json:hist[1, all].n (copies with an LTR age)
+F_min_copies	200	base.constants:MIN_HIST
+time_axis_rate	13	report_data.json:mu x 1e9 (substitutions per site per billion years)
+H_split_inherited	split 1.99 Myr (1.81–2.2)	report_data.json:dt.pairs[0].split.inherited.estimate, lo, hi / (2 mu), years
+H_split_consensus	split 1.64 Myr (1.4–2.17)	report_data.json:dt.pairs[0].split.consensus.estimate, lo, hi / (2 mu), years
+H_split_orthologs	split 1.88 Myr (1.81–1.94)	report_data.json:dt.pairs[0].split.orthologs.estimate, lo, hi / (2 mu), years
+H_split_confinement	split 192 kyr (19.4 kyr – 4.64 Myr)	report_data.json:dt.pairs[0].split.confinement.estimate, lo, hi / (2 mu), years
+H_split_profile	split 1.64 Myr (1.4–2.17)	report_data.json:dt.pairs[0].split.profile.estimate, lo, hi / (2 mu), years
+H_merger_ltr_clock	merger 109 kyr (55.1–178)	report_data.json:dt.pairs[0].merger_ltr.estimate, lo, hi / (2 mu), years
+H_merger_genealogy_clock	merger < 176 kyr	report_data.json:dt.pairs[0].merger.hi / (2 mu), years

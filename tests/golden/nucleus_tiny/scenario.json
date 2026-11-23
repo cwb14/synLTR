@@ -1,0 +1,64 @@
+{
+ "root_age": 2000000.0,
+ "tree": {
+  "split": 800000.0,
+  "children": [
+   {
+    "split": 300000.0,
+    "children": [
+     "A",
+     "D"
+    ]
+   },
+   "C"
+  ]
+ },
+ "mergers": [
+  {
+   "time": 100000.0,
+   "lineages": [
+    "A",
+    "D"
+   ]
+  },
+  {
+   "time": 20000.0,
+   "lineages": [
+    "A",
+    "C"
+   ]
+  }
+ ],
+ "chromosomes": {
+  "n": 2,
+  "length": 200000
+ },
+ "families": {
+  "n": 8,
+  "masters": [
+   1,
+   2
+  ],
+  "ltr_len_median": 120,
+  "int_len_median": 1000
+ },
+ "activity": {
+  "rate": 4e-05
+ },
+ "half_life": 1000000.0,
+ "birth_divergence": 2.0,
+ "gene_conversion": 1e-06,
+ "conversion_tract": 50,
+ "family_rate_sigma": 0.3,
+ "phi": 0.5,
+ "target_weight": {
+  "C": 2.0
+ },
+ "exchanges": {
+  "nonreciprocal": 3,
+  "reciprocal": 2,
+  "size_min": 10000.0,
+  "size_max": 60000.0
+ },
+ "singleton_share": 0.14
+}

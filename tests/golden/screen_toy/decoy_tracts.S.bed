@@ -1,0 +1,3 @@
+#chrom	start0	end	name	score	strand	sister	donor	n_loci	n_RD	n_RS	mean_post	sum_post	q	p_decoy	youngest_k	youngest_u95	n_identical	inv_frac	alphabet
+S_chr1	953828	1194676	D-ancestry	640	.	R	D	22	1	0	0.6403754015258184	14.088258833568005	.	.	0.02688	.	0	0.0	ancestry
+S_chr1	953828	1194676	D-recent	641	.	R	D	22	1	0	0.6413285749912233	14.109228649806914	.	.	0.02688	.	0	0.0	recent

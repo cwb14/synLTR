@@ -1,0 +1,43 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  pytest:
+    name: pytest (fast tests, then the golden pins) in the environment.yml environment
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash -el {0}
+    steps:
+      - uses: actions/checkout@v4
+
+      # environment.yml holds the Python packages and every program the tests call (lastz, minimap2, samtools,
+      # bcftools, poppler); the checkout itself is installed in the next step
+      - uses: mamba-org/setup-micromamba@v2
+        with:
+          environment-file: environment.yml
+
+      - name: Install synltr
+        run: pip install --no-deps -e .
+
+      - name: Lint
+        run: ruff check src tests
+
+      - name: Test
+        run: pytest -m "not slow"
+
+      # the four pinned end-to-end runs (marked slow, about 2 minutes): a change of any pinned number fails CI
+      - name: Golden outputs
+        run: pytest tests/test_golden.py

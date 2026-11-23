@@ -1,0 +1,188 @@
+layer	test	scope	stratum	statistic	value	se	z	n	loci	note
+library	jackknife	all	all	block_bp	88216	.	.	.	none	rule
+library	roles	R,S;D	all	source	data	.	.	.	.	sister pair R+S (the pair sharing the most single-copy k-mers the third genome lacks: 112019); recipient R by the sign of D_kmer(R,S;D) = +0.4306 on D's records
+library	sharing	R,S;D	single_copy_kmers	R+S	112019	.	.	.	.	single-copy k-mers R and S share and D lacks
+library	sharing	R,S;D	single_copy_kmers	D+R	57124	.	.	.	.	single-copy k-mers D and R share and S lacks
+library	sharing	R,S;D	single_copy_kmers	D+S	22736	.	.	.	.	single-copy k-mers D and S share and R lacks
+library	D_kmer	R,S;D	all	D	0.430604	0.0697839	6.17053	.	.	held: annotation-sensitive; D = (nA - nB) / (nA + nB): single-copy k-mers on D's records; false signals (|Z| > 3) in simulated nulls: even annotation 0/30, even annotation, bottleneck 0/30, one sister 10 points less complete 5/10, one sister 30 points less complete 9/10
+library	D_kmer	R,S;D	all	nA	57124	.	.	.	.	held: annotation-sensitive; single-copy k-mers D shares with R only
+library	D_kmer	R,S;D	all	nB	22736	.	.	.	.	held: annotation-sensitive; single-copy k-mers D shares with S only
+library	D_kmer	R,S;D	all	nblocks	102	.	.	.	.	held: annotation-sensitive; jackknife blocks of 88,216 bp on D's records
+library	donor_resolved	R,S;D	D elements inside synteny	resolved_R	0.998382	.	.	.	.	of D's records, the share resolved (present or absent) in R
+library	donor_resolved	R,S;D	D elements inside synteny	resolved_S	0.998382	.	.	.	.	of D's records, the share resolved (present or absent) in S
+library	donor_resolved	R,S;D	D elements inside synteny	resolved_both	0.998382	.	.	.	.	of D's records, the share resolved (present or absent) in both R and S
+library	donor_resolved	R,S;D	D elements inside synteny	n	618	.	.	.	.	D's records
+library	D_ins	R,S;D	all	D	0.42029	0.080068	5.24916	.	.	held: annotation-sensitive; D = (nA - nB) / (nA + nB) over insertions, each absence inferred (A) inside synteny; false signals (|Z| > 3) in simulated nulls: even annotation 0/30, even annotation, bottleneck 0/30, one sister 10 points less complete 9/10, one sister 30 points less complete 9/10
+library	D_ins	R,S;D	all	nA	98	.	.	.	.	held: annotation-sensitive; R+D insertions absent from S
+library	D_ins	R,S;D	all	nB	40	.	.	.	.	held: annotation-sensitive; S+D insertions absent from R
+library	D_ins	R,S;D	all	nblocks	73	.	.	.	.	held: annotation-sensitive; jackknife blocks of 88,216 bp on D's copies
+library	D_ins	R,S;D	absence_certain	D	.	.	.	.	.	held: annotation-sensitive; absences whose syntenic interval is shorter than 0.5 of the element
+library	D_ins	R,S;D	absence_certain	nA	0	.	.	.	.	held: annotation-sensitive; R+D insertions absent from S
+library	D_ins	R,S;D	absence_certain	nB	0	.	.	.	.	held: annotation-sensitive; S+D insertions absent from R
+library	D_ins	R,S;D	absence_certain	nblocks	0	.	.	.	.	held: annotation-sensitive; jackknife blocks of 88,216 bp on D's copies
+library	D_ins_by_age	R,S;D	K2P (0,0.002]	D	1	0	.	.	.	held: annotation-sensitive; insertions whose D copy has LTR K2P (0,0.002]
+library	D_ins_by_age	R,S;D	K2P (0,0.002]	nA	25	.	.	.	.	held: annotation-sensitive; R+D insertions absent from S
+library	D_ins_by_age	R,S;D	K2P (0,0.002]	nB	0	.	.	.	.	held: annotation-sensitive; S+D insertions absent from R
+library	D_ins_by_age	R,S;D	K2P (0,0.002]	nblocks	16	.	.	.	.	held: annotation-sensitive; jackknife blocks of 88,216 bp on D's copies
+library	D_ins_by_age	R,S;D	K2P (0.005,0.01]	D	0.245902	0.123414	1.9925	.	.	held: annotation-sensitive; insertions whose D copy has LTR K2P (0.005,0.01]
+library	D_ins_by_age	R,S;D	K2P (0.005,0.01]	nA	38	.	.	.	.	held: annotation-sensitive; R+D insertions absent from S
+library	D_ins_by_age	R,S;D	K2P (0.005,0.01]	nB	23	.	.	.	.	held: annotation-sensitive; S+D insertions absent from R
+library	D_ins_by_age	R,S;D	K2P (0.005,0.01]	nblocks	48	.	.	.	.	held: annotation-sensitive; jackknife blocks of 88,216 bp on D's copies
+library	D_ins_by_age	R,S;D	K2P (0.01,0.02]	D	0.288889	0.12576	2.29714	.	.	held: annotation-sensitive; insertions whose D copy has LTR K2P (0.01,0.02]
+library	D_ins_by_age	R,S;D	K2P (0.01,0.02]	nA	29	.	.	.	.	held: annotation-sensitive; R+D insertions absent from S
+library	D_ins_by_age	R,S;D	K2P (0.01,0.02]	nB	16	.	.	.	.	held: annotation-sensitive; S+D insertions absent from R
+library	D_ins_by_age	R,S;D	K2P (0.01,0.02]	nblocks	38	.	.	.	.	held: annotation-sensitive; jackknife blocks of 88,216 bp on D's copies
+library	D_ins_by_chrom	R,S;D	D_chr1	D	0.702128	0.0972986	7.21621	.	.	held: annotation-sensitive; insertions whose D copy lies on D_chr1
+library	D_ins_by_chrom	R,S;D	D_chr1	nA	40	.	.	.	.	held: annotation-sensitive; R+D insertions absent from S
+library	D_ins_by_chrom	R,S;D	D_chr1	nB	7	.	.	.	.	held: annotation-sensitive; S+D insertions absent from R
+library	D_ins_by_chrom	R,S;D	D_chr1	nblocks	24	.	.	.	.	held: annotation-sensitive; jackknife blocks of 88,216 bp on D's copies
+library	D_ins_by_chrom	R,S;D	D_chr2	D	0.04	0.10973	0.36453	.	.	held: annotation-sensitive; insertions whose D copy lies on D_chr2
+library	D_ins_by_chrom	R,S;D	D_chr2	nA	26	.	.	.	.	held: annotation-sensitive; R+D insertions absent from S
+library	D_ins_by_chrom	R,S;D	D_chr2	nB	24	.	.	.	.	held: annotation-sensitive; S+D insertions absent from R
+library	D_ins_by_chrom	R,S;D	D_chr2	nblocks	24	.	.	.	.	held: annotation-sensitive; jackknife blocks of 88,216 bp on D's copies
+library	D_ins_by_chrom	R,S;D	D_chr3	D	0.560976	0.131525	4.26517	.	.	held: annotation-sensitive; insertions whose D copy lies on D_chr3
+library	D_ins_by_chrom	R,S;D	D_chr3	nA	32	.	.	.	.	held: annotation-sensitive; R+D insertions absent from S
+library	D_ins_by_chrom	R,S;D	D_chr3	nB	9	.	.	.	.	held: annotation-sensitive; S+D insertions absent from R
+library	D_ins_by_chrom	R,S;D	D_chr3	nblocks	25	.	.	.	.	held: annotation-sensitive; jackknife blocks of 88,216 bp on D's copies
+library	completeness_ratio	R,S;D	R/S on D K2P>0.0283	ratio	1	0	.	.	.	of D's old insertions (LTR K2P above its 0.75 quantile) resolved in both sisters, the count present in R over that in S; a value only, it gates nothing: it reads R's annotation completeness relative to S's (or old polymorphisms carried by gene flow), and one-sided dropout biases D_kmer and D_ins toward the more complete sister; D3 and D_self held the null in simulation up to a 10-point completeness gap, not beyond (the every-pair evenness check gates them)
+library	completeness_ratio	R,S;D	R/S on D K2P>0.0283	n	155	.	.	.	.	D's old insertions resolved in both sisters
+library	R_share_D_by_chrom	R,S;D	R_chr1	kmer_share	0.393443	.	.	.	.	of R's single-copy k-mers shared with exactly one of S and D, the share with D
+library	R_share_D_by_chrom	R,S;D	R_chr1	kmers_D	23847	.	.	.	.	single-copy k-mers R shares with D only
+library	R_share_D_by_chrom	R,S;D	R_chr1	kmers_S	36764	.	.	.	.	single-copy k-mers R shares with S only
+library	R_share_D_by_chrom	R,S;D	R_chr1	ins_share	0.357143	.	.	.	.	of R's insertions shared with exactly one of S and D, the share with D
+library	R_share_D_by_chrom	R,S;D	R_chr1	ins_D	40	.	.	.	.	R+D insertions absent from S
+library	R_share_D_by_chrom	R,S;D	R_chr1	ins_S	72	.	.	.	.	R+S insertions absent from D
+library	R_share_D_by_chrom	R,S;D	R_chr2	kmer_share	0.29338	.	.	.	.	of R's single-copy k-mers shared with exactly one of S and D, the share with D
+library	R_share_D_by_chrom	R,S;D	R_chr2	kmers_D	15685	.	.	.	.	single-copy k-mers R shares with D only
+library	R_share_D_by_chrom	R,S;D	R_chr2	kmers_S	37778	.	.	.	.	single-copy k-mers R shares with S only
+library	R_share_D_by_chrom	R,S;D	R_chr2	ins_share	0.268041	.	.	.	.	of R's insertions shared with exactly one of S and D, the share with D
+library	R_share_D_by_chrom	R,S;D	R_chr2	ins_D	26	.	.	.	.	R+D insertions absent from S
+library	R_share_D_by_chrom	R,S;D	R_chr2	ins_S	71	.	.	.	.	R+S insertions absent from D
+library	R_share_D_by_chrom	R,S;D	R_chr3	kmer_share	0.319454	.	.	.	.	of R's single-copy k-mers shared with exactly one of S and D, the share with D
+library	R_share_D_by_chrom	R,S;D	R_chr3	kmers_D	17592	.	.	.	.	single-copy k-mers R shares with D only
+library	R_share_D_by_chrom	R,S;D	R_chr3	kmers_S	37477	.	.	.	.	single-copy k-mers R shares with S only
+library	R_share_D_by_chrom	R,S;D	R_chr3	ins_share	0.323232	.	.	.	.	of R's insertions shared with exactly one of S and D, the share with D
+library	R_share_D_by_chrom	R,S;D	R_chr3	ins_D	32	.	.	.	.	R+D insertions absent from S
+library	R_share_D_by_chrom	R,S;D	R_chr3	ins_S	67	.	.	.	.	R+S insertions absent from D
+library	D_kmer_by_chrom	R,S;D	D_chr1	D	0.660611	0.0812261	8.13299	.	.	held: annotation-sensitive; D_kmer on D's records on D_chr1
+library	D_kmer_by_chrom	R,S;D	D_chr1	nA	23902	.	.	.	.	held: annotation-sensitive; single-copy k-mers D shares with R only
+library	D_kmer_by_chrom	R,S;D	D_chr1	nB	4885	.	.	.	.	held: annotation-sensitive; single-copy k-mers D shares with S only
+library	D_kmer_by_chrom	R,S;D	D_chr1	nblocks	34	.	.	.	.	held: annotation-sensitive; jackknife blocks of 88,216 bp on D's records
+library	D_kmer_by_chrom	R,S;D	D_chr2	D	0.136316	0.127899	1.06581	.	.	held: annotation-sensitive; D_kmer on D's records on D_chr2
+library	D_kmer_by_chrom	R,S;D	D_chr2	nA	15559	.	.	.	.	held: annotation-sensitive; single-copy k-mers D shares with R only
+library	D_kmer_by_chrom	R,S;D	D_chr2	nB	11826	.	.	.	.	held: annotation-sensitive; single-copy k-mers D shares with S only
+library	D_kmer_by_chrom	R,S;D	D_chr2	nblocks	34	.	.	.	.	held: annotation-sensitive; jackknife blocks of 88,216 bp on D's records
+library	D_kmer_by_chrom	R,S;D	D_chr3	D	0.491304	0.11792	4.1664	.	.	held: annotation-sensitive; D_kmer on D's records on D_chr3
+library	D_kmer_by_chrom	R,S;D	D_chr3	nA	17663	.	.	.	.	held: annotation-sensitive; single-copy k-mers D shares with R only
+library	D_kmer_by_chrom	R,S;D	D_chr3	nB	6025	.	.	.	.	held: annotation-sensitive; single-copy k-mers D shares with S only
+library	D_kmer_by_chrom	R,S;D	D_chr3	nblocks	34	.	.	.	.	held: annotation-sensitive; jackknife blocks of 88,216 bp on D's records
+library	identity_spectrum	R,S;D	d in [0,1e-09)	n_target	45	.	.	.	.	R-D orthologs whose D copy is resolved in S
+library	identity_spectrum	R,S;D	d in [0,1e-09)	n_mirror	0	.	.	.	.	S-D orthologs whose D copy is resolved in R
+library	identity_spectrum	R,S;D	d in [0,1e-09)	ratio_calibrated	.	.	.	.	.	n_target x calibration / n_mirror
+library	identity_spectrum	R,S;D	d in [1e-09,0.00025)	n_target	0	.	.	.	.	R-D orthologs whose D copy is resolved in S
+library	identity_spectrum	R,S;D	d in [1e-09,0.00025)	n_mirror	0	.	.	.	.	S-D orthologs whose D copy is resolved in R
+library	identity_spectrum	R,S;D	d in [1e-09,0.00025)	ratio_calibrated	.	.	.	.	.	n_target x calibration / n_mirror
+library	identity_spectrum	R,S;D	d in [0.00025,0.0005)	n_target	53	.	.	.	.	R-D orthologs whose D copy is resolved in S
+library	identity_spectrum	R,S;D	d in [0.00025,0.0005)	n_mirror	0	.	.	.	.	S-D orthologs whose D copy is resolved in R
+library	identity_spectrum	R,S;D	d in [0.00025,0.0005)	ratio_calibrated	.	.	.	.	.	n_target x calibration / n_mirror
+library	identity_spectrum	R,S;D	d in [0.0005,0.001)	n_target	21	.	.	.	.	R-D orthologs whose D copy is resolved in S
+library	identity_spectrum	R,S;D	d in [0.0005,0.001)	n_mirror	0	.	.	.	.	S-D orthologs whose D copy is resolved in R
+library	identity_spectrum	R,S;D	d in [0.0005,0.001)	ratio_calibrated	.	.	.	.	.	n_target x calibration / n_mirror
+library	identity_spectrum	R,S;D	d in [0.001,0.002)	n_target	5	.	.	.	.	R-D orthologs whose D copy is resolved in S
+library	identity_spectrum	R,S;D	d in [0.001,0.002)	n_mirror	1	.	.	.	.	S-D orthologs whose D copy is resolved in R
+library	identity_spectrum	R,S;D	d in [0.001,0.002)	ratio_calibrated	6.15385	.	.	.	.	n_target x calibration / n_mirror
+library	identity_spectrum	R,S;D	d in [0.002,0.004)	n_target	2	.	.	.	.	R-D orthologs whose D copy is resolved in S
+library	identity_spectrum	R,S;D	d in [0.002,0.004)	n_mirror	1	.	.	.	.	S-D orthologs whose D copy is resolved in R
+library	identity_spectrum	R,S;D	d in [0.002,0.004)	ratio_calibrated	2.46154	.	.	.	.	n_target x calibration / n_mirror
+library	identity_spectrum	R,S;D	d in [0.004,0.008)	n_target	139	.	.	.	.	R-D orthologs whose D copy is resolved in S
+library	identity_spectrum	R,S;D	d in [0.004,0.008)	n_mirror	166	.	.	.	.	S-D orthologs whose D copy is resolved in R
+library	identity_spectrum	R,S;D	d in [0.004,0.008)	ratio_calibrated	1.03058	.	.	.	.	n_target x calibration / n_mirror
+library	identity_spectrum	R,S;D	d in [0.008,0.016)	n_target	180	.	.	.	.	R-D orthologs whose D copy is resolved in S
+library	identity_spectrum	R,S;D	d in [0.008,0.016)	n_mirror	219	.	.	.	.	S-D orthologs whose D copy is resolved in R
+library	identity_spectrum	R,S;D	d in [0.008,0.016)	ratio_calibrated	1.01159	.	.	.	.	n_target x calibration / n_mirror
+library	identity_spectrum	R,S;D	d in [0.016,0.032)	n_target	0	.	.	.	.	R-D orthologs whose D copy is resolved in S
+library	identity_spectrum	R,S;D	d in [0.016,0.032)	n_mirror	0	.	.	.	.	S-D orthologs whose D copy is resolved in R
+library	identity_spectrum	R,S;D	d in [0.016,0.032)	ratio_calibrated	.	.	.	.	.	n_target x calibration / n_mirror
+library	identity_spectrum	R,S;D	d in [0.032,0.064)	n_target	0	.	.	.	.	R-D orthologs whose D copy is resolved in S
+library	identity_spectrum	R,S;D	d in [0.032,0.064)	n_mirror	0	.	.	.	.	S-D orthologs whose D copy is resolved in R
+library	identity_spectrum	R,S;D	d in [0.032,0.064)	ratio_calibrated	.	.	.	.	.	n_target x calibration / n_mirror
+library	identity_spectrum	R,S;D	d in [0.064,1)	n_target	0	.	.	.	.	R-D orthologs whose D copy is resolved in S
+library	identity_spectrum	R,S;D	d in [0.064,1)	n_mirror	0	.	.	.	.	S-D orthologs whose D copy is resolved in R
+library	identity_spectrum	R,S;D	d in [0.064,1)	ratio_calibrated	.	.	.	.	.	n_target x calibration / n_mirror
+library	f_lower_bound	R,S;D	identity_spectrum	f	0.293399	.	.	.	.	lower bound on R's admixed fraction: the excess of R-D over calibrated S-D orthologs per bin, summed, over R's D-orthologs
+library	f_lower_bound	R,S;D	identity_spectrum	n_target	445	.	.	.	.	R-D orthologs
+library	f_lower_bound	R,S;D	identity_spectrum	n_mirror	387	.	.	.	.	S-D orthologs
+library	f_lower_bound	R,S;D	identity_spectrum	calibration	1.23077	.	.	.	.	mirror over target orthologs above the pooled median divergence
+library	f_lower_bound	R,S;D	identity_spectrum	median_d	0.00755556	.	.	.	.	the pooled median divergence
+library	f_lower_bound	R,S;D	identity_spectrum	n_target_recent	124	.	.	.	.	R-D orthologs below 0.002 divergence
+library	f_lower_bound	R,S;D	identity_spectrum	n_mirror_recent	0.8125	.	.	.	.	S-D orthologs below 0.002, calibrated
+library	D3_triples	R,S;D	all	D	0.12555	0.0283243	4.43257	.	.	D = (nA - nB) / (nA + nB) over the triples' mismatches, positive when R is closer to D; false signals (|Z| > 3) in simulated nulls: even annotation 0/30, even annotation, bottleneck 0/30, one sister 10 points less complete 0/10, one sister 30 points less complete 4/10
+library	D3_triples	R,S;D	all	nA	6271	.	.	.	.	S-D mismatches
+library	D3_triples	R,S;D	all	nB	4872	.	.	.	.	R-D mismatches
+library	D3_triples	R,S;D	all	nblocks	101	.	.	.	.	jackknife blocks of 88,216 bp on R's copies
+library	D3_triples	R,S;D	all	triples	347	.	.	.	.	ortholog triples (R, S and D copies called orthologous in each pair)
+library	D_self_outgroup	R,S;D	LTR sites	D	0.943925	0.033837	27.8963	.	.	D = (ABBA - BABA) / (ABBA + BABA) at D's LTR sites polarized by its other LTR; false signals (|Z| > 3) in simulated nulls: even annotation 0/30, even annotation, bottleneck 1/30, one sister 10 points less complete 0/10, one sister 30 points less complete 10/10
+library	D_self_outgroup	R,S;D	LTR sites	nA	104	.	.	.	.	ABBA: R shares D's derived allele
+library	D_self_outgroup	R,S;D	LTR sites	nB	3	.	.	.	.	BABA: S shares D's derived allele
+library	D_self_outgroup	R,S;D	LTR sites	nblocks	101	.	.	.	.	jackknife blocks of 88,216 bp on R's copies
+library	D_self_outgroup	R,S;D	LTR sites	BBAA	162	.	.	.	.	sites where R and S share an allele D lacks
+library	evenness	R,S	old insertions	r	0.984615	.	.	404	.	share of R's old insertions present in S among those resolved there, over the same share of S's in R: S's annotation completeness relative to R's
+library	evenness	R,S	old insertions	log_r	-0.0155042	0.0081971	.	.	.	se: delete-one jackknife over 1,000,000-bp blocks on each genome, the two variances added (printed only)
+library	evenness	R,S	old insertions	share_R_in_S	0.984615	.	.	195	.	R's old insertions (LTR K2P above its 0.75 quantile) present in S among those resolved there
+library	evenness	R,S	old insertions	share_S_in_R	1	.	.	209	.	S's old insertions present in R among those resolved there
+library	evenness	R,D	old insertions	r	1	.	.	350	.	share of R's old insertions present in D among those resolved there, over the same share of D's in R: D's annotation completeness relative to R's
+library	evenness	R,D	old insertions	log_r	0	0	.	.	.	se: delete-one jackknife over 1,000,000-bp blocks on each genome, the two variances added (printed only)
+library	evenness	R,D	old insertions	share_R_in_D	1	.	.	195	.	R's old insertions (LTR K2P above its 0.75 quantile) present in D among those resolved there
+library	evenness	R,D	old insertions	share_D_in_R	1	.	.	155	.	D's old insertions present in R among those resolved there
+library	evenness	S,D	old insertions	r	1	.	.	364	.	share of S's old insertions present in D among those resolved there, over the same share of D's in S: D's annotation completeness relative to S's
+library	evenness	S,D	old insertions	log_r	0	0	.	.	.	se: delete-one jackknife over 1,000,000-bp blocks on each genome, the two variances added (printed only)
+library	evenness	S,D	old insertions	share_S_in_D	1	.	.	209	.	S's old insertions (LTR K2P above its 0.75 quantile) present in D among those resolved there
+library	evenness	S,D	old insertions	share_D_in_S	1	.	.	155	.	D's old insertions present in S among those resolved there
+library	evenness	R,S,D	all	check	0.984615	.	.	.	.	the lowest min(r, 1/r), pair R,S; the check passes when every pair reaches 0.889 (simulated runs: even annotation: 30 nulls and 58 gene-flow runs 0.948-0.997 (0/88 held); even annotation: 30 bottleneck nulls 0.947-0.994 (0/30 held); one sister 10 points less complete 0.859-0.915 (10/13 held); one sister 30 points less complete 0.636-0.697 (13/13 held))
+library	inversions	R~S	all	n_blocks	0	.	.	558	chain blocks	.
+library	inversions	R~S	all	n_blocks_1Mb	0	.	.	558	chain blocks	.
+library	inversions	R~S	all	bp_inverted_x	0	.	.	558	chain blocks	.
+library	inversions	R~D	all	n_blocks	1	.	.	445	chain blocks	.
+library	inversions	R~D	all	n_blocks_1Mb	0	.	.	445	chain blocks	.
+library	inversions	R~D	all	bp_inverted_x	780975	.	.	445	chain blocks	.
+library	inversions	S~D	all	n_blocks	1	.	.	387	chain blocks	.
+library	inversions	S~D	all	n_blocks_1Mb	0	.	.	387	chain blocks	.
+library	inversions	S~D	all	bp_inverted_x	729854	.	.	387	chain blocks	.
+library	hmm_ancestry	R,S;D	R	sister	S	.	.	.	.	the decoy, painted with R's fitted model
+library	hmm_ancestry	R,S;D	R	donor	D	.	.	.	.	.
+library	hmm_ancestry	R,S;D	R	pi	0.188763	.	.	.	.	the fitted D-like fraction (EM; clipped to [0.0001, 0.5])
+library	hmm_ancestry	R,S;D	R	mean_tract_bp	461888	.	.	.	.	L, the switch scale: between elements d bp apart the state is redrawn from (1 - pi, pi) with probability 1 - exp(-d / L)
+library	hmm_ancestry	R,S;D	R	loglik	-228.183	.	.	.	.	log-likelihood of the fitted HMM
+library	hmm_ancestry	R,S;D	R	n_tracts	3	.	.	.	.	runs with posterior > 0.5 and posterior odds >= 3 x prior odds
+library	hmm_ancestry	R,S;D	R	n_decoy_tracts	1	.	.	.	.	the same rule on the decoy
+library	hmm_ancestry	R,S;D	R	n_tracts_q05	0	.	.	.	.	tracts at q <= 0.05 (target-decoy against S's painting; scale = records of R / records of S = 0.9342)
+library	hmm_ancestry	R,S;D	R	posterior_mean	0.171801	.	.	.	.	mean posterior of the D-like state over R's records, weighted by length
+library	hmm_ancestry	R,S;D	R	decoy_posterior_mean	0.0403995	.	.	.	.	the same over the decoy S, painted with R's fitted model
+library	hmm_ancestry	R,S;D	R	excess_over_decoy	0.131401	.	.	.	.	posterior_mean - decoy_posterior_mean
+library	hmm_ancestry	R,S;D	R	near_threshold	0.00488889	.	.	.	.	divergence below it is near: the 0.05 quantile of S's ortholog divergences to D (n_diff / n_sites; 0 when none), one threshold for R and the decoy S
+library	hmm_ancestry	R,S;D	R	e1_near_donor	0.987087	.	.	.	.	state 1's (D-like) emission probability of near_donor, fitted by EM
+library	hmm_ancestry	R,S;D	R	e1_donor_only	0.0046783	.	.	.	.	state 1's (D-like) emission probability of donor_only, fitted by EM
+library	hmm_ancestry	R,S;D	R	e1_near_sister	0.0042065	.	.	.	.	state 1's (D-like) emission probability of near_sister, fitted by EM
+library	hmm_ancestry	R,S;D	R	e1_sister_only	0.00402804	.	.	.	.	state 1's (D-like) emission probability of sister_only, fitted by EM
+library	hmm_ancestry	R,S;D	R	e0_near_donor	0.00469384	.	.	.	.	state 0's (S-like) emission probability of near_donor, fitted by EM
+library	hmm_ancestry	R,S;D	R	e0_donor_only	0.108982	.	.	.	.	state 0's (S-like) emission probability of donor_only, fitted by EM
+library	hmm_ancestry	R,S;D	R	e0_near_sister	0.885375	.	.	.	.	state 0's (S-like) emission probability of near_sister, fitted by EM
+library	hmm_ancestry	R,S;D	R	e0_sister_only	0.000949	.	.	.	.	state 0's (S-like) emission probability of sister_only, fitted by EM
+library	hmm_ancestry	R,S;D	R	donor_state	1	.	.	.	.	state 1 is D-like when its near_donor emission exceeds state 0's and its near_sister emission falls below it
+library	hmm_recent	R,S;D	R	sister	S	.	.	.	.	the decoy, painted with R's fitted model
+library	hmm_recent	R,S;D	R	donor	D	.	.	.	.	.
+library	hmm_recent	R,S;D	R	pi	0.206862	.	.	.	.	the fitted D-like fraction (EM; clipped to [0.0001, 0.5])
+library	hmm_recent	R,S;D	R	mean_tract_bp	461888	.	.	.	.	L, the switch scale: between elements d bp apart the state is redrawn from (1 - pi, pi) with probability 1 - exp(-d / L)
+library	hmm_recent	R,S;D	R	loglik	-45.291	.	.	.	.	log-likelihood of the fitted HMM
+library	hmm_recent	R,S;D	R	n_tracts	3	.	.	.	.	runs with posterior > 0.5 and posterior odds >= 3 x prior odds
+library	hmm_recent	R,S;D	R	n_decoy_tracts	1	.	.	.	.	the same rule on the decoy
+library	hmm_recent	R,S;D	R	n_tracts_q05	0	.	.	.	.	tracts at q <= 0.05 (target-decoy against S's painting; scale = records of R / records of S = 0.9342)
+library	hmm_recent	R,S;D	R	posterior_mean	0.172576	.	.	.	.	mean posterior of the D-like state over R's records, weighted by length
+library	hmm_recent	R,S;D	R	decoy_posterior_mean	0.040803	.	.	.	.	the same over the decoy S, painted with R's fitted model
+library	hmm_recent	R,S;D	R	excess_over_decoy	0.131773	.	.	.	.	posterior_mean - decoy_posterior_mean
+library	hmm_recent	R,S;D	R	near_threshold	0.00488889	.	.	.	.	divergence below it is near: the 0.05 quantile of S's ortholog divergences to D (n_diff / n_sites; 0 when none), one threshold for R and the decoy S
+library	hmm_recent	R,S;D	R	e1_near_donor	0.995748	.	.	.	.	state 1's (D-like) emission probability of near_donor, fitted by EM
+library	hmm_recent	R,S;D	R	e1_near_sister	0.00425225	.	.	.	.	state 1's (D-like) emission probability of near_sister, fitted by EM
+library	hmm_recent	R,S;D	R	e0_near_donor	0.00527694	.	.	.	.	state 0's (S-like) emission probability of near_donor, fitted by EM
+library	hmm_recent	R,S;D	R	e0_near_sister	0.994723	.	.	.	.	state 0's (S-like) emission probability of near_sister, fitted by EM
+library	hmm_recent	R,S;D	R	donor_state	1	.	.	.	.	state 1 is D-like when its near_donor emission exceeds state 0's and its near_sister emission falls below it

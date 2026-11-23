@@ -1,0 +1,201 @@
+{
+ "scenario": {
+  "mu": 1.3e-08,
+  "kappa": 2.0,
+  "root_age": 2000000.0,
+  "tree": {
+   "split": 800000.0,
+   "children": [
+    {
+     "split": 300000.0,
+     "children": [
+      "A",
+      "D"
+     ]
+    },
+    "C"
+   ]
+  },
+  "mergers": [
+   {
+    "time": 100000.0,
+    "lineages": [
+     "A",
+     "D"
+    ]
+   },
+   {
+    "time": 20000.0,
+    "lineages": [
+     "A",
+     "C"
+    ]
+   }
+  ],
+  "chromosomes": {
+   "n": 2,
+   "length": 200000
+  },
+  "families": {
+   "n": 8,
+   "masters": [
+    1,
+    2
+   ],
+   "branch_rate": 3e-07,
+   "ltr_len_median": 120,
+   "ltr_len_sigma": 0.8,
+   "int_len_median": 1000,
+   "int_len_sigma": 0.4,
+   "size_sigma": 2.0,
+   "gc": 0.4
+  },
+  "activity": {
+   "rate": 4e-05,
+   "lineage_sigma": 1.0,
+   "p_off": 0.2,
+   "p_burst": 0.3,
+   "burst_width": 100000.0,
+   "burst_gain": 10.0
+  },
+  "target_weight": {
+   "C": 2.0
+  },
+  "phi": 0.5,
+  "p_copy_source": 0.3,
+  "active_age": 100000.0,
+  "half_life": 1000000.0,
+  "birth_divergence": 2.0,
+  "gene_conversion": 1e-06,
+  "conversion_tract": 50,
+  "family_rate_sigma": 0.3,
+  "exchanges": {
+   "nonreciprocal": 3,
+   "reciprocal": 2,
+   "size_min": 10000.0,
+   "size_max": 60000.0
+  },
+  "exchange_list": [],
+  "singleton_share": 0.14
+ },
+ "seed": 7,
+ "splits": [
+  {
+   "node": "anc0",
+   "time": 800000.0,
+   "children": [
+    "anc1",
+    "C"
+   ]
+  },
+  {
+   "node": "anc1",
+   "time": 300000.0,
+   "children": [
+    "A",
+    "D"
+   ]
+  }
+ ],
+ "mergers": [
+  {
+   "time": 100000.0,
+   "lineages": [
+    "A",
+    "D"
+   ]
+  },
+  {
+   "time": 20000.0,
+   "lineages": [
+    "A",
+    "C"
+   ]
+  }
+ ],
+ "merge_time": {
+  "A": 100000.0,
+  "D": 100000.0,
+  "C": 20000.0
+ },
+ "families": [
+  {
+   "name": "fam0000",
+   "ltr_len": 120,
+   "int_len": 1000,
+   "mu": 8.303565436914116e-09,
+   "superfamily": "Gypsy",
+   "clade": "Athila",
+   "n_copies": 14
+  },
+  {
+   "name": "fam0001",
+   "ltr_len": 152,
+   "int_len": 1000,
+   "mu": 1.0833732315900716e-08,
+   "superfamily": "Gypsy",
+   "clade": "TatII",
+   "n_copies": 1
+  },
+  {
+   "name": "fam0002",
+   "ltr_len": 100,
+   "int_len": 1216,
+   "mu": 7.025753965575038e-09,
+   "superfamily": "Gypsy",
+   "clade": "Reina",
+   "n_copies": 3
+  },
+  {
+   "name": "fam0003",
+   "ltr_len": 100,
+   "int_len": 1153,
+   "mu": 8.440892382363012e-09,
+   "superfamily": "Gypsy",
+   "clade": "TatII",
+   "n_copies": 4
+  },
+  {
+   "name": "fam0004",
+   "ltr_len": 100,
+   "int_len": 1043,
+   "mu": 7.1522632574690485e-09,
+   "superfamily": "Gypsy",
+   "clade": "CRM",
+   "n_copies": 75
+  },
+  {
+   "name": "fam0005",
+   "ltr_len": 100,
+   "int_len": 1000,
+   "mu": 1.1581650800268487e-08,
+   "superfamily": "Gypsy",
+   "clade": "TatII",
+   "n_copies": 2
+  },
+  {
+   "name": "fam0006",
+   "ltr_len": 126,
+   "int_len": 1000,
+   "mu": 8.497019143822228e-09,
+   "superfamily": "Gypsy",
+   "clade": "Tekay",
+   "n_copies": 0
+  },
+  {
+   "name": "fam0007",
+   "ltr_len": 351,
+   "int_len": 1321,
+   "mu": 1.3481638723329266e-08,
+   "superfamily": "Gypsy",
+   "clade": "CRM",
+   "n_copies": 37
+  }
+ ],
+ "n_coordinate_collisions_dropped": 0,
+ "n_copies": {
+  "A": 48,
+  "D": 50,
+  "C": 38
+ }
+}

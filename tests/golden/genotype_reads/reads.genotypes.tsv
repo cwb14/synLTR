@@ -1,0 +1,10 @@
+element_id	chrom	start	end	strand	family	clade	length	ltr5_len	ltr3_len	tsd	n_inner	n_outer	sample	n_F	n_F_span	n_F_other	n_F_left	n_F_right	n_S	n_S_split	n_E	n_E_split	n_P	n_O	n_U	n_lowq	hap_F	hap_S	hap_E	phase_sites	other_delta_median	r_F	r_S	r_E	exp_reads	flank_depth	flank_ratio	genotype	gq	vcf_gt	p_F	p_E	p_S	pav	flags
+E1_het_empty	chr1	20006	24805	+	famA	test	4800	400	400	CGCCA	0	0	full	24	11	0	7	6	0	0	14	1	0	0	0	0	0	0	0	0	.	1.310	0.950	0.983	36.3	33.5	1.06	F/E	99	0/1	1.0000	1.0000	0.0000	present	PASS
+E2_het_solo	chr1	49811	54610	+	famA	test	4800	400	400	CACTG	0	0	full	19	7	0	8	4	16	1	0	0	7	0	0	0	0	0	0	0	.	1.310	0.950	0.983	35.8	38.0	1.20	F/S	99	0/2	1.0000	0.0000	1.0000	present	PASS
+E3_hom	chr1	79616	86815	+	famB	test	7200	600	600	CATCT	0	0	full	40	15	0	19	6	0	0	0	0	1	0	0	0	0	0	0	0	.	1.461	0.934	0.983	46.2	27.0	0.85	F/F	8	0/0	1.0000	0.0000	0.0000	present	PASS
+E4_hemi	chr1	111821	116620	+	famA	test	4800	400	400	TAGTT	0	0	full	25	10	0	7	8	0	0	0	0	1	0	0	0	0	0	0	0	.	1.310	0.950	0.983	20.7	18.0	0.57	F/N	6	0/.	1.0000	0.0000	0.0000	present	flank_depth_low
+E5_nested_outer	chr1	146626	158630	+	famB	test	12005	600	600	CCCCC	1	0	full	44	4	4	17	23	0	0	0	0	2	0	0	0	0	0	0	0	.	1.715	0.934	0.983	54.3	30.0	0.95	F/F	6	0/0	1.0000	0.0000	0.0000	present	full_other_length
+E5_nested_outer_inner	chr1	150231	155030	+	famA	test	4800	400	400	GAGTA	0	1	full	15	4	0	3	8	0	0	14	4	1	0	0	0	0	0	0	0	.	1.310	0.950	0.983	36.3	27.5	0.87	F/E	99	0/1	1.0000	1.0000	0.0000	present	PASS
+E7_hom	chr2	15006	22205	+	famB	test	7200	600	600	TGGCT	0	0	full	49	11	0	18	20	0	0	0	0	1	0	0	0	0	0	0	0	.	1.461	0.934	0.983	46.2	33.0	1.04	F/F	16	0/0	1.0000	0.0000	0.0000	present	PASS
+E8_decoy_hom	chr2	47211	54410	+	famB	test	7200	600	600	TAATA	0	0	full	60	18	0	24	18	0	0	0	0	3	0	0	0	0	0	0	0	.	1.461	0.934	0.983	46.2	41.0	1.30	F/F	27	0/0	1.0000	0.0000	0.0000	present	PASS
+E9_internal_del	chr3	18006	22805	+	famA	test	4800	400	400	GAGCT	0	0	full	54	41	22	8	5	0	0	0	0	3	0	0	0	0	0	0	0	.	1.310	0.950	0.983	41.5	39.5	1.25	F/F	26	0/0	1.0000	0.0000	0.0000	present	full_other_length

@@ -1,0 +1,30 @@
+
+Run
+- Library screen of 3 genomes (R, S, D) from their LTR-RT libraries alone (the library route's evidence: pairs/, blocks.tsv)
+- Relationships (distances, the tree, sister pairs by shared insertions), D_pav with its strata and age gradient, the assembly route's f4-ratio, the sequence-identity layer and mechanisms are not run on the library screen: they need observed empty sites (E) from genome assemblies, which inferred absences (A) never stand for; run `synltr geneflow` without --screen on the genome assemblies for them
+
+Trio tests
+- Trio R,S,D: roles from the single-copy k-mers: sisters R and S (the pair sharing the most single-copy k-mers the third genome lacks), donor D; recipient R, the sister sharing more of them with D (D_kmer(R,S;D) = +0.4306)
+- D(single-copy k-mers; R,S;D) = +0.4306 +- 0.0698 (Z = 6.2, 102 jackknife blocks on D); false signals (|Z| > 3) in simulated nulls: even annotation 0/30, even annotation, bottleneck 0/30, one sister 10 points less complete 5/10, one sister 30 points less complete 9/10.
+- D elements inside synteny with R: 1.00, with S: 1.00, with both: 1.00.
+- D(insertions; R,S;D) = +0.4203 +- 0.0801 (Z = 5.2; 98 R+D vs 40 S+D insertions absent from the third); false signals (|Z| > 3) in simulated nulls: even annotation 0/30, even annotation, bottleneck 0/30, one sister 10 points less complete 9/10, one sister 30 points less complete 9/10.
+- Annotation completeness: D's old insertions (K2P > 0.0283) present in R vs S: ratio 1.000 +- 0.000. A value only: one-sided annotation dropout (or old polymorphisms carried by gene flow) biases D_kmer and D_ins toward the more complete sister; D3 and D_self held the null in simulation up to a 10-point completeness gap, not beyond, so the every-pair evenness check below decides whether they give a verdict.
+- Identity spectrum: R-D vs mirror S-D orthologs (equal totals in the deep half): ratio at d >= 0.00756 = 1 by calibration; at d < 0.002: 124 vs 1 (124.00x). Excess = admixture-fraction lower bound 0.293 (fraction of R's D-orthologs).
+- D3 (ortholog triples, divergence; sign as D): +0.1255 (Z = 4.4; 347 triples); false signals (|Z| > 3) in simulated nulls: even annotation 0/30, even annotation, bottleneck 0/30, one sister 10 points less complete 0/10, one sister 30 points less complete 4/10. D(self-outgroup: sister LTR polarizes) = +0.9439 (Z = 27.9; ABBA 104, BABA 3, BBAA 162); false signals (|Z| > 3) in simulated nulls: even annotation 0/30, even annotation, bottleneck 1/30, one sister 10 points less complete 0/10, one sister 30 points less complete 10/10.
+- Every-pair evenness check (share of each genome's old insertions present in the other, X's over Y's): R,S r = 0.985 (se of log r 0.008), R,D r = 1.000 (se of log r 0.000), S,D r = 1.000 (se of log r 0.000); lowest min(r, 1/r) 0.985: passes (at least 0.889 for every pair).
+- D_ins and D_kmer give no verdict: annotation-sensitive (false signals in 9/10 and 5/10 simulated nulls with one sister 10 points less completely annotated, a gap no check separates reliably from even annotation); for a verdict, run `synltr geneflow` without --screen on the genome assemblies.
+- Verdict, D3: a signal of gene flow between R and D (Z = 4.4; |Z| >= 3 counts).
+- Verdict, D_self: a signal of gene flow between R and D (Z = 27.9; |Z| >= 3 counts).
+
+Painting
+- Ancestry painting of R (sister S, donor D): D-like posterior mean 0.172 vs 0.040 in the decoy S (excess +0.131); switch scale L (mean_tract_bp) 461.9 kb, pi 0.189; 3 tract(s) (1 decoy tracts), 0 at q <= 0.05
+- Recent shared ancestry of R (sister S, donor D): D-like posterior mean 0.173 vs 0.041 in the decoy S (excess +0.132); switch scale L (mean_tract_bp) 461.9 kb, pi 0.207; 3 tract(s) (1 decoy tracts), 0 at q <= 0.05
+
+Inversions
+- R~S: 0 inverted block(s)
+- R~D: 1 inverted block(s); largest: R R_chr2:1004312-1785286 (26 anchors)
+- S~D: 1 inverted block(s); largest: S S_chr2:1034075-1763928 (26 anchors)
+- Inverted blocks are the collinear chain blocks of the library screen whose orientation is opposite to their chromosome pair's main orientation (the sign holding more anchors; a tie counts as +). A chromosome pair with fewer than CHAIN_INV_MIN = 50 anchors is not searched (too few to tell its main orientation); a block needs at least CHAIN_MIN = 5 anchors, and more than the longest chain among shuffled anchors
+
+Warnings
+- none

@@ -1,0 +1,2 @@
+level	n	n_a	n_b	part_a	part_b	copies	replicability	replicability_se	n_pairs	borderline	strength	parent_strength	replicability_all	strength_all	agrees_all	parent_strength_all	replicability_young	strength_young	agrees_young	parent_strength_young	replicability_middle	strength_middle	agrees_middle	parent_strength_middle	replicability_old	strength_old	agrees_old	parent_strength_old	rule	accepted	forced
+root	4	2	2	chr001,chr003	chr002,chr004	all	1.000	0.000	50	no	0.09662	NA	1.000	0.09662	yes	NA	1.000	0.522	yes	NA	1.000	0.577	yes	NA	0.767	0.1213	no	NA	pooled	yes	no

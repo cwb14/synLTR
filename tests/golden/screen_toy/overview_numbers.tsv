@@ -1,0 +1,12 @@
+key	value	source
+panel_C	needs assemblies: run geneflow without --screen	manifest.json:route library
+panel_D	needs assemblies: run geneflow without --screen	manifest.json:route library
+panel_E	needs assemblies: run geneflow without --screen	manifest.json:route library
+panel_F	needs assemblies: run geneflow without --screen	manifest.json:route library
+sequences_drawn	3	work/elements/R.tsv:seqid
+sequences_not_drawn	0	work/elements/R.tsv:seqid
+posterior_mean	0.173	stats.tsv:hmm_recent/R,S;D/R/posterior_mean
+decoy_posterior_mean	0.041	stats.tsv:hmm_recent/R,S;D/R/decoy_posterior_mean
+n_tracts	3	stats.tsv:hmm_recent/R,S;D/R/n_tracts
+n_tracts_q05	0	stats.tsv:hmm_recent/R,S;D/R/n_tracts_q05
+B_window	R_chr3:1-1,577,095	tracts.R.bed:chrom

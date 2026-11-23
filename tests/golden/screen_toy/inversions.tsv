@@ -1,0 +1,3 @@
+genome_x	seqid_x	start_x	end_x	bp_left_x	bp_right_x	genome_y	seqid_y	start_y	end_y	bp_left_y	bp_right_y	n_loci	n_strand	n_discordant
+R	R_chr2	1004312	1785286	.	.	D	D_chr2	1116962	1897936	.	.	26	.	.
+S	S_chr2	1034075	1763928	.	.	D	D_chr2	1138320	1868173	.	.	26	.	.
